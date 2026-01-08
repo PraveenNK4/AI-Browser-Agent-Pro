@@ -97,8 +97,11 @@ def load_credentials_from_xml():
 
 
 def replace_credential_placeholders(task_text, credentials):
-    """Replace credential placeholders in task text with actual values."""
+    """Replace credential placeholders in task text with secure references."""
     import re
+
+    # Store credentials in webui_manager for secure access during execution
+    # Instead of exposing credentials in the task text, we'll use placeholders
 
     # First, check if any stored site names appear in the task
     task_lower = task_text.lower()
@@ -106,14 +109,14 @@ def replace_credential_placeholders(task_text, credentials):
         site_name_lower = site_name.lower()
         # Check if the site name appears in the task
         if site_name_lower in task_lower:
-            # If we find a site reference, automatically add login instructions with URL
+            # If we find a site reference, add login instruction with placeholders
             if 'login' not in task_lower and 'log in' not in task_lower:
                 # Get the URL from credentials if available
                 site_url = creds.get('url', f'https://{site_name}')
-                # Add login instruction with URL to the beginning of the task
-                login_instruction = f"First, navigate to {site_url} and log in to {site_name} with username '{creds['username']}' and password '{creds['password']}'. "
+                # Use secure placeholders instead of actual credentials
+                login_instruction = f"First, navigate to {site_url} and log in to {site_name} using the stored credentials for this site. "
                 task_text = login_instruction + task_text
-                logger.info(f"Added automatic login instruction with URL for site: {site_name} -> {site_url}")
+                logger.info(f"Added automatic login instruction with URL for site: {site_name} -> {site_url} (credentials will be injected securely)")
                 break
 
     # Also check for the original patterns as fallback
@@ -130,16 +133,52 @@ def replace_credential_placeholders(task_text, credentials):
         for match in matches:
             site_name = match.lower()
             if site_name in credentials:
-                creds = credentials[site_name]
-                # Replace generic credential requests with actual values
+                # Replace generic credential requests with secure placeholders
                 task_text = re.sub(
                     r'credentials?:?\s*(username|user|login)?:?\s*\w+\s*(password|pass)?:?\s*\w+',
-                    f'Username: {creds["username"]} Password: {creds["password"]}',
+                    f'Use the stored credentials for {site_name}',
                     task_text,
                     flags=re.IGNORECASE
                 )
-                logger.info(f"Replaced credentials for site: {site_name}")
+                logger.info(f"Replaced credential request with secure reference for site: {site_name}")
                 break
+
+    return task_text
+
+
+def setup_secure_credentials(credentials):
+    """
+    Set up credentials securely in environment variables without exposing to LLM.
+    Returns a mapping of site names to secure references.
+    """
+    credential_mapping = {}
+
+    for site_name, creds in credentials.items():
+        # Set environment variables that the agent can access securely
+        os.environ[f'AUTOMATION_{site_name.upper()}_USERNAME'] = creds['username']
+        os.environ[f'AUTOMATION_{site_name.upper()}_PASSWORD'] = creds['password']
+        os.environ[f'AUTOMATION_{site_name.upper()}_URL'] = creds.get('url', f'https://{site_name}')
+
+        # Create a secure reference for the LLM
+        credential_mapping[site_name.lower()] = f"stored_credentials_{site_name.lower()}"
+
+        logger.info(f"Securely stored credentials for {site_name} in environment variables")
+
+    return credential_mapping
+
+
+def inject_secure_credential_references(task_text, credential_mapping):
+    """
+    Replace credential references with secure placeholders that don't expose actual values.
+    """
+    for site_name, secure_ref in credential_mapping.items():
+        if site_name in task_text.lower():
+            # Replace actual credential exposure with secure reference
+            task_text = task_text.replace(
+                f"using the stored credentials for this site",
+                f"using {secure_ref}"
+            )
+            break
 
     return task_text
 
@@ -880,6 +919,12 @@ async def run_agent_task(
     else:
         logger.info(f"No credential replacement needed for task: '{task}'")
 
+    # Set up secure credentials in environment variables
+    credential_mapping = setup_secure_credentials(credentials)
+
+    # Inject secure credential references into task
+    task = inject_secure_credential_references(task, credential_mapping)
+
     # Set running state indirectly via _current_task
     webui_manager.bu_chat_history.append({"role": "user", "content": task})
 
@@ -1152,10 +1197,10 @@ async def run_agent_task(
             webui_manager.bu_agent_task_id,
             f"{webui_manager.bu_agent_task_id}.json",
         )
-        gif_path = os.path.join(
+        video_path = os.path.join(
             save_agent_history_path,
             webui_manager.bu_agent_task_id,
-            f"{webui_manager.bu_agent_task_id}.gif",
+            f"{webui_manager.bu_agent_task_id}.mp4",
         )
         playwright_script_path = os.path.join(
             save_agent_history_path,
@@ -1200,12 +1245,12 @@ async def run_agent_task(
                 source="webui",
             )
             webui_manager.bu_agent.state.agent_id = webui_manager.bu_agent_task_id
-            webui_manager.bu_agent.settings.generate_gif = gif_path
+            webui_manager.bu_agent.settings.generate_gif = video_path
             webui_manager.bu_agent.settings.save_playwright_script_path = playwright_script_path
         else:
             webui_manager.bu_agent.state.agent_id = webui_manager.bu_agent_task_id
             webui_manager.bu_agent.add_new_task(task)
-            webui_manager.bu_agent.settings.generate_gif = gif_path
+            webui_manager.bu_agent.settings.generate_gif = video_path
             webui_manager.bu_agent.browser = webui_manager.bu_browser
             webui_manager.bu_agent.browser_context = webui_manager.bu_browser_context
             webui_manager.bu_agent.controller = webui_manager.bu_controller
@@ -1702,11 +1747,10 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
         with gr.Column():
             gr.Markdown("### Task Outputs")
             agent_history_file = gr.File(label="Agent History JSON", interactive=False)
-            recording_gif = gr.Image(
-                label="Task Recording GIF",
-                format="gif",
+            recording_gif = gr.Video(
+                label="Task Recording MP4",
+                format="mp4",
                 interactive=False,
-                type="filepath",
             )
             playwright_script = gr.Code(
                 label="Generated Playwright Script",
