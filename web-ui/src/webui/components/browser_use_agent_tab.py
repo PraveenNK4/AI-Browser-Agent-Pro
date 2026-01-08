@@ -459,6 +459,150 @@ def generate_docx_report(webui_manager: WebuiManager, history: AgentHistoryList,
         return None
 
 
+def enhance_playwright_script(script_content: str, task_id: str) -> str:
+    """Enhance the generated Playwright script with sequential execution and error handling."""
+
+    # Add imports and setup
+    enhanced_script = f'''import asyncio
+import logging
+from playwright.async_api import async_playwright, expect
+import os
+from pathlib import Path
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create screenshots directory
+screenshot_dir = Path(f"./tmp/agent_history/{task_id}/screenshots")
+screenshot_dir.mkdir(parents=True, exist_ok=True)
+
+async def run_automation():
+    """Run the automation with sequential step execution and error handling."""
+
+    async with async_playwright() as p:
+        # Launch browser
+        browser = await p.chromium.launch(headless=False)
+        context = await browser.new_context(viewport={{"width": 1280, "height": 1024}})
+        page = await context.new_page()
+
+        step_results = []
+        current_step = 0
+
+        try:
+'''
+
+    # Parse the original script and add step-by-step execution
+    lines = script_content.split('\n')
+    in_async_function = False
+    indent_level = 0
+    step_actions = []
+
+    for i, line in enumerate(lines):
+        if 'async def run(' in line or 'async def main(' in line:
+            in_async_function = True
+            continue
+        elif in_async_function and line.strip().startswith('await '):
+            # This is an action that should be wrapped with error handling
+            action_line = line.strip()
+            step_actions.append(action_line)
+
+            # Add enhanced step execution
+            enhanced_script += f'''
+            # Step {len(step_actions)}
+            current_step = {len(step_actions)}
+            logger.info(f"Executing Step {{current_step}}: {{action_line}}")
+
+            try:
+                # Take screenshot before action
+                screenshot_path = screenshot_dir / f"step_{{current_step}}_before.png"
+                await page.screenshot(path=str(screenshot_path))
+                logger.info(f"Screenshot saved: {{screenshot_path}}")
+
+                # Execute the action
+                {action_line}
+
+                # Wait for page to be stable
+                await page.wait_for_load_state('networkidle')
+                await asyncio.sleep(1)
+
+                # Take screenshot after action
+                screenshot_path = screenshot_dir / f"step_{{current_step}}_after.png"
+                await page.screenshot(path=str(screenshot_path))
+                logger.info(f"Screenshot saved: {{screenshot_path}}")
+
+                # Validate step success (basic check)
+                step_results.append({{
+                    "step": current_step,
+                    "action": "{action_line}",
+                    "status": "success",
+                    "screenshot_before": str(screenshot_path),
+                    "screenshot_after": str(screenshot_path)
+                }})
+
+                logger.info(f"Step {{current_step}} completed successfully")
+
+            except Exception as e:
+                logger.error(f"Step {{current_step}} failed: {{e}}")
+
+                # Take error screenshot
+                error_screenshot = screenshot_dir / f"step_{{current_step}}_error.png"
+                await page.screenshot(path=str(error_screenshot))
+
+                step_results.append({{
+                    "step": current_step,
+                    "action": "{action_line}",
+                    "status": "failed",
+                    "error": str(e),
+                    "error_screenshot": str(error_screenshot)
+                }})
+
+                logger.error(f"Stopping execution due to step {{current_step}} failure")
+                break
+
+            # Brief pause between steps
+            await asyncio.sleep(0.5)
+'''
+
+    # Add completion and cleanup
+    enhanced_script += '''
+        finally:
+            # Generate summary report
+            logger.info("Generating execution summary...")
+
+            success_count = sum(1 for r in step_results if r["status"] == "success")
+            total_steps = len(step_results)
+
+            logger.info(f"Execution Summary:")
+            logger.info(f"- Total Steps: {total_steps}")
+            logger.info(f"- Successful: {success_count}")
+            logger.info(f"- Failed: {total_steps - success_count}")
+
+            # Save detailed results
+            results_file = screenshot_dir.parent / "execution_results.json"
+            import json
+            with open(results_file, 'w') as f:
+                json.dump(step_results, f, indent=2)
+            logger.info(f"Results saved to: {results_file}")
+
+            # Close browser
+            await browser.close()
+
+            if success_count == total_steps:
+                logger.info("🎉 All steps completed successfully!")
+                return True
+            else:
+                logger.error(f"❌ Execution failed: {total_steps - success_count} steps failed")
+                return False
+
+if __name__ == "__main__":
+    success = asyncio.run(run_automation())
+    exit(0 if success else 1)
+'''
+
+    return enhanced_script
+
+
 def _handle_done(webui_manager: WebuiManager, history: AgentHistoryList):
     """Callback when the agent finishes the task (success or failure)."""
     logger.info(
@@ -1227,9 +1371,13 @@ async def run_agent_task(
                 try:
                     with open(playwright_script_path, 'r', encoding='utf-8') as f:
                         script_content = f.read()
-                    final_update[playwright_script_comp] = gr.Code(value=script_content, language="python")
+
+                    # Enhance the Playwright script with sequential execution and error handling
+                    enhanced_script = enhance_playwright_script(script_content, webui_manager.bu_agent_task_id)
+
+                    final_update[playwright_script_comp] = gr.Code(value=enhanced_script, language="python")
                 except Exception as e:
-                    logger.error(f"Failed to read Playwright script: {e}")
+                    logger.error(f"Failed to read/enhance Playwright script: {e}")
                     final_update[playwright_script_comp] = gr.Code(value=f"Error reading script: {e}", language="text")
 
             if docx_path and os.path.exists(docx_path):
