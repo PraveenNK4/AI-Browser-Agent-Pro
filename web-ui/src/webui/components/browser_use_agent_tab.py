@@ -98,10 +98,25 @@ def load_credentials_from_xml():
 
 def replace_credential_placeholders(task_text, credentials):
     """Replace credential placeholders in task text with actual values."""
-    # Look for patterns like "login to [sitename]" and replace with credentials
     import re
 
-    # Common patterns to detect site references
+    # First, check if any stored site names appear in the task
+    task_lower = task_text.lower()
+    for site_name, creds in credentials.items():
+        site_name_lower = site_name.lower()
+        # Check if the site name appears in the task
+        if site_name_lower in task_lower:
+            # If we find a site reference, automatically add login instructions with URL
+            if 'login' not in task_lower and 'log in' not in task_lower:
+                # Get the URL from credentials if available
+                site_url = creds.get('url', f'https://{site_name}')
+                # Add login instruction with URL to the beginning of the task
+                login_instruction = f"First, navigate to {site_url} and log in to {site_name} with username '{creds['username']}' and password '{creds['password']}'. "
+                task_text = login_instruction + task_text
+                logger.info(f"Added automatic login instruction with URL for site: {site_name} -> {site_url}")
+                break
+
+    # Also check for the original patterns as fallback
     patterns = [
         r'login to (\w+)',
         r'log into (\w+)',
@@ -561,6 +576,31 @@ async def run_agent_task(
     # Initialize docx_path variable
     docx_path = None
 
+    # --- Browser Settings (from environment variables) ---
+    browser_binary_path = os.getenv("BROWSER_PATH") or None
+    browser_user_data_dir = os.getenv("BROWSER_USER_DATA") or None
+    use_own_browser = os.getenv("USE_OWN_BROWSER", "true").lower() == "true"
+    keep_browser_open = os.getenv("KEEP_BROWSER_OPEN", "true").lower() == "true"
+    headless = os.getenv("HEADLESS", "false").lower() == "true"
+    disable_security = os.getenv("DISABLE_SECURITY", "false").lower() == "true"
+    window_w = int(os.getenv("WINDOW_WIDTH", "1280"))
+    window_h = int(os.getenv("WINDOW_HEIGHT", "1100"))
+    cdp_url = os.getenv("BROWSER_CDP") or None
+    wss_url = os.getenv("WSS_URL") or None
+    save_recording_path = os.getenv("RECORDING_PATH") or None
+    save_trace_path = os.getenv("TRACE_PATH") or None
+    save_agent_history_path = os.getenv("AGENT_HISTORY_PATH", "./tmp/agent_history")
+    save_download_path = os.getenv("DOWNLOADS_PATH", "./tmp/downloads")
+
+    # Initialize directories early so file processing can use them
+    os.makedirs(save_agent_history_path, exist_ok=True)
+    if save_recording_path:
+        os.makedirs(save_recording_path, exist_ok=True)
+    if save_trace_path:
+        os.makedirs(save_trace_path, exist_ok=True)
+    if save_download_path:
+        os.makedirs(save_download_path, exist_ok=True)
+
     # --- 1. Get Task and Initial UI Update ---
     task = components.get(user_input_comp, "").strip()
     if not task:
@@ -568,17 +608,76 @@ async def run_agent_task(
         yield {run_button_comp: gr.update(interactive=True)}
         return
 
+    # Generate task ID early for file processing
+    webui_manager.bu_agent_task_id = str(uuid.uuid4())
+
     # Get uploaded context files
     context_files_comp = webui_manager.get_component_by_id("browser_use_agent.context_files")
     uploaded_files = components.get(context_files_comp, [])
 
+    logger.info(f"Context files component: {context_files_comp}")
+    logger.info(f"Uploaded files count: {len(uploaded_files) if uploaded_files else 0}")
+    logger.info(f"Uploaded files type: {type(uploaded_files)}")
+
     # Process uploaded files for context
     context_info = ""
-    if uploaded_files:
+    if uploaded_files and len(uploaded_files) > 0:
         context_info = "\n\nContext files uploaded:"
-        for file_obj in uploaded_files:
-            if hasattr(file_obj, 'name') and hasattr(file_obj, 'read'):
-                filename = getattr(file_obj, 'orig_name', 'unknown_file')
+        logger.info(f"Processing {len(uploaded_files)} uploaded files")
+
+        for i, file_obj in enumerate(uploaded_files):
+            logger.info(f"Processing file {i+1}: {file_obj}")
+            logger.info(f"File object type: {type(file_obj)}")
+
+            # Gradio file uploads are file paths, not file objects
+            if isinstance(file_obj, str):
+                # It's a file path from Gradio upload
+                filename = os.path.basename(file_obj)
+                logger.info(f"Gradio file path: {file_obj}")
+
+                context_info += f"\n- {filename}"
+
+                # Copy file to temporary location for agent access
+                temp_dir = os.path.join(save_agent_history_path, webui_manager.bu_agent_task_id, "context_files")
+                os.makedirs(temp_dir, exist_ok=True)
+                temp_file_path = os.path.join(temp_dir, filename)
+
+                try:
+                    shutil.copy2(file_obj, temp_file_path)
+                    context_info += f" (saved to {temp_file_path})"
+                    logger.info(f"Saved context file: {temp_file_path}")
+
+                    # Read first few lines for context (only for text files)
+                    try:
+                        # Check if it's a text file by extension
+                        text_extensions = {'.txt', '.md', '.py', '.js', '.html', '.css', '.json', '.csv', '.xml', '.yaml', '.yml'}
+                        file_ext = os.path.splitext(filename)[1].lower()
+
+                        if file_ext in text_extensions:
+                            with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                first_lines = []
+                                for line_num, line in enumerate(f):
+                                    if line_num < 3:  # First 3 lines
+                                        first_lines.append(line.strip())
+                                    else:
+                                        break
+                                context_info += f"\n  Preview: {' | '.join(first_lines)}"
+                        else:
+                            # For binary files like .docx, .pdf, etc.
+                            context_info += f"\n  Preview: [Binary file - {file_ext} format]"
+                    except Exception as e:
+                        logger.debug(f"Could not read file preview: {e}")
+                        context_info += f"\n  Preview: [Could not preview file]"
+
+                except Exception as e:
+                    logger.error(f"Failed to save context file {filename}: {e}")
+                    context_info += f" (failed to save: {e})"
+
+            elif hasattr(file_obj, 'name') or hasattr(file_obj, 'filename'):
+                # Fallback for other file object types
+                filename = getattr(file_obj, 'name', getattr(file_obj, 'filename', 'unknown_file'))
+                logger.info(f"File object filename: {filename}")
+
                 context_info += f"\n- {filename}"
 
                 # Save file to temporary location for agent access
@@ -587,16 +686,45 @@ async def run_agent_task(
                 temp_file_path = os.path.join(temp_dir, filename)
 
                 try:
+                    # Reset file pointer if possible
+                    if hasattr(file_obj, 'seek'):
+                        file_obj.seek(0)
+
                     with open(temp_file_path, 'wb') as f:
-                        content = file_obj.read()
-                        f.write(content)
+                        if hasattr(file_obj, 'read'):
+                            content = file_obj.read()
+                            f.write(content)
+                        else:
+                            logger.warning(f"File object has no read method: {filename}")
+
                     context_info += f" (saved to {temp_file_path})"
                     logger.info(f"Saved context file: {temp_file_path}")
+
+                    # Read first few lines for context
+                    try:
+                        with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            first_lines = []
+                            for line_num, line in enumerate(f):
+                                if line_num < 3:  # First 3 lines
+                                    first_lines.append(line.strip())
+                                else:
+                                    break
+                            context_info += f"\n  Preview: {' | '.join(first_lines)}"
+                    except Exception as e:
+                        logger.debug(f"Could not read file preview: {e}")
+
                 except Exception as e:
                     logger.error(f"Failed to save context file {filename}: {e}")
                     context_info += f" (failed to save: {e})"
+            else:
+                logger.warning(f"Unsupported file object type: {type(file_obj)}")
+                context_info += f"\n- Unsupported file type: {type(file_obj)}"
+    else:
+        logger.info("No context files uploaded")
+        context_info = "\n\nNo context files uploaded"
 
-        task += context_info
+    logger.info(f"Final context_info: {context_info}")
+    task += context_info
 
     # Load credentials and replace placeholders in task
     credentials = load_credentials_from_xml()
@@ -760,9 +888,7 @@ async def run_agent_task(
     save_agent_history_path = os.getenv("AGENT_HISTORY_PATH", "./tmp/agent_history")
     save_download_path = os.getenv("DOWNLOADS_PATH", "./tmp/downloads")
 
-    stream_vw = 70
-    stream_vh = int(70 * window_h // window_w)
-
+    # Initialize directories early so file processing can use them
     os.makedirs(save_agent_history_path, exist_ok=True)
     if save_recording_path:
         os.makedirs(save_recording_path, exist_ok=True)
@@ -770,6 +896,9 @@ async def run_agent_task(
         os.makedirs(save_trace_path, exist_ok=True)
     if save_download_path:
         os.makedirs(save_download_path, exist_ok=True)
+
+    stream_vw = 70
+    stream_vh = int(70 * window_h // window_w)
 
     # --- 2. Initialize LLM ---
     main_llm = await _initialize_llm(
