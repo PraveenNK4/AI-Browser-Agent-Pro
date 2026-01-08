@@ -49,8 +49,6 @@ from langchain_ibm import ChatWatsonx
 from langchain_aws import ChatBedrock
 from pydantic import SecretStr
 
-from src.utils import config
-
 
 class DeepSeekR1ChatOpenAI(ChatOpenAI):
 
@@ -160,8 +158,8 @@ def get_llm_model(provider: str, **kwargs):
         env_var = f"{provider.upper()}_API_KEY"
         api_key = kwargs.get("api_key", "") or os.getenv(env_var, "")
         if not api_key:
-            provider_display = config.PROVIDER_DISPLAY_NAMES.get(provider, provider.upper())
-            error_msg = f"💥 {provider_display} API key not found! 🔑 Please set the `{env_var}` environment variable or provide it in the UI."
+            provider_display = provider.upper()
+            error_msg = f"💥 {provider_display} API key not found! 🔑 Please set the `{env_var}` environment variable."
             raise ValueError(error_msg)
         kwargs["api_key"] = api_key
 

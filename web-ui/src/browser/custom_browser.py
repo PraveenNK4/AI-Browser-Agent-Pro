@@ -9,18 +9,89 @@ from playwright.async_api import (
     Playwright,
     async_playwright,
 )
-from browser_use.browser.browser import Browser, IN_DOCKER
+from browser_use.browser.browser import Browser
 from browser_use.browser.context import BrowserContext, BrowserContextConfig
 from playwright.async_api import BrowserContext as PlaywrightBrowserContext
 import logging
 
-from browser_use.browser.chrome import (
-    CHROME_ARGS,
-    CHROME_DETERMINISTIC_RENDERING_ARGS,
-    CHROME_DISABLE_SECURITY_ARGS,
-    CHROME_DOCKER_ARGS,
-    CHROME_HEADLESS_ARGS,
-)
+# Define Chrome arguments directly to avoid import issues
+CHROME_ARGS = [
+    '--no-first-run',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-features=TranslateUI',
+    '--disable-ipc-flooding-protection',
+    '--disable-hang-monitor',
+    '--disable-prompt-on-repost',
+    '--force-color-profile=srgb',
+    '--metrics-recording-only',
+    '--no-crash-upload',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-dev-shm-usage',
+    '--disable-extensions-except=/tmp/browser-use/extensions',
+    '--disable-extensions-http-throttling',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-web-security',
+    '--disable-features=VizDisplayCompositor',
+    '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+]
+
+CHROME_DETERMINISTIC_RENDERING_ARGS = [
+    '--disable-background-media-download',
+    '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-breakpad',
+    '--disable-client-side-phishing-detection',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--disable-dev-shm-usage',
+    '--disable-domain-reliability',
+    '--disable-extensions',
+    '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+    '--disable-hang-monitor',
+    '--disable-ipc-flooding-protection',
+    '--disable-popup-blocking',
+    '--disable-print-preview',
+    '--disable-prompt-on-repost',
+    '--disable-renderer-backgrounding',
+    '--disable-sync',
+    '--force-color-profile=srgb',
+    '--hide-scrollbars',
+    '--metrics-recording-only',
+    '--mute-audio',
+    '--no-default-browser-check',
+    '--no-first-run',
+    '--password-store=basic',
+    '--use-mock-keychain',
+]
+
+CHROME_DISABLE_SECURITY_ARGS = [
+    '--disable-web-security',
+    '--disable-features=VizDisplayCompositor',
+    '--disable-extensions-http-throttling',
+    '--disable-blink-features=AutomationControlled',
+]
+
+CHROME_DOCKER_ARGS = [
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+]
+
+CHROME_HEADLESS_ARGS = [
+    '--headless=new',
+    '--no-sandbox',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-dev-shm-usage',
+]
 from browser_use.browser.context import BrowserContext, BrowserContextConfig
 from browser_use.browser.utils.screen_resolution import get_screen_resolution, get_window_adjustments
 from browser_use.utils import time_execution_async
@@ -66,7 +137,7 @@ class CustomBrowser(Browser):
         chrome_args = {
             f'--remote-debugging-port={self.config.chrome_remote_debugging_port}',
             *CHROME_ARGS,
-            *(CHROME_DOCKER_ARGS if IN_DOCKER else []),
+            # *(CHROME_DOCKER_ARGS if IN_DOCKER else []),  # Removed - not running in Docker
             *(CHROME_HEADLESS_ARGS if self.config.headless else []),
             *(CHROME_DISABLE_SECURITY_ARGS if self.config.disable_security else []),
             *(CHROME_DETERMINISTIC_RENDERING_ARGS if self.config.deterministic_rendering else []),

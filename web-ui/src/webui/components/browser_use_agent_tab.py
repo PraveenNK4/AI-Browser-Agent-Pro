@@ -679,8 +679,66 @@ async def run_agent_task(
             planner_ollama_num_ctx if planner_llm_provider_name == "ollama" else None,
         )
 
-    # Extend system prompt to be more restrictive and handle e-commerce workflows
-    prompt_addition = "\n\nIMPORTANT: Stay focused on the exact task requested. Do not perform additional actions beyond what is specifically asked.\n\nFor e-commerce tasks like adding items to cart:\n- FIRST sort by price (low to high) to identify cheapest items\n- Add items using buttons on the main inventory page, NOT individual product pages\n- Stay on the inventory/catalog page when adding multiple items\n- Only navigate to cart/checkout when explicitly requested\n\nFor clicking buttons like 'Sign In', 'Login', 'Submit', or other common UI elements, prefer using 'click_element_by_text' with the button text instead of 'click_element_by_index' to avoid index mismatches. If scrolling doesn't reveal the content, try using 'zoom_page' to 80 or 50 percent to make more content visible without scrolling."
+    # Truly dynamic prompt generation - analyzes task and generates adaptive rules
+    def analyze_task_and_generate_rules(task_text: str) -> str:
+        """Analyze the task and generate truly dynamic, context-aware automation rules."""
+
+        # Parse task components to understand what needs to be done
+        task_lower = task_text.lower()
+
+        # Extract key actions and objects from the task
+        actions = []
+        objects = []
+
+        # Action keywords
+        action_keywords = ['login', 'click', 'fill', 'submit', 'search', 'find', 'extract', 'navigate', 'select', 'add', 'remove', 'sort', 'filter']
+        for keyword in action_keywords:
+            if keyword in task_lower:
+                actions.append(keyword)
+
+        # Object keywords
+        object_keywords = ['form', 'button', 'input', 'field', 'cart', 'product', 'item', 'page', 'link', 'menu', 'table', 'data']
+        for keyword in object_keywords:
+            if keyword in task_lower:
+                objects.append(keyword)
+
+        # Generate dynamic rules based on detected actions and objects
+        rules = ["IMPORTANT: Stay focused on the exact task requested. Do not perform additional actions beyond what is specifically asked."]
+
+        # Dynamic rule generation based on task analysis
+        if 'multiple' in task_lower or 'all' in task_lower or any(word in task_lower for word in ['2', '3', '4', '5', 'several']):
+            rules.append("MULTI-ITEM TASK: When handling multiple items, maintain your position on the main listing page and avoid navigation to individual item pages unless specifically required.")
+
+        if any(action in actions for action in ['login', 'submit', 'fill']):
+            rules.append("FORM INTERACTION: For form-based actions, use text-based element selection and complete all required fields before submission.")
+
+        if any(obj in objects for obj in ['cart', 'product', 'item']):
+            rules.append("COMMERCE WORKFLOW: Stay on inventory/product listing pages when adding items - avoid individual product page navigation.")
+
+        if any(action in actions for action in ['search', 'find', 'filter', 'sort']):
+            rules.append("DATA OPERATIONS: Use available filters and sorting options to organize data before performing actions on specific items.")
+
+        if any(obj in objects for obj in ['table', 'data', 'information']):
+            rules.append("DATA HANDLING: Extract or manipulate data systematically, ensuring you're on the correct page with the target information.")
+
+        # Universal web automation principles (always included)
+        rules.extend([
+            "",
+            "UNIVERSAL WEB AUTOMATION PRINCIPLES:",
+            "- Prefer text-based element selection over positional/index-based selection for reliability",
+            "- Use descriptive identifiers (button text, field labels, link text) over generic selectors",
+            "- If elements aren't visible, try scrolling, waiting, or zooming to reveal content",
+            "- Maintain context awareness - know which page/section you're currently on",
+            "- Handle dynamic content by using stable, descriptive selectors",
+            "- When actions fail, adapt by trying alternative approaches or selectors",
+            "- Wait for page loads and element interactions to complete naturally",
+            "- Use context clues (surrounding text, positioning) to identify correct elements among similar ones"
+        ])
+
+        return "\n".join(rules)
+
+    # Generate dynamic rules based on task content
+    prompt_addition = "\n\n" + analyze_task_and_generate_rules(task)
     if extend_system_prompt:
         extend_system_prompt += prompt_addition
     else:
