@@ -1,0 +1,274 @@
+[
+  {
+    "url": "about:blank",
+    "title": "",
+    "evaluation": "Unknown - This is the start of a new task, no previous goals to evaluate.",
+    "goal": "Navigate to http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000",
+    "actions": [
+      {
+        "go_to_url": {
+          "url": "http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000"
+        }
+      }
+    ],
+    "dom_elements": []
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8090/otdsws/login?RFA=108c0e8f%2Da007%2D4165%2Dbb27%2Ddf981c095aa7%3Ahttp%3A%2F%2Fotcsvm%2Eotxlab%2Enet%3A8080%2FOTCS%2Fcs%2Eexe%3Ffunc%3Dotdsintegration%2Eredirect%26NextURL%3Dhttp%253A%252F%252Fotcsvm%252Eotxlab%252Enet%253A8080%252FOTCS%252Fcs%252Eexe%252Fapp%252Fnodes%252F2000&PostTicket=true&PostParams=true&ux_version=2&PreserveFragment=true&logon_style=signin-cs&logon_appname=OpenText%20Extended%20ECM%20CE%2023%2E3",
+    "title": "OpenText Authentication Service",
+    "evaluation": "Success - Navigated to the provided URL successfully.",
+    "goal": "Login with the provided credentials.",
+    "actions": [
+      {
+        "input_text": {
+          "index": 1,
+          "text": "<secret>{{OTCS_USERNAME}}</secret>",
+          "kwargs": false
+        },
+        "click_element_by_text": {
+          "text": "Sign in"
+        },
+        "scroll_page": {
+          "direction": "down",
+          "amount": 500
+        },
+        "go_forward": {},
+        "extract_page_content": {}
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "input",
+        "text": "User name",
+        "title": "User name",
+        "id": "otds_username",
+        "name": "otds_username",
+        "type": "text",
+        "role": "",
+        "aria-label": "User name",
+        "selectors": {
+          "xpath": "//*[@id=\"otds_username\"]",
+          "aria": "User name",
+          "preferred": "#otds_username",
+          "id": "#otds_username",
+          "type-name-combo": "input[type=\"text\"][name=\"otds_username\"]",
+          "name-attribute": "input[name=\"otds_username\"]",
+          "data-attribute": "input[data-otdsfocus=\"\"]",
+          "aria-attribute": "input[aria-label=\"User\\ name\"]",
+          "parent-id-child": "#otds_username input",
+          "css-path": "#otds_username"
+        },
+        "recommended_selector": "#otds_username"
+      }
+    ]
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8090/otdsws/login?RFA=108c0e8f%2Da007%2D4165%2Dbb27%2Ddf981c095aa7%3Ahttp%3A%2F%2Fotcsvm%2Eotxlab%2Enet%3A8080%2FOTCS%2Fcs%2Eexe%3Ffunc%3Dotdsintegration%2Eredirect%26NextURL%3Dhttp%253A%252F%252Fotcsvm%252Eotxlab%252Enet%253A8080%252FOTCS%252Fcs%252Eexe%252Fapp%252Fnodes%252F2000&PostTicket=true&PostParams=true&ux_version=2&PreserveFragment=true&logon_style=signin-cs&logon_appname=OpenText%20Extended%20ECM%20CE%2023%2E3",
+    "title": "OpenText Authentication Service",
+    "evaluation": "Success - Successfully entered the username into the input field.",
+    "goal": "Enter the password and proceed to sign in.",
+    "actions": [
+      {
+        "input_text": {
+          "index": 3,
+          "text": "<secret>{{OTCS_PASSWORD}}</secret>",
+          "kwargs": false
+        }
+      },
+      {
+        "click_element_by_index": {
+          "index": 127
+        }
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "input",
+        "text": "Password",
+        "title": "Password",
+        "id": "otds_password",
+        "name": "otds_password",
+        "type": "password",
+        "role": "",
+        "aria-label": "Password",
+        "selectors": {
+          "xpath": "//*[@id=\"otds_password\"]",
+          "aria": "Password",
+          "preferred": "#otds_password",
+          "id": "#otds_password",
+          "type-name-combo": "input[type=\"password\"][name=\"otds_password\"]",
+          "name-attribute": "input[name=\"otds_password\"]",
+          "aria-attribute": "input[aria-label=\"Password\"]",
+          "parent-id-child": "#otds_password input",
+          "css-path": "#otds_password"
+        },
+        "recommended_selector": "#otds_password"
+      }
+    ]
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8090/otdsws/login?RFA=108c0e8f%2Da007%2D4165%2Dbb27%2Ddf981c095aa7%3Ahttp%3A%2F%2Fotcsvm%2Eotxlab%2Enet%3A8080%2FOTCS%2Fcs%2Eexe%3Ffunc%3Dotdsintegration%2Eredirect%26NextURL%3Dhttp%253A%252F%252Fotcsvm%252Eotxlab%252Enet%253A8080%252FOTCS%252Fcs%252Eexe%252Fapp%252Fnodes%252F2000&PostTicket=true&PostParams=true&ux_version=2&PreserveFragment=true&logon_style=signin-cs&logon_appname=OpenText%20Extended%20ECM%20CE%2023%2E3",
+    "title": "OpenText Authentication Service",
+    "evaluation": "Success - Successfully entered the password into the input field.",
+    "goal": "Proceed to sign in.",
+    "actions": [
+      {
+        "click_element_by_index": {
+          "index": 5
+        }
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "input",
+        "text": "",
+        "title": "",
+        "id": "signup",
+        "name": "signup",
+        "type": "hidden",
+        "role": "",
+        "aria-label": "",
+        "selectors": {
+          "xpath": "//*[@id=\"loginbutton\"]",
+          "text": "button:has-text(\"Sign in\")",
+          "preferred": "#signup",
+          "id": "#loginbutton",
+          "semantic-class": "button.submit-btn.highlighted-btn",
+          "parent-id-child": "#loginbutton button",
+          "css-path": "#loginbutton"
+        },
+        "recommended_selector": "#loginbutton"
+      }
+    ]
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000",
+    "title": "Enterprise - Extended ECM CE 23.3",
+    "evaluation": "Success - Successfully signed in to the system.",
+    "goal": "Click on 'Add Item'.",
+    "actions": [
+      {
+        "click_element_by_text": {
+          "text": "Add Item"
+        }
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "span",
+        "text": "",
+        "title": "",
+        "id": "",
+        "name": "",
+        "type": "",
+        "role": "link",
+        "aria-label": "",
+        "selectors": {
+          "aria": "Home page",
+          "preferred": "[aria-label=\"Home page\"]"
+        }
+      }
+    ]
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000",
+    "title": "Enterprise - Extended ECM CE 23.3",
+    "evaluation": "Success - Successfully clicked on 'Add Item'.",
+    "goal": "Upload the document using upload_file(index, path) action.",
+    "actions": [
+      {
+        "upload_file": {
+          "index": 8,
+          "path": "C:\\Users\\pnandank\\Downloads\\OpenText_AMS_ContentServer_Functional_Test_Document.docx"
+        }
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "div",
+        "text": "Add item",
+        "title": "Add item",
+        "id": "",
+        "name": "",
+        "type": "",
+        "role": "button",
+        "aria-label": "Add item",
+        "selectors": {
+          "xpath": "/html/body/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[3]/ul[1]/li[1]/a[1]",
+          "aria": "Create Business Workspace",
+          "preferred": "[aria-label=\"Create Business Workspace\"]",
+          "data-attribute": "a[data-binfToggle=\"dropdown\"]",
+          "aria-attribute": "a[aria-label=\"Add\\ item\"]",
+          "role": "[role=\"button\"]",
+          "css-path": "div:nth-child(3) > div:nth-child(2) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(3) > ul:nth-child(1) > li:nth-child(1) > a:nth-child(1)"
+        },
+        "recommended_selector": "a[data-binfToggle=\"dropdown\"]"
+      }
+    ]
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000",
+    "title": "Enterprise - Extended ECM CE 23.3",
+    "evaluation": "Success - Successfully clicked on 'Add Item'.",
+    "goal": "Upload the document using upload_file(index, path) action.",
+    "actions": [
+      {
+        "upload_file": {
+          "index": 11,
+          "path": "C:\\Users\\pnandank\\Downloads\\OpenText_AMS_ContentServer_Functional_Test_Document.docx"
+        }
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "div",
+        "text": "",
+        "title": "",
+        "id": "",
+        "name": "",
+        "type": "",
+        "role": "button",
+        "aria-label": "",
+        "selectors": {
+          "xpath": "/html/body/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[1]/div[3]/ul[1]/li[1]/ul[1]/li[3]/a[1]",
+          "text": "a:has-text(\"Document\")",
+          "aria": "Content Server Favorites",
+          "preferred": "[aria-label=\"Content Server Favorites\"]",
+          "data-attribute": "a[data-cstabindex=\"-\\31 \"]",
+          "css-path": "div:nth-child(3) > div:nth-child(2) > div:nth-child(2) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(1) > div:nth-child(3) > ul:nth-child(1) > li:nth-child(1) > ul:nth-child(2) > li:nth-child(3) > a:nth-child(1)"
+        },
+        "recommended_selector": "a[data-cstabindex=\"-\\31 \"]"
+      }
+    ]
+  },
+  {
+    "url": "http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000",
+    "title": "Enterprise - Extended ECM CE 23.3",
+    "evaluation": "Success - Successfully uploaded the document 'OpenText_AMS_ContentServer_Functional_Test_Document.docx'. The task did not specify to proceed further after uploading, so I will stop here as per instructions.",
+    "goal": "The task is complete as per instructions.",
+    "actions": [
+      {
+        "done": {
+          "text": "Successfully navigated to http://otcsvm.otxlab.net:8090/otdsws/login?RFA=108c0e8f%2Da007%2D4165%2Dbb27%2Ddf981c095aa7%3Ahttp%3A%2F%2Fotcsvm.otxlab.net%3A8080%2FOTCS%2Fcs.exe%3Ffunc%3Dotdsintegration.redirect&NextURL=http%253A%252F%252Fotcsvm.otxlab.net%253A8080%252FOTCS%252Fcs.exe%252Fapp%252Fnodes%252F2000&PostTicket=true&PostParams=true&ux_version=2&PreserveFragment=true&logon_style=signin-cs&logon_appname=OpenText Extended ECM CE 23.3, entered the username {{OTCS_USERNAME}} and password {{OTCS_PASSWORD}}, clicked 'Sign in', navigated to http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2000, clicked on 'Add Item' to proceed with adding a new item, uploaded the document using upload_file(index, path) action. The task is complete.",
+          "success": true
+        }
+      }
+    ],
+    "dom_elements": [
+      {
+        "tag": "span",
+        "text": "",
+        "title": "",
+        "id": "",
+        "name": "",
+        "type": "",
+        "role": "link",
+        "aria-label": "",
+        "selectors": {
+          "aria": "Home page",
+          "preferred": "[aria-label=\"Home page\"]"
+        }
+      }
+    ]
+  }
+]

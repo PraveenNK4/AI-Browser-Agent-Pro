@@ -1,0 +1,5 @@
+Testing extraction on: file:///C:/Users/pnandank/Downloads/Dynamic_Scrapper_4008 1/Dynamic_Scrapper_4008/Dynamic_Scrapper/web-ui/web-ui/test_page.html
+Test failed: Page.goto: net::ERR_FILE_NOT_FOUND at file:///C:/Users/pnandank/Downloads/Dynamic_Scrapper_4008%201/Dynamic_Scrapper_4008/Dynamic_Scrapper/web-ui/web-ui/test_page.html
+Call log:
+  - navigating to "file:///C:/Users/pnandank/Downloads/Dynamic_Scrapper_4008%201/Dynamic_Scrapper_4008/Dynamic_Scrapper/web-ui/web-ui/test_page.html", waiting until "load"
+

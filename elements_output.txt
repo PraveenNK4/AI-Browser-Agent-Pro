@@ -1,0 +1,275 @@
+Order  | Tag        | Visible  | ARIA                           | HTML Snippet
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+18     | div        | False    | Create Business Workspace      | <div class="conws-create-workspace-icon-container csui-acc-focusable-active" title="Create Business Workspace" aria-label="Create Business Workspace" role="button" aria-haspopup="true" aria-expanded="
+39     | div        | True     |                                | <div class="cs-perspective-panel" role="main"><div class="load-container csui-global binf-hidden">  <div class="outer-border">
+    <div class="loader"></div>
+    <div class="binf-sr-only" aria-live="p
+43     | div        | True     | Content of Enterprise          | <div class="csui-nodestable" role="region" aria-label="Content of Enterprise"><div class="csui-alternating-toolbars">
+  <div class="csui-table-tabletoolbar"><div class="csui-acc-tab-region"><div class
+44     | div        | True     | Table toolbar                  | <div class="csui-tabletoolbar tile-nav" aria-label="Table toolbar" role="toolbar">
+  <div class="csui-navigationToolbar"><ul role="none" class="csui-toolbar binf-nav binf-nav-pills csui-align-left"></
+50     | ul         | True     |                                | <ul role="none" class="csui-toolbar binf-nav binf-nav-pills csui-align-left"><li role="none" class="binf-dropdown csui-wrapper csui-more-dropdown-wrapper"><a href="#" role="button" class="binf-dropdow
+51     | li         | True     |                                | <li role="none" class="binf-dropdown csui-wrapper csui-more-dropdown-wrapper"><a href="#" role="button" class="binf-dropdown-toggle csui-acc-focusable " data-binf-toggle="dropdown" aria-expanded="fals
+52     | a          | True     | Add item                       | <a href="#" role="button" class="binf-dropdown-toggle csui-acc-focusable " data-binf-toggle="dropdown" aria-expanded="false" aria-haspopup="true" title="Add item" aria-label="Add item" tabindex="-1"><
+53     | svg        | True     |                                | <svg role="presentation" xmlns="http://www.w3.org/2000/svg" x="0px" y="0px" viewBox="0 0 32 32" class="csui-icon-v2 csui-icon-v2-with-states csui-icon-v2-size-normal csui-icon-v2-action-icon csui-icon
+54     | ul         | False    |                                | <ul class="binf-dropdown-menu csui-more-dropdown-menu csui-normal-scrolling binf-dropdown-align-left-bottom" role="menu" style="position: fixed; left: 60px; top: 71.6px;"><li data-csui-command="add" d
+55     | li         | False    |                                | <li data-csui-command="add" data-csui-addtype="298" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Collection
+    </a>
+</li>
+57     | li         | False    |                                | <li data-csui-command="add" data-csui-addtype="136" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Compound Document
+    </a>
+</l
+59     | li         | False    |                                | <li data-csui-command="add" data-csui-addtype="144" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Document
+    </a>
+</li>
+61     | li         | False    |                                | <li data-csui-command="addemailfolder" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Email Folder
+    </a>
+</li>
+63     | li         | False    |                                | <li data-csui-command="add" data-csui-addtype="0" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Folder
+    </a>
+</li>
+65     | li         | False    |                                | <li data-csui-command="add" data-csui-addtype="1" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Shortcut
+    </a>
+</li>
+67     | li         | False    |                                | <li data-csui-command="add" data-csui-addtype="140" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Web Address
+    </a>
+</li>
+68     | a          | False    |                                | <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Web Address
+    </a>
+69     | li         | False    |                                | <li data-csui-command="addwiki" role="none" class="">    <a href="#" class="csui-toolitem  csui-toolitem-textonly" data-cstabindex="-1" tabindex="-1">Wiki
+    </a>
+</li>
+94     | ul         | True     |                                | <ul role="none" class="csui-toolbar binf-nav binf-nav-pills csui-align-right"><li data-csui-command="toggledescription" role="none" class="">        <a href="#" title="Show description" role="button" 
+102    | li         | True     |                                | <li id="Favorite24785" role="none" class=""><div class="custom-view-region"><div>  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="cs
+103    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+109    | table      | True     | Content of Enterprise          | <table class="binf-table dataTable no-footer DTTT_selectable csui-table-spacing-medium" id="view2377" aria-label="Content of Enterprise"><thead><tr><th class="csui-table-cell-_select sorting_disabled"
+145    | tbody      | True     |                                | <tbody class="csui-normal-scrolling csui-no-scroll-x"><tr class="odd csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-v
+146    | tr         | True     |                                | <tr class="odd csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="ch
+167    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+168    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+169    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+171    | tr         | False    |                                | <tr class="csui-details-row csui-details-row-description binf-hidden csui-saved-item" style=""><td></td><td></td><td class="csui-details-row" colspan="5"><div class="cs-description">    <div class="cs
+174    | td         | False    |                                | <td class="csui-details-row" colspan="5"><div class="cs-description">    <div class="csui-description-colunm">
+            <span class="description " aria-label="This is a test file uploaded by automa
+175    | div        | False    |                                | <div class="cs-description">    <div class="csui-description-colunm">
+            <span class="description " aria-label="This is a test file uploaded by automation" title="This is a test file uploaded
+176    | div        | False    |                                | <div class="csui-description-colunm">
+            <span class="description " aria-label="This is a test file uploaded by automation" title="This is a test file uploaded by automation">
+               
+177    | span       | False    | This is a test file uploaded b | <span class="description " aria-label="This is a test file uploaded by automation" title="This is a test file uploaded by automation">
+                This is a test file uploaded by automation
+      
+178    | tr         | True     |                                | <tr class="even csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="c
+199    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+200    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+201    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+210    | tr         | True     |                                | <tr class="odd csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="ch
+231    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+232    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+233    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+242    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+263    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+264    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+265    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+267    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+290    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+291    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+292    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+294    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+314    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+315    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+316    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+318    | tr         | True     |                                | <tr class="odd csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="ch
+340    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+341    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+342    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+351    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+372    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+373    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+374    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+376    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+397    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+398    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+399    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+401    | tr         | True     |                                | <tr class="even csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="c
+422    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+423    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+424    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+433    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+456    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+457    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+458    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+460    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+483    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+484    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+485    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+487    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+508    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+509    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+510    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+512    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+533    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+534    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+535    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+537    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+558    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+559    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+560    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+562    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+583    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+584    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+585    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+587    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+594    | td         | True     |                                | <td class=" csui-table-cell-type" data-csui-attribute="type">    <a class="csui-table-cell-default-action" href="http://www.opentext.com" aria-label="URL opentext" tabindex="-1"><span class="csui-icon
+595    | a          | True     | URL opentext                   | <a class="csui-table-cell-default-action" href="http://www.opentext.com" aria-label="URL opentext" tabindex="-1"><span class="csui-icon-group" title="Web Address">  <svg role="presentation" xmlns="htt
+596    | span       | True     |                                | <span class="csui-icon-group" title="Web Address">  <svg role="presentation" xmlns="http://www.w3.org/2000/svg" x="0px" y="0px" viewBox="0 0 32 32" class="csui-icon-v2 csui-icon-v2-size-normal csui-ic
+608    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+609    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+610    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+612    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+633    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+634    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+635    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+637    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+658    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+659    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+660    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+662    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+683    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+684    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+685    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+687    | tr         | True     |                                | <tr class="odd csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="ch
+709    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+710    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+711    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+720    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+741    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+742    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+743    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+745    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+766    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+767    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+768    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+770    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+791    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+792    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+793    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+795    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+816    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+817    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+818    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+820    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+841    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+842    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+843    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+845    | tr         | True     |                                | <tr class="odd csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-c
+866    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+867    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+868    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+870    | tr         | True     |                                | <tr class="even csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="checkbox" class="csui-
+891    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+892    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+893    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+895    | tr         | True     |                                | <tr class="odd csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="ch
+916    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+917    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+918    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://
+927    | tr         | True     |                                | <tr class="even csui-has-details-row csui-saved-item"><td class=" csui-table-cell-_select" data-csui-attribute="_select"><div class="csui-control-view csui-checkbox-view"><button type="button" role="c
+934    | td         | True     |                                | <td class=" csui-table-cell-type" data-csui-attribute="type">    <a class="csui-table-cell-default-action" href="http://otds.com" aria-label="URL URL" tabindex="-1"><span class="csui-icon-group" title
+935    | a          | True     | URL URL                        | <a class="csui-table-cell-default-action" href="http://otds.com" aria-label="URL URL" tabindex="-1"><span class="csui-icon-group" title="Web Address">  <svg role="presentation" xmlns="http://www.w3.or
+936    | span       | True     |                                | <span class="csui-icon-group" title="Web Address">  <svg role="presentation" xmlns="http://www.w3.org/2000/svg" x="0px" y="0px" viewBox="0 0 32 32" class="csui-icon-v2 csui-icon-v2-size-normal csui-ic
+948    | td         | True     |                                | <td class="csui-table-cell-favorite csui-table-cell-last-visible" data-csui-attribute="favorite">  <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="b
+949    | div        | True     |                                | <div class="csui-favorite-star-view-container csui-favorite-popover-container">
+      <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Ad
+950    | button     | True     | Add Favorite                   | <button type="button" class="csui-favorite-star csui-acc-focusable" tabindex="-1" aria-haspopup="dialog" title="Add Favorite" aria-label="Add Favorite">
+        <svg role="presentation" xmlns="http://

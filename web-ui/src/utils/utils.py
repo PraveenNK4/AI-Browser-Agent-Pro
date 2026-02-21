@@ -1,4 +1,5 @@
 import base64
+import re
 import os
 import time
 from pathlib import Path
@@ -37,3 +38,15 @@ def get_latest_files(directory: str, file_types: list = ['.webm', '.zip']) -> Di
             print(f"Error getting latest {file_type} file: {e}")
 
     return latest_files
+
+
+def slugify(value: str) -> str:
+    """
+    Normalizes string, converts to lowercase, removes non-alpha characters,
+    and converts spaces to hyphens.
+    """
+    value = str(value)
+    # Remove non-word characters (everything except numbers and letters)
+    value = re.sub(r'[^\w\s-]', '', value).strip().lower()
+    # Replace all runs of whitespace with a single dash
+    return re.sub(r'[-\s]+', '-', value)

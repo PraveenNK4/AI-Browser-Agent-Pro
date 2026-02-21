@@ -1,0 +1,1 @@
+['wss_url', 'cdp_url', 'browser_class', 'browser_binary_path', 'chrome_remote_debugging_port', 'extra_browser_args', 'headless', 'disable_security', 'deterministic_rendering', 'keep_alive', 'proxy', 'new_context_config']

@@ -1,5 +1,6 @@
 import asyncio
 import pdb
+import os
 
 from playwright.async_api import Browser as PlaywrightBrowser
 from playwright.async_api import (
@@ -31,7 +32,6 @@ CHROME_ARGS = [
     '--no-crash-upload',
     '--disable-component-extensions-with-background-pages',
     '--disable-dev-shm-usage',
-    '--disable-extensions-except=/tmp/browser-use/extensions',
     '--disable-extensions-http-throttling',
     '--disable-blink-features=AutomationControlled',
     '--disable-web-security',
@@ -93,11 +93,26 @@ CHROME_HEADLESS_ARGS = [
     '--disable-dev-shm-usage',
 ]
 from browser_use.browser.context import BrowserContext, BrowserContextConfig
-from browser_use.browser.utils.screen_resolution import get_screen_resolution, get_window_adjustments
 from browser_use.utils import time_execution_async
 import socket
 
 from .custom_context import CustomBrowserContext
+
+
+def get_screen_resolution():
+    """Get screen resolution - fallback implementation."""
+    try:
+        import screeninfo
+        monitor = screeninfo.get_monitors()[0]
+        return {'width': monitor.width, 'height': monitor.height}
+    except ImportError:
+        # Fallback to default resolution
+        return {'width': 1920, 'height': 1080}
+
+
+def get_window_adjustments():
+    """Get window adjustments - fallback implementation."""
+    return 0, 0
 
 logger = logging.getLogger(__name__)
 
@@ -106,10 +121,42 @@ class CustomBrowser(Browser):
 
     async def new_context(self, config: BrowserContextConfig | None = None) -> CustomBrowserContext:
         """Create a browser context"""
-        browser_config = self.config.model_dump() if self.config else {}
-        context_config = config.model_dump() if config else {}
-        merged_config = {**browser_config, **context_config}
-        return CustomBrowserContext(config=BrowserContextConfig(**merged_config), browser=self)
+        # Only pass the context config, not merged with browser config
+        return CustomBrowserContext(config=config, browser=self)
+    
+    async def close(self, force: bool = False):
+        """Close the browser. If force=True, kills the browser process even if connected via CDP."""
+        if self.playwright_browser:
+            try:
+                if force:
+                    # Force kill browser process
+                    import psutil
+                    import signal
+                    
+                    # Find and kill Chrome/Chromium processes
+                    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                        try:
+                            if proc.info['name'] and 'chrome' in proc.info['name'].lower():
+                                # Check if this is our browser by looking for remote debugging port
+                                cmdline = proc.info.get('cmdline', [])
+                                if cmdline and any('remote-debugging-port' in str(arg) for arg in cmdline):
+                                    logger.info(f"Force killing Chrome process: PID {proc.info['pid']}")
+                                    proc.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                
+                await self.playwright_browser.close()
+                self.playwright_browser = None
+                logger.info("Browser closed successfully")
+            except Exception as e:
+                logger.error(f"Error closing browser: {e}")
+        
+        if self.playwright:
+            try:
+                await self.playwright.stop()
+                self.playwright = None
+            except Exception as e:
+                logger.error(f"Error stopping playwright: {e}")
 
     async def _setup_builtin_browser(self, playwright: Playwright) -> PlaywrightBrowser:
         """Sets up and returns a Playwright Browser instance with anti-detection measures."""
@@ -141,10 +188,13 @@ class CustomBrowser(Browser):
             *(CHROME_HEADLESS_ARGS if self.config.headless else []),
             *(CHROME_DISABLE_SECURITY_ARGS if self.config.disable_security else []),
             *(CHROME_DETERMINISTIC_RENDERING_ARGS if self.config.deterministic_rendering else []),
-            f'--window-position={offset_x},{offset_y}',
-            f'--window-size={screen_size["width"]},{screen_size["height"]}',
             *self.config.extra_browser_args,
         }
+
+        # Only add window size/pos if NOT maximizing
+        if "--start-maximized" not in chrome_args:
+            chrome_args.add(f'--window-position={offset_x},{offset_y}')
+            chrome_args.add(f'--window-size={screen_size["width"]},{screen_size["height"]}')
 
         # check if chrome remote debugging port is already taken,
         # if so remove the remote-debugging-port arg to prevent conflicts
@@ -153,6 +203,10 @@ class CustomBrowser(Browser):
                 chrome_args.remove(f'--remote-debugging-port={self.config.chrome_remote_debugging_port}')
 
         browser_class = getattr(playwright, self.config.browser_class)
+        
+        # Always launch a fresh browser - CDP reuse removed for testing stability
+        logger.info("Launching fresh browser instance")
+
         args = {
             'chromium': list(chrome_args),
             'firefox': [

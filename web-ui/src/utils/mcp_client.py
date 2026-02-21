@@ -6,7 +6,10 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Type, Union, get_type_hints
 
 from browser_use.controller.registry.views import ActionModel
-from langchain.tools import BaseTool
+try:
+    from langchain.tools import BaseTool
+except ImportError:
+    from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel, Field, create_model
 from pydantic.v1 import BaseModel, Field

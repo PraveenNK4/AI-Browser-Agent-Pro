@@ -45,8 +45,14 @@ from langchain_mistralai import ChatMistralAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
-from langchain_ibm import ChatWatsonx
-from langchain_aws import ChatBedrock
+try:
+    from langchain_ibm import ChatWatsonx
+except ImportError:
+    ChatWatsonx = None
+try:
+    from langchain_aws import ChatBedrock
+except ImportError:
+    ChatBedrock = None
 from pydantic import SecretStr
 
 

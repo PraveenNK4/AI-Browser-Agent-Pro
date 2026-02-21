@@ -1,4 +1,19 @@
 import gradio as gr
+import asyncio
+
+# Monkey patch to fix pending_message_lock issue
+import gradio.queueing
+
+original_init = gradio.queueing.Queue.__init__
+
+def patched_init(self, *args, **kwargs):
+    original_init(self, *args, **kwargs)
+    if not hasattr(self, 'pending_message_lock') or self.pending_message_lock is None:
+        self.pending_message_lock = asyncio.Lock()
+    if not hasattr(self, 'delete_lock') or self.delete_lock is None:
+        self.delete_lock = asyncio.Lock()
+
+gradio.queueing.Queue.__init__ = patched_init
 
 from src.webui.webui_manager import WebuiManager
 from src.webui.components.browser_use_agent_tab import create_browser_use_agent_tab
@@ -56,6 +71,8 @@ def create_ui(theme_name="Ocean"):
     with gr.Blocks(
             title="AI Browser Agent Pro", theme=theme_map[theme_name], css=css, js=js_func,
     ) as demo:
+        # Initialize queue with explicit settings
+        gr.set_static_paths(paths=[])
         with gr.Row():
             gr.Markdown(
                 """
