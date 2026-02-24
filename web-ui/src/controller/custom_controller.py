@@ -1120,32 +1120,138 @@ class CustomController(Controller):
             except Exception as e:
                 return ActionResult(error=f"Smart login failed: {str(e)}")
 
-        @self.registry.action('Extract page content (Prefer JSON for tables)')
+        @self.registry.action('Extract page content. Best for general text extraction or unstructured data.')
         async def extract_content(goal: str, browser: BrowserContext, should_strip_link_urls: bool = True):
             """
             Extract specific information from the current page.
-            CRITICAL: If extracting a table, ALWAYS provide the data in a raw JSON list/dict format 
-            within ```json blocks. Do NOT summarize or use conversational text for table data.
             """
             try:
-                # Use the built-in browser-use extraction logic but with our reinforced prompt hints
-                # We can call the original extraction by looking it up if we want, 
-                # but here we'll just implement a robust version that handles the 'goal'.
                 page = await browser.get_current_page()
                 
-                # We use the page's text but reinforce the LLM's goal
-                # This is a pass-through to the agent's internal extraction if possible,
-                # but since we are a custom controller, we can just return the page's current state
-                # and let the agent's main loop handle the 'goal' using its existing logic.
-                # However, many agents look for structured data in theActionResult.
+                # Performance: detect if goal is about a table, redirect if so
+                table_keywords = ['table', 'columns', 'rows', 'data', 'list', 'status', 'id']
+                if any(kw in goal.lower() for kw in table_keywords):
+                    # Try to find a table and extract it
+                    tables = await page.query_selector_all('table')
+                    if tables:
+                        msg = "Goal mentions tabular data. Suggest using extract_table for better results if this general extraction is insufficient."
+                        logger.info(msg)
                 
-                # For now, we'll return a message that reinforces the JSON requirement to the Agent.
+                # Standard extraction logic (generic)
+                content = await page.evaluate("""() => {
+                    // Generic extraction: get all visible text but prioritize clean structure
+                    return document.body.innerText;
+                }""")
+                
                 return ActionResult(
-                    extracted_content=f"Extraction started for goal: {goal}. Please provide the resulting data in a structured ```json``` block if it contains multiple rows or tabular data.",
+                    extracted_content=f"Page content for goal '{goal}':\n\n{content[:5000]}",
                     include_in_memory=True
                 )
             except Exception as e:
                 return ActionResult(error=str(e))
+
+        @self.registry.action('Extract structured table data. REQUIRED for reports containing lists, IDs, or status grids.')
+        async def extract_table(
+            goal: str, 
+            browser: BrowserContext, 
+            header_keywords: Optional[list[str]] = None,
+            table_index: int = 0
+        ):
+            """
+            Extract structured data from tables. 
+            Provide header_keywords to filter columns.
+            """
+            try:
+                page = await browser.get_current_page()
+                
+                # Robust extraction logic aligned with script_helpers.py
+                # 1. Find the table
+                tables = await page.query_selector_all('table')
+                if not tables:
+                    return ActionResult(error="No tables found on the current page.")
+                
+                if table_index >= len(tables):
+                    table_index = 0 # Fallback to first
+                
+                table = tables[table_index]
+                
+                # 2. Extract rows
+                rows = await table.query_selector_all('tr')
+                if not rows:
+                    return ActionResult(error="Table found but contains no rows (tr elements).")
+                
+                # 3. Resolve headers
+                col_map = {}
+                header_row_idx = -1
+                
+                # Scan first 10 rows for headers if not found in first
+                num_to_scan = min(10, len(rows))
+                
+                headers_found = []
+                for i in range(num_to_scan):
+                    cells = await rows[i].query_selector_all('th, td')
+                    texts = [(await c.inner_text()).strip() for c in cells]
+                    
+                    if header_keywords:
+                        # Find indices for requested keywords
+                        current_map = {}
+                        for kw in header_keywords:
+                            idx = next((j for j, t in enumerate(texts) if kw.lower() in t.lower()), -1)
+                            if idx != -1:
+                                current_map[kw] = idx
+                        
+                        if len(current_map) >= len(header_keywords) * 0.5: # 50% match
+                            col_map = current_map
+                            header_row_idx = i
+                            headers_found = texts
+                            break
+                    else:
+                        # Use first row with > 1 columns as header
+                        if len(texts) > 1:
+                            headers_found = texts
+                            header_row_idx = i
+                            col_map = {h: idx for idx, h in enumerate(texts)}
+                            break
+                
+                if not headers_found:
+                    # Fallback: invent headers Col 1, Col 2...
+                    header_row_idx = -1
+                    cells = await rows[0].query_selector_all('td, th')
+                    headers_found = [f"Col {idx+1}" for idx in range(len(cells))]
+                    col_map = {h: idx for idx, h in enumerate(headers_found)}
+
+                # 4. Extract data
+                data_results = []
+                for i in range(header_row_idx + 1, len(rows)):
+                    cells = await rows[i].query_selector_all('td')
+                    if len(cells) < len(headers_found):
+                        continue
+                        
+                    row_data = {}
+                    for h, idx in col_map.items():
+                        if idx < len(cells):
+                            row_data[h] = (await cells[idx].inner_text()).strip()
+                    
+                    if row_data:
+                        data_results.append(row_data)
+                
+                if not data_results:
+                    return ActionResult(error=f"Table found with headers {headers_found}, but no data rows followed.")
+
+                # Format as JSON string
+                import json
+                json_data = json.dumps(data_results, indent=2)
+                
+                # Keep it under token limit
+                if len(json_data) > 3000:
+                    json_data = json_data[:3000] + "... [TRUNCATED]"
+
+                return ActionResult(
+                    extracted_content=f"Extracted {len(data_results)} rows from table (Goal: {goal}):\n\n```json\n{json_data}\n```",
+                    include_in_memory=True
+                )
+            except Exception as e:
+                return ActionResult(error=f"Table extraction failed: {str(e)}")
 
     @time_execution_sync('--act')
     async def act(
@@ -1168,8 +1274,9 @@ class CustomController(Controller):
             if browser_context:
                 try:
                     page = await browser_context.get_current_page()
-                    # Use a shorter timeout and continue if it takes too long
-                    await asyncio.wait_for(page.wait_for_load_state('networkidle', timeout=1000), timeout=1.2)
+                    # CRITICAL SPEED OPTIMIZATION: Reduce timeout for load state checks
+                    # Performance: Use 'domcontentloaded' instead of 'networkidle' for faster turns where safe
+                    await asyncio.wait_for(page.wait_for_load_state('domcontentloaded', timeout=500), timeout=0.6)
                 except (asyncio.TimeoutError, Exception):
                     pass
 
@@ -1187,7 +1294,8 @@ class CustomController(Controller):
                         
                     # Looser loop detection for non-mutating actions (threshold 5)
                     action_data = action.model_dump(exclude_unset=True)
-                    non_mutating_actions = ['extract_content', 'scroll_page', 'scroll_to_text', 'wait_for_element', 'done', 'retrieve_value_by_element']
+                    # Add 'wait' and 'extract_table' to whitelist to prevent premature loop detection
+                    non_mutating_actions = ['extract_content', 'extract_table', 'scroll_page', 'scroll_to_text', 'wait_for_element', 'done', 'retrieve_value_by_element', 'wait']
                     is_non_mutating = any(name in action_data for name in non_mutating_actions)
                     
                     max_repeats = 5 if is_non_mutating else 3

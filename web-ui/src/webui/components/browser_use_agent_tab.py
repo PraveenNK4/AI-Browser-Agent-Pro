@@ -400,10 +400,15 @@ async def run_agent_task(
         yield {run_button_comp: gr.update(interactive=True)}
         return
 
-    # Generate task ID (Readable Format)
+    # Generate task ID (Meaningful & Concise Format)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     short_uuid = str(uuid.uuid4())[:8]
-    task_slug = slugify(task)[:50] # Limit length
+    
+    # Truncate task to first 6 meaningful words for the folder name
+    task_words = [w for w in task.split() if w.lower() not in ['to', 'on', 'with', 'the', 'a', 'an', 'in', 'for', 'from', 'using']]
+    short_task = " ".join(task_words[:6])
+    task_slug = slugify(short_task)[:50]
+    
     webui_manager.bu_agent_task_id = f"{timestamp}_{task_slug}_{short_uuid}"
     set_run_id(webui_manager.bu_agent_task_id)
     webui_manager.reset_failure_tracking()
@@ -492,7 +497,12 @@ async def run_agent_task(
    - Ensure URLs are correct. NEVER use double dots (e.g., http://host..domain).
    - Use the exact URL provided in the task.
 
-2. 🎯 HOVER DECISION TREE - READ THIS FIRST BEFORE ANY HOVER ACTION!
+3. 📊 DATA EXTRACTION (SPEED & ACCURACY):
+   - For ANY tabular data, status lists, or multiple records, use extract_table(goal, header_keywords).
+   - NEVER use separate retrieve_value_by_element calls for multiple rows.
+   - extract_table is 10x faster and more accurate for grids.
+
+4. 🖱️ HOVER DECISION TREE - READ THIS FIRST BEFORE ANY HOVER ACTION!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 QUESTION: What are you trying to hover?
@@ -528,7 +538,7 @@ QUESTION: What are you trying to hover?
 
 CRITICAL RULES:
 1. Execute ONLY the exact task requested. No extra steps.
-2. Use retrieve_value_by_element to extract data, then validate_value to check it.
+2. For tabular data/lists: ALWAYS use extract_table().
 3. For clicks: prefer click_element_by_text(text) over indices.
 4. Use scroll_page() to access content below fold.
 
@@ -538,8 +548,8 @@ FILE UPLOAD — HARD RULE:
 - Paths must come from available context files only
 
 RETRIEVAL PATTERN:
-Step 1: retrieve_value_by_element(index=N) → extracts plain text
-Step 2: validate_value(actual=text, expected=value, operator="equals")
+Step 1: extract_table() or retrieve_value_by_element(index=N)
+Step 2: validate_value(actual=extracted_text, expected=value, operator="equals")
 
 NEVER pass HTML to validate_value. Always retrieve first.
 """

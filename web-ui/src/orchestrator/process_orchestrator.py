@@ -463,9 +463,21 @@ async def run_all_processes(
     # Create orchestration output directory
     if orchestration_output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Add a hint from the first process name for better folder naming
+        hint = ""
+        if processes:
+            try:
+                from src.utils.utils import slugify
+                # Simplified hint: first 4 words of the first process
+                p_words = [w for w in processes[0].name.split() if w.lower() not in ['to', 'on', 'with', 'the', 'a', 'an', 'in', 'for', 'from', 'using']]
+                hint = "_" + slugify(" ".join(p_words[:4]))[:30]
+            except Exception:
+                pass
+                
         orchestration_output_dir = os.path.join(
             agent_history_path,
-            f'orchestration_{timestamp}'
+            f'orchestration_{timestamp}{hint}'
         )
     
     os.makedirs(orchestration_output_dir, exist_ok=True)
