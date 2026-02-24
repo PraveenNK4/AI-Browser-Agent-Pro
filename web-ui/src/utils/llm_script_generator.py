@@ -90,6 +90,7 @@ else:
     sys.path.append(current_dir)
 
 from src.utils.vault import vault
+from src.utils.report_templates import generate_script_report
 
 # ── Configuration (adjust via environment or inline) ──
 TIMEOUT_FILL_MS        = int(os.environ.get("TIMEOUT_FILL_MS", "{TIMEOUT_FILL_MS}"))
@@ -292,7 +293,7 @@ Write a COMPLETE, STANDALONE Python script that:
         If `dom_elements` is empty, use scoped selectors like `form#id table`.
         NEVER hallucinate selectors. NEVER use bare `"table"` — always scope it.
 
-    6.  **Report output** — Print results in a clear format and save to a timestamped `.txt` file.
+    6.  **Report output** — Print results in a clear format. At the END of the script, call `generate_script_report()` to save a Word (.docx) report. NEVER save results to a `.txt` file.
 
     7.  **URL handling** — CRITICAL: Use the BASE application URL (e.g. `http://host/app/`),
         NOT login/auth redirect URLs. The base URL auto-redirects to login if needed.
@@ -332,6 +333,21 @@ Write a COMPLETE, STANDALONE Python script that:
     15. **Scrolling Resilience** — If the execution history shows `scroll_to_text(...)` failing (text not found or visible), or if you need to reach the bottom of a long page (like a Distributed Agent Status page with many workers):
         - Prefer `await page.mouse.wheel(0, 800)` or `scroll_page(direction='down', amount=800)` logic if text-based scrolling is brittle.
         - ALWAYS add `await page.wait_for_timeout(1000)` after a large scroll to allow lazy-loaded content to render.
+
+    16. **Word Report** — At the END of the script (before `await browser.close()`), call:
+        ```python
+        steps = []  # Build this as you go: steps.append({"action": "action_name", "output": "captured text"})
+        generate_script_report(
+            script_name=os.path.basename(__file__),
+            steps=steps,
+            screenshots_dir=str(SCREENSHOT_DIR),
+            output_path=str(SCREENSHOT_DIR.parent / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"),
+            status="Execution Complete",
+            captured_outputs="<combined text output>",
+        )
+        ```
+        Build the `steps` list incrementally: after each action or extraction, append a dict with `{"action": ..., "output": ...}`.
+        The `screenshots_dir` is SCREENSHOT_DIR, which already holds the numbered screenshots.
 
 ### 📝 STRUCTURE
 Use this header, then write helper functions and `async def run()`:

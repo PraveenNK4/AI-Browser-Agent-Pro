@@ -3,12 +3,8 @@ Generate DOCX report from Playwright script execution with screenshots and step 
 """
 
 import json
-import base64
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Inches
+from typing import Optional
 
 
 def generate_playwright_report(
@@ -17,7 +13,7 @@ def generate_playwright_report(
     execution_log_path: Optional[Path] = None,
 ) -> Optional[Path]:
     """
-    Generate DOCX report from Playwright execution history.
+    Generate DOCX report from Playwright execution history using the script template.
     
     Args:
         history_json_path: Path to agent history JSON
@@ -28,33 +24,16 @@ def generate_playwright_report(
         Path to generated DOCX report or None if generation failed
     """
     try:
+        from src.utils.report_templates import generate_script_report
+
         with history_json_path.open('r', encoding='utf-8') as f:
             data = json.load(f)
         
-        steps = data.get('history', []) if isinstance(data, dict) else data
+        raw_steps = data.get('history', []) if isinstance(data, dict) else data
         
-        doc = Document()
-        doc.add_heading('Playwright Automation Report', 0)
-        
-        # Summary section
-        doc.add_heading('Execution Summary', level=1)
-        summary_para = doc.add_paragraph()
-        summary_para.add_run('Script: ').bold = True
-        summary_para.add_run(f"{history_json_path.stem}.py")
-        
-        summary_para = doc.add_paragraph()
-        summary_para.add_run('Source: ').bold = True
-        summary_para.add_run('AI Browser Agent')
-        
-        summary_para = doc.add_paragraph()
-        summary_para.add_run('Status: ').bold = True
-        summary_para.add_run('Execution Complete')
-        
-        # Steps section
-        doc.add_heading('Automation Steps', level=1)
-        
-        step_counter = 0
-        for step_idx, step in enumerate(steps, 1):
+        # Build the steps list for the report
+        steps = []
+        for step_idx, step in enumerate(raw_steps, 1):
             if not isinstance(step, dict):
                 continue
             
@@ -64,66 +43,35 @@ def generate_playwright_report(
             if not actions:
                 continue
             
-            for action_idx, action in enumerate(actions):
+            for action in actions:
                 if not isinstance(action, dict) or not action:
                     continue
-                
                 action_name = list(action.keys())[0]
-                params = action.get(action_name, {})
-                dom_ctx = action.get('dom_context', {})
                 
-                step_counter += 1
+                output_text = ""
+                result = step.get('result', {})
+                if isinstance(result, dict):
+                    output_text = result.get('extracted_content', '') or result.get('url', '') or ''
+                elif isinstance(result, list) and result:
+                    first_r = result[0] if isinstance(result[0], dict) else {}
+                    output_text = first_r.get('extracted_content', '') or first_r.get('url', '') or str(result[0])[:200]
                 
-                # Step heading
-                doc.add_heading(f'Step {step_counter}: {action_name}', level=2)
-                
-                # Action details
-                details_table = doc.add_table(rows=1, cols=2)
-                details_table.style = 'Table Grid'
-                
-                # Action type
-                row = details_table.rows[0]
-                row.cells[0].text = 'Action'
-                row.cells[1].text = action_name
-                
-                # Action parameters
-                if params:
-                    row = details_table.add_row().cells
-                    row[0].text = 'Parameters'
-                    
-                    param_lines = []
-                    for key, value in params.items():
-                        if key != 'index':
-                            param_lines.append(f"{key}: {str(value)[:50]}")
-                    row[1].text = '\n'.join(param_lines) if param_lines else 'N/A'
-                
-                # DOM context (selector used)
-                if dom_ctx:
-                    row = details_table.add_row().cells
-                    row[0].text = 'Selector'
-                    attrs = dom_ctx.get('attributes', {})
-                    selectors = dom_ctx.get('selectors', {})
-                    selector = selectors.get('css', '') or f"#{attrs.get('id', 'N/A')}"
-                    row[1].text = selector
-                
-                # Screenshot if available
-                if screenshots_dir and screenshots_dir.exists():
-                    screenshot_path = screenshots_dir / f"{step_counter - 1}.png"
-                    if screenshot_path.exists():
-                        try:
-                            doc.add_paragraph()
-                            doc.add_paragraph('Screenshot:')
-                            doc.add_picture(str(screenshot_path), width=Inches(6))
-                        except Exception as e:
-                            doc.add_paragraph(f"[Screenshot unavailable: {e}]")
-                
-                doc.add_paragraph()
+                steps.append({
+                    "action": action_name,
+                    "output": output_text[:200] if output_text else "N/A",
+                })
         
-        # Save report
         report_path = history_json_path.parent / f"{history_json_path.stem}_playwright_report.docx"
-        doc.save(str(report_path))
         
-        return report_path
+        result = generate_script_report(
+            script_name=f"{history_json_path.stem}.py",
+            steps=steps,
+            screenshots_dir=str(screenshots_dir) if screenshots_dir else None,
+            output_path=str(report_path),
+            status="Execution Complete",
+        )
+        
+        return Path(result) if result else None
     
     except Exception as e:
         print(f"Error generating Playwright report: {e}")

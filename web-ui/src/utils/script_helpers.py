@@ -329,10 +329,11 @@ async def generate_report(
     status: bool,
     screenshot=None,
     output: str = None,
+    steps: list = None,
+    screenshots_dir: str = None,
 ) -> None:
-    """Print extracted data and save a .docx report in the script's directory."""
+    """Print extracted data and save a .docx report using the script template."""
     from datetime import datetime
-    from docx import Document
 
     print("\n" + "=" * 60)
     print(f"📋 EXTRACTED DATA: {scenario}")
@@ -342,19 +343,39 @@ async def generate_report(
     print("=" * 60 + "\n")
 
     try:
+        from src.utils.report_templates import generate_script_report
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         script_dir = os.path.dirname(os.path.abspath(__file__))
         report_path = os.path.join(script_dir, f"report_{timestamp}.docx")
 
-        doc = Document()
-        doc.add_heading(f"Report: {scenario}", 0)
-        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        doc.add_paragraph(f"Status: {'SUCCESS' if status else 'FAILED'}")
-        if output:
-            doc.add_paragraph(f"Output:\n{output}")
-        if screenshot:
-            doc.add_picture(io.BytesIO(screenshot))
-        doc.save(report_path)
-        print(f"[+] Report saved: {report_path}")
+        # Build steps list if not provided
+        if not steps:
+            steps = [{"action": scenario, "output": output or "N/A"}]
+
+        result = generate_script_report(
+            script_name=f"{scenario}_{timestamp}",
+            steps=steps,
+            screenshots_dir=screenshots_dir,
+            output_path=report_path,
+            status="SUCCESS" if status else "FAILED",
+            captured_outputs=output,
+        )
+        if result:
+            print(f"[+] Report saved: {result}")
+        else:
+            # Fallback: basic docx if template fails
+            from docx import Document
+            doc = Document()
+            doc.add_heading(f"Report: {scenario}", 0)
+            doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            doc.add_paragraph(f"Status: {'SUCCESS' if status else 'FAILED'}")
+            if output:
+                doc.add_paragraph(f"Output:\n{output}")
+            if screenshot:
+                doc.add_picture(io.BytesIO(screenshot))
+            doc.save(report_path)
+            print(f"[+] Report saved (fallback): {report_path}")
     except Exception as e:
         print(f"[-] Report generation failed: {e}")
+

@@ -249,152 +249,39 @@ async def _handle_new_step(
 
 
 def generate_docx_report(webui_manager: WebuiManager, history: AgentHistoryList, task: str):
-    """Generate comprehensive DOCX report with screenshots and findings."""
+    """Generate comprehensive DOCX report using the execution template."""
     try:
-        logger.info("Generating DOCX report...")
+        logger.info("Generating DOCX report via template...")
         if not webui_manager or not hasattr(webui_manager, 'bu_agent_task_id'):
             logger.error("Missing webui_manager or task_id")
             return None
-        
-        doc = Document()
-        doc.add_heading('AI Browser Agent Execution Report', 0)
 
-        # Task summary
-        doc.add_heading('Task Summary', level=1)
-        task_para = doc.add_paragraph()
-        task_para.add_run('Task: ').bold = True
-        task_para.add_run(task)
+        from src.utils.report_templates import generate_execution_report
 
-        duration = history.total_duration_seconds()
-        tokens = history.total_input_tokens()
-        final_result = history.final_result()
-
-        summary_table = doc.add_table(rows=5, cols=2)
-        summary_table.style = 'Table Grid'
-        summary_table.rows[0].cells[0].text = 'Duration'
-        summary_table.rows[0].cells[1].text = f"{duration:.2f}s"
-        summary_table.rows[1].cells[0].text = 'Tokens'
-        summary_table.rows[1].cells[1].text = str(tokens)
-        summary_table.rows[2].cells[0].text = 'Steps'
-        summary_table.rows[2].cells[1].text = str(len(history.history))
-        summary_table.rows[3].cells[0].text = 'Status'
-        summary_table.rows[3].cells[1].text = 'Completed' if final_result else 'Failed'
-        summary_table.rows[4].cells[0].text = 'Task ID'
-        summary_table.rows[4].cells[1].text = webui_manager.bu_agent_task_id or 'Unknown'
-
-        # Final result
-        doc.add_heading('Final Result', level=1)
-        if final_result:
-            result_para = doc.add_paragraph()
-            result_para.add_run('Outcome: ').bold = True
-            result_para.add_run(final_result)
-        
-        step_failures = getattr(webui_manager, 'bu_step_failures', {})
-        total_failures = sum(step_failures.values())
-        status_para = doc.add_paragraph()
-        status_para.add_run('Status: ').bold = True
-        if total_failures > 0:
-            status_para.add_run(f"Completed with {total_failures} failures")
-        else:
-            status_para.add_run("All steps successful")
-
-        # Step details
-        doc.add_heading('Step-by-Step Execution', level=1)
-        for i, step in enumerate(history.history, 1):
-            step_status = "PASS" if step_failures.get(i, 0) == 0 else f"FAIL ({step_failures.get(i, 0)}x)"
-            doc.add_heading(f'Step {i} - {step_status}', level=2)
-
-            # Goal
-            goal_para = doc.add_paragraph()
-            goal_para.add_run('Goal: ').bold = True
-            goal_text = "Execute action"
-            if hasattr(step, 'model_output') and step.model_output:
-                if hasattr(step.model_output, 'current_state') and step.model_output.current_state:
-                    if hasattr(step.model_output.current_state, 'next_goal') and step.model_output.current_state.next_goal:
-                        goal_text = str(step.model_output.current_state.next_goal)
-            goal_para.add_run(goal_text)
-
-            # Action
-            action_para = doc.add_paragraph()
-            action_para.add_run('Action: ').bold = True
-            action_desc = "No action"
-            if hasattr(step, 'action'):
-                action = getattr(step, 'action', None)
-                if action:
-                    action_desc = str(action[0]) if isinstance(action, (list, tuple)) else str(action)
-            action_para.add_run(action_desc)
-
-            # Screenshot
-            if hasattr(step, 'state') and hasattr(step.state, 'screenshot') and step.state.screenshot:
-                try:
-                    screenshot_data = step.state.screenshot
-                    if screenshot_data.startswith('data:image'):
-                        screenshot_data = screenshot_data.split(',')[1]
-                    image_data = base64.b64decode(screenshot_data)
-                    image = Image.open(io.BytesIO(image_data))
-                    
-                    if image.width > 900:
-                        ratio = 900 / image.width
-                        image = image.resize((int(image.width * ratio), int(image.height * ratio)), Image.Resampling.LANCZOS)
-                    
-                    if image.mode in ("RGBA", "LA", "P"):
-                        image = image.convert("RGB")
-                    
-                    img_buffer = io.BytesIO()
-                    image.save(img_buffer, format='JPEG', quality=95)
-                    img_buffer.seek(0)
-                    
-                    doc.add_picture(img_buffer, width=Inches(6))
-                    caption = doc.add_paragraph(f'Step {i} screenshot')
-                    caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                except Exception as e:
-                    logger.warning(f"Failed to add screenshot for step {i}: {e}")
-
-            # Result
-            result_para = doc.add_paragraph()
-            result_para.add_run('Result: ').bold = True
-            result_text = "No result"
-            if hasattr(step, 'result') and step.result:
-                # result is list[ActionResult], take first if available
-                if isinstance(step.result, list) and len(step.result) > 0:
-                    first_result = step.result[0]
-                    if hasattr(first_result, 'extracted_content'):
-                        extracted = getattr(first_result, 'extracted_content', None)
-                        if extracted:
-                            result_text = str(extracted)
-                        else:
-                            result_text = str(first_result)
-                    else:
-                        result_text = str(first_result)
-                else:
-                    result_text = str(step.result)
-            result_para.add_run(result_text)
-
-            doc.add_paragraph()
-
-        # Errors
-        errors = history.errors()
-        if errors and any(errors):
-            doc.add_heading('Errors', level=1)
-            for error in errors:
-                if error:
-                    doc.add_paragraph(f'Error: {str(error)}')
-
-        # Save
         task_id = webui_manager.bu_agent_task_id
         if not task_id:
             logger.error("Task ID is None")
             return None
+
         agent_history_path = os.getenv("AGENT_HISTORY_PATH", "./tmp/agent_history")
         task_dir = os.path.join(agent_history_path, task_id)
         os.makedirs(task_dir, exist_ok=True)
-        
-        # Sanitize task_id for filename (it may contain slashes if it's a nested process)
+
         safe_filename = task_id.replace("/", "_").replace("\\", "_")
         docx_path = os.path.join(task_dir, f"{safe_filename}_report.docx")
-        doc.save(docx_path)
-        logger.info(f"DOCX report saved: {docx_path}")
-        return docx_path
+
+        step_failures = getattr(webui_manager, 'bu_step_failures', {})
+
+        result = generate_execution_report(
+            history=history,
+            task=task,
+            task_id=task_id,
+            output_path=docx_path,
+            step_failures=step_failures,
+        )
+        if result:
+            logger.info(f"DOCX report saved: {result}")
+        return result
     except Exception as e:
         logger.error(f"DOCX generation failed: {e}", exc_info=True)
         return None
