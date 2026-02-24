@@ -1,0 +1,13 @@
+HEALTH CHECK CONSOLIDATED REPORT - 20260223_164755
+========================================
+
+--- Admin Server Report ---
+Server: Unknown | Status: Active | Errors: 0
+
+--- Partition Map Report ---
+
+--- Worker Status Report ---
+{'Distributed Agent ID': '', 'Status': 'Sleeping for 0.5 seconds...', 'Last Update': 'Idle'}
+{'Distributed Agent ID': '02/23/2026 03:17 AM', 'Status': '', 'Last Update': 'Sleeping for 0.5 seconds...'}
+{'Distributed Agent ID': '', 'Status': '02/23/2026 03:17 AM', 'Last Update': ''}
+

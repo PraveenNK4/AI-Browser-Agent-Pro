@@ -389,28 +389,36 @@ def generate_action_code(action: Dict[str, Any], action_name: str, table_selecto
         # Include Smart Login block only for the first navigation
         login_block = ""
         if step_index == 1:
-            login_block = '''
+            from src.utils.config import (
+                VAULT_CREDENTIAL_PREFIX,
+                LOGIN_USER_SELECTORS, LOGIN_PASS_SELECTORS, LOGIN_SUBMIT_SELECTORS,
+            )
+            user_sel_list  = repr(LOGIN_USER_SELECTORS)
+            pass_sel_list  = repr(LOGIN_PASS_SELECTORS)
+            submit_sel_list = repr(LOGIN_SUBMIT_SELECTORS)
+            vault_pfx      = VAULT_CREDENTIAL_PREFIX
+            login_block = f'''
             # Smart Login Check (Golden Standard)
             print("[*] Checking if login is required...")
             is_login_page = await page.evaluate('() => document.querySelectorAll("input[type=\\'password\\']").length > 0')
             if is_login_page:
                 print("  [!] Login page detected. Performing Vault-based login...")
-                user = get_secret("OTCS_USERNAME")
-                passwd = get_secret("OTCS_PASSWORD")
-                
-                if user and passwd and not user.startswith("{{"):
+                user = get_secret("{vault_pfx}_USERNAME")
+                passwd = get_secret("{vault_pfx}_PASSWORD")
+
+                if user and passwd and not user.startswith("{{{{"):
                     # Fill User
-                    for sel in ['#otds_username', 'input[name="otds_username"]', '#username']:
+                    for sel in {user_sel_list}:
                         if await page.locator(sel).count() > 0:
                             await page.fill(sel, user)
                             break
                     # Fill Password
-                    for sel in ['#otds_password', 'input[name="otds_password"]', '#password']:
+                    for sel in {pass_sel_list}:
                         if await page.locator(sel).count() > 0:
                             await page.fill(sel, passwd)
                             break
                     # Submit
-                    for sel in ['button[type="submit"]', '#otds_login_button', 'input[type="submit"]']:
+                    for sel in {submit_sel_list}:
                         if await page.locator(sel).count() > 0:
                             await page.click(sel)
                             break

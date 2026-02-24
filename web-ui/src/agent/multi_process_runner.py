@@ -1,4 +1,3 @@
-
 import asyncio
 import re
 import logging
@@ -218,12 +217,13 @@ CRITICAL INSTRUCTION: You must strictly adhere to all negative constraints.
             
             # Run with Timeout
             try:
-                await asyncio.wait_for(agent.run(max_steps=self.max_steps), timeout=600.0)
+                from src.utils.config import AGENT_RUN_TIMEOUT_S
+                await asyncio.wait_for(agent.run(max_steps=self.max_steps), timeout=AGENT_RUN_TIMEOUT_S)
                 # Check if agent completed successfully
                 if agent.state.stopped:
                     status = "STOPPED"
             except asyncio.TimeoutError:
-                logger.error(f"{process_name} Timed out after 600s.")
+                logger.error(f"{process_name} Timed out after {AGENT_RUN_TIMEOUT_S}s.")
                 status = "TIMEOUT"
                 process_errors.append("Process timed out after 600s")
             except Exception as e:
@@ -325,20 +325,15 @@ CRITICAL INSTRUCTION: You must strictly adhere to all negative constraints.
             # Generate Playwright script via LLM
             if history_file.exists():
                 try:
-                    # Determine model and provider from self.llm
-                    model_name = "qwen2.5:14b" # Default fallback
-                    provider = "ollama"
-                    
-                    if hasattr(self.llm, 'model_name'):
-                        model_name = self.llm.model_name
-                    elif hasattr(self.llm, 'model'):
-                        model_name = self.llm.model
-                        
-                    logger.info(f"Generating Playwright script via LLM ({model_name})...")
+                    # Use the dedicated script-generation model (fast coder model),
+                    # NOT the agent's task model. Configured via SCRIPT_GEN_MODEL /
+                    # SCRIPT_GEN_PROVIDER env vars (defaults in config.py).
+                    from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
+                    logger.info(f"Generating Playwright script via LLM ({SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL})...")
                     script_path, script_content = generate_llm_script(
                         str(history_file),
-                        model_name=model_name,
-                        provider=provider
+                        model_name=SCRIPT_GEN_MODEL,
+                        provider=SCRIPT_GEN_PROVIDER,
                     )
                     # result.script_file is set to the generated path
                     result.script_file = script_path

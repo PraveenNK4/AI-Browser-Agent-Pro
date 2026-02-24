@@ -22,6 +22,24 @@ import re
 import hashlib
 from datetime import datetime
 import logging
+import pathlib
+import sys
+
+# Ensure config is importable regardless of working directory
+_utils_dir = pathlib.Path(__file__).parent
+if str(_utils_dir.parent.parent) not in sys.path:
+    sys.path.insert(0, str(_utils_dir.parent.parent))
+
+from src.utils.config import (
+    OLLAMA_BASE_URL,
+    OLLAMA_VERIFIER_MODEL,
+    OLLAMA_VERIFIER_TEMPERATURE,
+    OLLAMA_VERIFIER_TOP_P,
+    OLLAMA_VERIFIER_TIMEOUT_S,
+    OLLAMA_VERIFIER_MIN_CONF,
+    OLLAMA_VERIFIER_STAGE_THRESH,
+    OLLAMA_AVAILABILITY_TIMEOUT_S,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,32 +49,34 @@ _verifier_instance = None
 
 class OllamaMaxAccuracyVerifier:
     """
-    Verifies DOM elements using Ollama's qwen2.5:32b model
-    with 4-stage verification pipeline for maximum accuracy.
+    Verifies DOM elements using Ollama with a 4-stage verification pipeline.
+    All tunable values (model, temperature, timeouts, thresholds) are read from
+    src.utils.config so they can be changed via environment variables without
+    touching code.
     """
-    
+
     def __init__(self, skip_availability_check=False):
-        self.model = "qwen2.5:14b"  # Faster model for testing/debugging - 14 billion parameters
-        self.temperature = 0.1
-        self.top_p = 0.95
-        self.timeout = 180  # 3 minutes - faster verification for testing
-        self.min_confidence = 90
-        self.ollama_url = "http://localhost:11434/api/generate"
-        self.stage_threshold = 75  # Each stage must have 75%+ confidence
-        
+        self.model          = OLLAMA_VERIFIER_MODEL
+        self.temperature    = OLLAMA_VERIFIER_TEMPERATURE
+        self.top_p          = OLLAMA_VERIFIER_TOP_P
+        self.timeout        = OLLAMA_VERIFIER_TIMEOUT_S
+        self.min_confidence = OLLAMA_VERIFIER_MIN_CONF
+        self.ollama_url     = f"{OLLAMA_BASE_URL}/api/generate"
+        self.stage_threshold = OLLAMA_VERIFIER_STAGE_THRESH
+
         # Test Ollama availability only once
         if not skip_availability_check:
             self._test_ollama_availability()
-    
+
     def _test_ollama_availability(self):
-        """Test if Ollama is available at localhost:11434"""
+        """Test if Ollama is available at the configured base URL."""
         try:
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+            response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=OLLAMA_AVAILABILITY_TIMEOUT_S)
             if response.status_code == 200:
-                logger.debug("✓ Ollama is available at localhost:11434")
+                logger.debug(f"✓ Ollama is available at {OLLAMA_BASE_URL}")
                 return True
         except Exception as e:
-            logger.warning(f"⚠ Ollama not available: {e}")
+            logger.warning(f"⚠ Ollama not available at {OLLAMA_BASE_URL}: {e}")
             return False
     
     def verify_element_for_step(self, step_name, action_name, element_text, 
@@ -136,9 +156,9 @@ Respond with ONLY a JSON object:
             payload = {
                 "model": self.model,
                 "prompt": prompt,
-                "temperature": 0.1,
+                "temperature": self.temperature,
                 "stream": False,
-                "format": "json" # Force JSON output if the model supports it
+                "format": "json"  # Force JSON output if the model supports it
             }
             
             response = requests.post(self.ollama_url, json=payload, timeout=self.timeout)
@@ -245,7 +265,7 @@ Rate confidence this is the best element among alternatives. Respond with JSON: 
             logger.warning(f"Ollama timeout after {self.timeout} seconds")
             return 0
         except requests.exceptions.ConnectionError:
-            logger.warning("Cannot connect to Ollama at localhost:11434")
+            logger.warning(f"Cannot connect to Ollama at {OLLAMA_BASE_URL}")
             return 0
         except Exception as e:
             logger.warning(f"Query error: {e}")

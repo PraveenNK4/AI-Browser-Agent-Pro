@@ -324,11 +324,13 @@ async def run_process(
                 logger.info("Generating Playwright script via LLM...")
                 try:
                     from src.utils.llm_script_generator import generate_script
-                    
-                    # Use environment variables directly since kwargs is not available in run_process
-                    provider = os.getenv('EXTRACTION_LLM_PROVIDER', 'ollama')
-                    model = os.getenv('LLM_MODEL_NAME', 'qwen2.5-coder:7b')
-                    
+                    from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
+
+                    # Use the dedicated script-generation model (fast coder model),
+                    # NOT the agent's task model. Set SCRIPT_GEN_MODEL / SCRIPT_GEN_PROVIDER
+                    # in your .env to override.
+                    logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL}")
+
                     # For non-mandatory processes, pass the mandatory history so scripts include login
                     mand_hist_path = str(mandatory_history_path) if mandatory_history_path and os.path.exists(mandatory_history_path) else None
                     if mand_hist_path:
@@ -338,8 +340,8 @@ async def run_process(
                     output_path, code = generate_script(
                         str(history_path), 
                         output_path=playwright_script_path,
-                        model_name=model,
-                        provider=provider,
+                        model_name=SCRIPT_GEN_MODEL,
+                        provider=SCRIPT_GEN_PROVIDER,
                         objective=task_str,
                         mandatory_history_path=mand_hist_path
                     )

@@ -13,6 +13,21 @@ utils_path = pathlib.Path(__file__).parent
 if str(utils_path) not in sys.path:
     sys.path.insert(0, str(utils_path))
 
+# Import config for Ollama verifier settings (no hardcoded values)
+try:
+    from src.utils.config import (
+        OLLAMA_VERIFIER_MODEL,
+        OLLAMA_VERIFIER_TEMPERATURE,
+        OLLAMA_VERIFIER_TIMEOUT_S,
+    )
+    _OLLAMA_DESC = f"Ollama ({OLLAMA_VERIFIER_MODEL} | temp={OLLAMA_VERIFIER_TEMPERATURE} | timeout={OLLAMA_VERIFIER_TIMEOUT_S}s)"
+except ImportError:
+    # Fallback when running standalone outside of the web-ui package tree
+    OLLAMA_VERIFIER_MODEL = os.getenv("OLLAMA_VERIFIER_MODEL", "qwen2.5:14b")
+    OLLAMA_VERIFIER_TEMPERATURE = float(os.getenv("OLLAMA_VERIFIER_TEMPERATURE", "0.1"))
+    OLLAMA_VERIFIER_TIMEOUT_S = int(os.getenv("OLLAMA_VERIFIER_TIMEOUT_S", "180"))
+    _OLLAMA_DESC = f"Ollama ({OLLAMA_VERIFIER_MODEL} | temp={OLLAMA_VERIFIER_TEMPERATURE})"
+
 """History enrichment with optional Ollama verification.
 
 Set the environment variable DISABLE_OLLAMA_VERIFICATION=1 to fully skip
@@ -29,7 +44,7 @@ try:
     if OLLAMA_VERIFICATION_ENABLED:
         from ollama_max_accuracy_verifier import verify_step_element
         HAS_OLLAMA_VERIFIER = True
-        logger.info("[+] Ollama Max Accuracy Verifier available (qwen2.5:14b | temp=0.1 | timeout=3min - TESTING MODE)")
+        logger.info(f"[+] Ollama Max Accuracy Verifier available ({_OLLAMA_DESC} - TESTING MODE)")
     else:
         logger.info("[*] Ollama verification DISABLED via env (DISABLE_OLLAMA_VERIFICATION=1)")
 except (ImportError, ModuleNotFoundError) as e:
@@ -285,7 +300,7 @@ def find_best_element_for_extraction(snapshot: Dict[str, Any], extracted_content
     
     # Now use Ollama for 100% accuracy verification if available and enabled
     if OLLAMA_VERIFICATION_ENABLED and HAS_OLLAMA_VERIFIER and verify_step_element:
-        logger.debug(f"\n  >>> Using Ollama (qwen2.5:14b | temp=0.1) for 100% accuracy verification...")
+        logger.debug(f"\n  >>> Using {_OLLAMA_DESC} for 100% accuracy verification...")
         
         element_text = best_element.get("selector_provenance", {}).get("text", "")
         element_html = best_element.get("integrity", {}).get("outerHTML", "")
@@ -407,7 +422,7 @@ def _verify_element_with_ollama(
         )
         
         verification_data = {
-            "method": "Ollama (qwen2.5:14b | temp=0.1)",
+            "method": _OLLAMA_DESC,
             "is_valid": is_valid,
             "confidence": result.get("confidence", 0),
             "element_hash": result.get("element_hash", ""),
@@ -695,7 +710,7 @@ def strip_and_enrich(history_path: pathlib.Path) -> None:
                         if OLLAMA_VERIFICATION_ENABLED and "ollama_verification" in best_element:
                             verification = best_element["ollama_verification"]
                             dom_context["verification"] = {
-                                "method": "Ollama (qwen2.5:14b | temp=0.1)",
+                                "method": _OLLAMA_DESC,
                                 "is_valid": verification.get("is_valid"),
                                 "confidence": verification.get("confidence"),
                                 "element_hash": verification.get("element_hash"),

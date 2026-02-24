@@ -1,0 +1,8 @@
+DISTRIBUTED AGENT STATUS REPORT - 20260224_094207
+========================================
+⚠️ Not all Distributed Agents are running.
+
+Data captured:
+Worker: Worker_OTCSVM_2099_001 | Status: Idle | Last Update: 02/23/2026 08:11 PM
+Worker: Worker_OTCSVM_2099_002 | Status: Idle | Last Update: 02/23/2026 08:11 PM
+Worker: Worker_OTCSVM_2099_003 | Status: Idle | Last Update: 02/23/2026 08:11 PM

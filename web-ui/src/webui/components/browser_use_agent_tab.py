@@ -454,7 +454,8 @@ async def _ask_assistant_callback(
     webui_manager.bu_user_help_response = None
 
     try:
-        await asyncio.wait_for(webui_manager.bu_response_event.wait(), timeout=3600.0)
+        from src.utils.config import WEBUI_RESPONSE_TIMEOUT_S
+        await asyncio.wait_for(webui_manager.bu_response_event.wait(), timeout=WEBUI_RESPONSE_TIMEOUT_S)
     except asyncio.TimeoutError:
         logger.warning("Timeout waiting for user.")
         webui_manager.bu_chat_history.append({"role": "assistant", "content": "**Timeout:** No response."})
@@ -568,7 +569,7 @@ async def run_agent_task(
     # Agent settings (Ollama only, low temp for strict mode)
     llm_provider_name = "ollama"
     llm_model_name = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b")
-    llm_temperature = 0.3  # Increased from 0.1 to allow more exploration when actions fail
+    llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
     use_vision = os.getenv("USE_VISION", "false").lower() == "true"
     ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16000"))
     llm_base_url = os.getenv("LLM_BASE_URL")
@@ -586,8 +587,9 @@ async def run_agent_task(
     extraction_model_name = os.getenv("EXTRACTION_LLM_MODEL_NAME")
     extraction_temperature = float(os.getenv("EXTRACTION_LLM_TEMPERATURE", "0.0"))
 
+    from src.utils.config import VAULT_CREDENTIAL_PREFIX as _VPX
     # Planner system message - explicit instructions for file uploads
-    extend_planner_system_message = """
+    extend_planner_system_message = f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 ACTION STRATEGY - REDUCE TURNS & INCREASE SPEED
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -596,7 +598,7 @@ async def run_agent_task(
    - NEVER use separate input_text for username and password. 
    - ALWAYS use: smart_login(username, password, button_text)
    - This performs UN/PW/Click in ONE atomic turn.
-   - Example: smart_login(username="{{OTCS_USERNAME}}", password="{{OTCS_PASSWORD}}", button_text="Sign in")
+   - Example: smart_login(username="{{{{{_VPX}_USERNAME}}}}", password="{{{{{_VPX}_PASSWORD}}}}", button_text="Sign in")
    - ⚠️ CRITICAL: Check the page URL. If you are on a login page, use smart_login immediately.
 
 2. 🔗 URL INTEGRITY:
@@ -1037,10 +1039,12 @@ NEVER pass HTML to validate_value. Always retrieve first.
                 
                 logger.info("Generating Playwright script via LLM...")
                 history_path = pathlib.Path(history_file)
+                from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
+                logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL} (agent model: {llm_provider_name}/{llm_model_name})")
                 script_path, script_content = generate_llm_script(
-                    str(history_path), 
-                    model_name=llm_model_name, 
-                    provider=llm_provider_name,
+                    str(history_path),
+                    model_name=SCRIPT_GEN_MODEL,
+                    provider=SCRIPT_GEN_PROVIDER,
                     objective=task
                 )
                 logger.info(f"Playwright script saved to {script_path}")
@@ -1185,7 +1189,8 @@ async def handle_clear(webui_manager: WebuiManager):
             webui_manager.bu_agent.stop()
         task.cancel()
         try:
-            await asyncio.wait_for(task, timeout=2.0)
+            from src.utils.config import TASK_CANCEL_TIMEOUT_S
+            await asyncio.wait_for(task, timeout=TASK_CANCEL_TIMEOUT_S)
         except Exception:
             pass
     
