@@ -888,47 +888,195 @@ class CustomController(Controller):
                 msg += f"Connection: {'✅ SECURE (HTTPS)' if is_https else '❌ INSECURE (HTTP)'}\n"
                 msg += f"Context: {'✅ Secure Context' if security_meta.get('isSecureContext') else '❌ Non-Secure Context'}\n"
                 
-                # Fetch detailed certificate info via page.request (OOB check to same URL)
-                # This is more reliable than trying to intercept the main frame's response 
-                # after the fact if browser-use doesn't provide it directly.
+                if not is_https:
+                    return ActionResult(extracted_content=msg, include_in_memory=True)
+
+                # Fetch detailed certificate info via ssl module (Robust fallback)
                 try:
-                    # Using the page's context to maintain cookies/sessions
-                    request_context = page.context.request
-                    response = await request_context.get(url)
-                    details = response.security_details()
+                    import ssl
+                    import socket
+                    from urllib.parse import urlparse
+                    from datetime import datetime
+                    import hashlib
                     
-                    if details:
-                        msg += f"\nCertificate Details:\n"
-                        msg += f" • Issuer: {details.get('issuer', 'N/A')}\n"
-                        msg += f" • Subject: {details.get('subject', 'N/A')}\n"
-                        msg += f" • Protocol: {details.get('protocol', 'N/A')}\n"
-                        msg += f" • Valid From: {details.get('validFrom', 'N/A')}\n"
-                        msg += f" • Valid To: {details.get('validTo', 'N/A')}\n"
+                    parsed = urlparse(url)
+                    hostname = parsed.hostname
+                    if not hostname:
+                        return ActionResult(extracted_content=msg + "\n⚠️ Could not parse hostname from URL.", include_in_memory=True)
                         
-                        # Add a sanity check for expiration
-                        from datetime import datetime
+                    port = parsed.port or 443
+                    
+                    # Get Certificate info via socket
+                    # We try verified first, then unverified to at least get metadata
+                    cert_info = None
+                    last_err = None
+                    der_cert = None
+                    
+                    for verify in [True, False]:
                         try:
-                            # validTo is usually a timestamp or ISO string depending on version
-                            # but Playwright typically returns a timestamp (seconds/ms) 
-                            # or we can parse it if it's a string.
-                            expired = False
-                            valid_to = details.get('validTo')
-                            if isinstance(valid_to, (int, float)):
-                                # Playwright usually provides decimal seconds
-                                expiry_dt = datetime.fromtimestamp(valid_to)
-                                if expiry_dt < datetime.now():
-                                    expired = True
-                                msg += f" • Status: {'❌ EXPIRED' if expired else '✅ VALID'}\n"
-                        except:
-                            pass
+                            context = ssl.create_default_context()
+                            if not verify:
+                                context.check_hostname = False
+                                context.verify_mode = ssl.CERT_NONE
+                            
+                            with socket.create_connection((hostname, port), timeout=5) as sock:
+                                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                                    cert_info = ssock.getpeercert()
+                                    der_cert = ssock.getpeercert(binary_form=True)
+                                    
+                                    if not cert_info and der_cert:
+                                        # For CERT_NONE, getpeercert() is empty. 
+                                        # Use cryptography to parse binary DER cert
+                                        try:
+                                            from cryptography import x509
+                                            from cryptography.hazmat.backends import default_backend
+                                            x509_cert = x509.load_der_x509_certificate(der_cert, default_backend())
+                                            
+                                            # Helper to extract all values for a given OID/Attribute
+                                            def get_attr(cert_obj, attr_name):
+                                                try:
+                                                    return ", ".join([str(val.value) for val in cert_obj.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)])
+                                                except: return "N/A"
+
+                                            cert_info = {
+                                                'subject': [[(k.oid._name, k.value)] for k in x509_cert.subject],
+                                                'issuer': [[(k.oid._name, k.value)] for k in x509_cert.issuer],
+                                                'notBefore': x509_cert.not_valid_before_utc.strftime('%b %d %H:%M:%S %Y GMT'),
+                                                'notAfter': x509_cert.not_valid_after_utc.strftime('%b %d %H:%M:%S %Y GMT'),
+                                            }
+                                        except Exception as parse_err:
+                                            logger.debug(f"Cryptography parse failed: {parse_err}")
+                                    
+                                    if cert_info or der_cert:
+                                        break
+                        except Exception as e:
+                            last_err = e
+                            continue
+                    
+                    if cert_info or der_cert:
+                        def format_dn(dn):
+                            if isinstance(dn, list):
+                                try:
+                                    return ", ".join([f"{item[0][0]}={item[0][1]}" for item in dn])
+                                except: return str(dn)
+                            return str(dn)
+
+                        msg += f"\nCertificate Details:\n"
+                        if cert_info:
+                            msg += f" • Issuer: {format_dn(cert_info.get('issuer'))}\n"
+                            msg += f" • Subject: {format_dn(cert_info.get('subject'))}\n"
+                            msg += f" • Valid From: {cert_info.get('notBefore', 'N/A')}\n"
+                            msg += f" • Valid To: {cert_info.get('notAfter', 'N/A')}\n"
+                        
+                        if der_cert:
+                            sha256_fingerprint = hashlib.sha256(der_cert).hexdigest().upper()
+                            msg += f" • SHA256 Fingerprint: {sha256_fingerprint[:2]}:" + ":".join([sha256_fingerprint[i:i+2] for i in range(2, len(sha256_fingerprint), 2)]) + "\n"
+
+                        # Expiration check
+                        if cert_info and cert_info.get('notAfter'):
+                            try:
+                                expiry_str = cert_info.get('notAfter')
+                                for fmt in ['%b %d %H:%M:%S %Y %Z', '%b %d %H:%M:%S %Y GMT']:
+                                    try:
+                                        expiry_dt = datetime.strptime(expiry_str, fmt)
+                                        if expiry_dt < datetime.now():
+                                            msg += f" • Status: ❌ EXPIRED\n"
+                                        else:
+                                            msg += f" • Status: ✅ VALID\n"
+                                        break
+                                    except: continue
+                            except: pass
                     else:
-                        msg += "\n⚠️ No certificate details found. This usually happens for local/broken connections.\n"
+                        msg += f"\n⚠️ Certificate extraction failed: {str(last_err)}\n"
+                
                 except Exception as cert_err:
                     msg += f"\n⚠️ Deep certificate scan failed: {str(cert_err)}\n"
 
                 return ActionResult(extracted_content=msg, include_in_memory=True)
             except Exception as e:
                 return ActionResult(error=f'Security audit failed: {str(e)}')
+
+        # --- SYSTEM OPERATION & OS AUTOMATION TOOLS ---
+        
+        @self.registry.action('Execute an OS-level shell command (e.g., "start cmd", "dir", "ipconfig").')
+        async def run_system_command(command: str):
+            """
+            Execute a system command using subprocess.
+            Use this to open apps (like 'start cmd'), list files, or run system utilities.
+            """
+            try:
+                import subprocess
+                # Use shell=True for 'start' commands on Windows
+                process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                stdout, stderr = process.communicate(timeout=5)
+                
+                output = f"Command: {command}\n"
+                if stdout: output += f"Output:\n{stdout}\n"
+                if stderr: output += f"Error:\n{stderr}\n"
+                if not stdout and not stderr: output += "Command executed (no output)."
+                
+                return ActionResult(extracted_content=output, include_in_memory=True)
+            except Exception as e:
+                return ActionResult(error=f"System command failed: {str(e)}")
+
+        @self.registry.action('Capture a full-screen screenshot of the entire OS (not just the browser viewport).')
+        async def system_screenshot(description: str = "system_capture"):
+            """
+            Capture the entire screen including taskbar, browser chrome, and external windows.
+            Essential for verifying browser-level popups (like security certificates) or external apps.
+            """
+            try:
+                import pyautogui
+                from datetime import datetime
+                import re
+                
+                # Setup directory
+                shot_dir = Path("tmp/system_screenshots")
+                shot_dir.mkdir(parents=True, exist_ok=True)
+                
+                timestamp = datetime.now().strftime("%H%M%S")
+                slug = re.sub(r'[^a-z0-9]+', '_', description.lower()).strip('_')
+                filename = f"{timestamp}_{slug}.png"
+                path = shot_dir / filename
+                
+                screenshot = pyautogui.screenshot()
+                screenshot.save(str(path))
+                
+                return ActionResult(extracted_content=f"📸 Full-system screenshot saved: {path}", include_in_memory=True)
+            except Exception as e:
+                return ActionResult(error=f"System screenshot failed: {str(e)}")
+
+        @self.registry.action('Perform an OS-level mouse click at coordinates (x, y). Use this for non-web elements.')
+        async def system_click(x: int, y: int):
+            """Click anywhere on the OS screen using absolute coordinates."""
+            try:
+                import pyautogui
+                pyautogui.click(x, y)
+                return ActionResult(extracted_content=f"Clicked at ({x}, {y})", include_in_memory=True)
+            except Exception as e:
+                return ActionResult(error=f"System click failed: {str(e)}")
+
+        @self.registry.action('Perform OS-level keyboard typing. Use this to input text into CMD or browser search bars.')
+        async def system_type(text: str):
+            """Type text at the current OS focus point."""
+            try:
+                import pyautogui
+                pyautogui.write(text, interval=0.1)
+                return ActionResult(extracted_content=f"Typed: {text}", include_in_memory=True)
+            except Exception as e:
+                return ActionResult(error=f"System type failed: {str(e)}")
+
+        @self.registry.action('Press a specific OS-level key (e.g., "enter", "win", "esc", "tab").')
+        async def system_press_key(key: str):
+            """Press a key (e.g., 'enter', 'f5', 'win')."""
+            try:
+                import pyautogui
+                pyautogui.press(key)
+                return ActionResult(extracted_content=f"Pressed key: {key}", include_in_memory=True)
+            except Exception as e:
+                return ActionResult(error=f"System key press failed: {str(e)}")
+
+        # --- END SYSTEM TOOLS ---
 
 
         @self.registry.action('Check if checkbox/radio is checked; click only if unchecked. Works for checkboxes, radio buttons, and toggle inputs.')
@@ -1286,8 +1434,8 @@ class CustomController(Controller):
                     page = await browser_context.get_current_page()
                     url = page.url
                     title = await page.title()
-                    content_len = len(await page.content())
-                    state_hash = f"{url}:{title}:{content_len}"
+                    scroll_pos = await page.evaluate("() => ({ x: window.scrollX, y: window.scrollY })")
+                    state_hash = f"{url}:{title}:{content_len}:{scroll_pos['x']}:{scroll_pos['y']}"
                     self.state_history.append(state_hash)
                     if len(self.state_history) > 20:
                         self.state_history.pop(0)

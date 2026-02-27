@@ -468,10 +468,10 @@ async def run_all_processes(
         hint = ""
         if processes:
             try:
-                from src.utils.utils import slugify
-                # Simplified hint: first 4 words of the first process
-                p_words = [w for w in processes[0].name.split() if w.lower() not in ['to', 'on', 'with', 'the', 'a', 'an', 'in', 'for', 'from', 'using']]
-                hint = "_" + slugify(" ".join(p_words[:4]))[:30]
+                from src.utils.utils import generate_task_title
+                # Generate an intelligent title from the first process name
+                hint_slug = generate_task_title(llm, processes[0].name)
+                hint = f"_{hint_slug}"
             except Exception:
                 pass
                 

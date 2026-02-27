@@ -5,7 +5,6 @@ env/
 ENV/
 
 # Environment Variables
-.env
 .env.local
 .env.production
 .env.development
@@ -145,7 +144,6 @@ celerybeat-schedule
 *.sage.py
 
 # Environments
-.env
 .venv
 env/
 venv/

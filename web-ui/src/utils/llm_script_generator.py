@@ -15,6 +15,7 @@ import argparse
 import re
 from pathlib import Path
 from typing import Dict, Any
+from datetime import datetime
 
 # Ensure we can import from src
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -97,7 +98,6 @@ TIMEOUT_FILL_MS        = int(os.environ.get("TIMEOUT_FILL_MS", "{TIMEOUT_FILL_MS
 TIMEOUT_CLICK_MS       = int(os.environ.get("TIMEOUT_CLICK_MS", "{TIMEOUT_CLICK_MS}"))
 TIMEOUT_TABLE_WAIT_MS  = int(os.environ.get("TIMEOUT_TABLE_WAIT_MS", "{TIMEOUT_TABLE_WAIT_MS}"))
 TIMEOUT_NETWORKIDLE_MS = int(os.environ.get("TIMEOUT_NETWORKIDLE_MS", "{TIMEOUT_NETWORKIDLE_MS}"))
-TIMEOUT_LOGIN_MS       = 2000
 
 # Vault Prefix (Dynamic Discovery)
 VAULT_PREFIX = os.environ.get("VAULT_CREDENTIAL_PREFIX", "{vault_prefix}")
@@ -105,10 +105,6 @@ if not vault.get_credentials(VAULT_PREFIX):
     keys = vault.list_keys()
     if keys:
         VAULT_PREFIX = keys[0]
-
-LOGIN_USER_SELECTORS   = {user_sels_str}
-LOGIN_PASS_SELECTORS   = {pass_sels_str}
-LOGIN_SUBMIT_SELECTORS = {submit_sels_str}
 
 def clean_text(text):
     if not text: return ""
@@ -159,42 +155,35 @@ Write a COMPLETE, STANDALONE Python script that:
 3. Can be run from any directory with just `python script.py`.
 
 ### 🛡️ GOLDEN RULES
-1.  **Self-contained** — The script MUST be fully standalone. Do NOT import from
-    `src.utils`, `script_helpers`, or any project-internal module.
-    Define all functions you need directly in the script.
+1.  **Self-contained** — The script MUST be fully standalone. Do NOT import from project-internal modules **except for the ones provided in the template header (vault, generate_script_report)**. Define all other helper functions you need directly in the script.
 
 2.  **Credentials** — Read from the project vault using `vault.get_credentials(VAULT_PREFIX)`.
     The script header automatically attempts to find the correct `VAULT_PREFIX` from available keys. 
     NEVER hardcode actual credentials.
 
-3.  **Login handling** — If the history shows a login form, write a login function EXACTLY like this:
-    ```python
-    async def login(page):
-        creds = vault.get_credentials(VAULT_PREFIX)
-        if not creds or "username" not in creds or "password" not in creds:
-            return
-        username, password = creds["username"], creds["password"]
-
-        # Fill username
-        for sel in LOGIN_USER_SELECTORS:
-            try:
-                await page.locator(sel).fill(username, timeout=TIMEOUT_LOGIN_MS)
-                break
-            except Exception: continue
-        # Fill password
-        for sel in LOGIN_PASS_SELECTORS:
-            try:
-                await page.locator(sel).fill(password, timeout=TIMEOUT_LOGIN_MS)
-                break
-            except Exception: continue
-        # Submit
-        for sel in LOGIN_SUBMIT_SELECTORS:
-            try:
-                await page.locator(sel).click(timeout=TIMEOUT_LOGIN_MS)
-                await page.wait_for_load_state("networkidle")
-                return
-            except Exception: continue
-    ```
+3.  **Login handling** — If the execution history shows that the agent encountered a login screen or performed authentication:
+    - Write an `async def login(page)` function at the start of your script.
+    - Call `await login(page)` in the `run()` function before navigation.
+    - If NO login is detected in history, do NOT define or call the login function. Keep the script lean.
+    - Inside your `login()` function, use these common selectors to find fields (embedded directly):
+      - Username: {user_sels_str}
+      - Password: {pass_sels_str}
+      - Submit/Sign-in: {submit_sels_str}
+    - Template for `login()`:
+      ```python
+      async def login(page):
+          creds = vault.get_credentials(VAULT_PREFIX)
+          if not creds: return
+          username, password = creds.get("username"), creds.get("password")
+          
+          # Use short timeouts for field probes
+          for sel in [ ... list of selectors from above ... ]:
+              try:
+                  await page.locator(sel).fill(username, timeout=2000)
+                  break
+              except: continue
+          # ... repeat for password and click submit ...
+      ```
 
         async def extract_table(page, selector, column_names):
             print(f"DEBUG: Extracting table with selector: {{selector}}")
@@ -334,19 +323,23 @@ Write a COMPLETE, STANDALONE Python script that:
         - Prefer `await page.mouse.wheel(0, 800)` or `scroll_page(direction='down', amount=800)` logic if text-based scrolling is brittle.
         - ALWAYS add `await page.wait_for_timeout(1000)` after a large scroll to allow lazy-loaded content to render.
 
-    16. **Word Report** — At the END of the script (before `await browser.close()`), call:
+    16. **Dynamic Success Statements** — At the end of the script before generating the report, write a generic, dynamic `print()` statement that describes what the script ACTUALLY did (e.g., checking if agents had to be started vs were already running).
+        - DO NOT blindly copy the specific, hardcoded conclusion text from the execution history's `done` step.
+        - Use the variables in your script (e.g., `if all_running:... else:...`) to print an accurate summary of the execution path.
+
+    17. **Word Report** — At the END of the script (before `await browser.close()`), call:
         ```python
-        steps = []  # Build this as you go: steps.append({"action": "action_name", "output": "captured text"})
+        steps = []  # Build this as you go: steps.append({{"action": "action_name", "output": "captured text"}})
         generate_script_report(
             script_name=os.path.basename(__file__),
             steps=steps,
             screenshots_dir=str(SCREENSHOT_DIR),
-            output_path=str(SCREENSHOT_DIR.parent / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"),
+            output_path=str(SCREENSHOT_DIR.parent / f"report_{{datetime.now().strftime('%Y%m%d_%H%M%S')}}.docx"),
             status="Execution Complete",
             captured_outputs="<combined text output>",
         )
         ```
-        Build the `steps` list incrementally: after each action or extraction, append a dict with `{"action": ..., "output": ...}`.
+        Build the `steps` list incrementally: after each action or extraction, append a dict with `{{"action": ..., "output": ...}}`.
         The `screenshots_dir` is SCREENSHOT_DIR, which already holds the numbered screenshots.
 
 ### 📝 STRUCTURE
@@ -1340,10 +1333,10 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
             injected_lines.append(f'{indent}await page.wait_for_load_state("domcontentloaded")\n')
             logger.info("[POST] Injected wait_for_load_state after page.goto")
 
-        # After maybe_login(page) — inject networkidle wait
-        if "await maybe_login(page)" in stripped:
+        # After login(page) — inject networkidle wait
+        if "await login(page)" in stripped:
             injected_lines.append(f'{indent}await page.wait_for_load_state("networkidle", timeout=TIMEOUT_NETWORKIDLE_MS)\n')
-            logger.info("[POST] Injected wait_for_load_state after maybe_login")
+            logger.info("[POST] Injected wait_for_load_state after login")
 
     code = "".join(injected_lines)
 
@@ -1381,6 +1374,24 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
         if selector is None and any("selector" in i for i in issues):
             raise RuntimeError(f"[QUALITY GATE] Cannot auto-fix — no DOM selector resolved. Issues: {issues}")
         code = warning + code
+
+    # ── 16: Safe login() injection (Final Robustness) ──────────────────────────
+    # If the LLM called await login(page) but forgot to define the function,
+    # inject a safe skip-nop definition.
+    if "await login(page)" in code and "async def login" not in code:
+        logger.warning("[POST] Injecting missing login() definition to prevent NameError")
+        login_nop = """
+async def login(page):
+    # Auto-injected NOP to prevent NameError. 
+    # LLM called login but no definition was provided in history context.
+    pass
+
+"""
+        # Insert after imports
+        if "from src.utils" in code:
+            code = re.sub(r'(from src\.utils\.report_templates import[^\n]*\n)', r'\1' + login_nop, code, count=1)
+        else:
+            code = re.sub(r'(import [^\n]*\n)', r'\1' + login_nop, code, count=1)
 
     return code
 

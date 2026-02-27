@@ -14,7 +14,7 @@ import time
 import uuid
 import builtins
 from datetime import datetime
-from src.utils.utils import slugify
+from src.utils.utils import slugify, generate_task_title
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from browser_use.agent.views import AgentHistoryList, AgentOutput
@@ -154,11 +154,12 @@ def _format_agent_output(model_output: AgentOutput) -> str:
                 content += f"**LLM Reasoning:**\n{llm_response}\n\n"
 
             # Actions JSON
-            action_dump = [action.model_dump(exclude_none=True) for action in model_output.action]
-            state_dump = model_output.current_state.model_dump(exclude_none=True)
-            output_dump = {"current_state": state_dump, "action": action_dump}
-            json_str = json.dumps(output_dump, indent=4, ensure_ascii=False)
-            content += f"**Actions:**\n<pre><code class='language-json'>{json_str}</code></pre>"
+            if hasattr(model_output, 'action') and model_output.action:
+                action_dump = [action.model_dump(exclude_none=True) for action in model_output.action]
+                state_dump = model_output.current_state.model_dump(exclude_none=True)
+                output_dump = {"current_state": state_dump, "action": action_dump}
+                json_str = json.dumps(output_dump, indent=4, ensure_ascii=False)
+                content += f"**Actions:**\n<pre><code class='language-json'>{json_str}</code></pre>"
         except Exception as e:
             logger.error(f"Error formatting output: {e}", exc_info=True)
             content = f"<pre><code>Error formatting output: {e}\nRaw: {str(model_output)}</code></pre>"
@@ -171,19 +172,19 @@ async def _handle_new_step(
     """Callback for each agent step."""
     if not hasattr(webui_manager, "bu_chat_history"):
         webui_manager.bu_chat_history = []
-    
+
     step_num -= 1
     step_end_time = time.perf_counter()
     step_duration = 0.0
     if webui_manager.bu_step_start_time:
         step_duration = round(step_end_time - webui_manager.bu_step_start_time, 3)
-    
+
     logger.info(f"Step {step_num} completed.")
 
     # Progression tracking
     if webui_manager.check_step_progression(step_num):
         logger.error(f"Step {step_num}: Excessive backward progression.")
-    
+
     # Failure tracking
     step_failed = False
     if hasattr(output, 'error'):
@@ -191,18 +192,18 @@ async def _handle_new_step(
         if error:
             step_failed = True
             logger.warning(f"Step {step_num} failed: {error}")
-    
+
     if webui_manager.check_step_failure(step_num, step_failed):
         logger.error(f"Step {step_num} exceeded 3 failures. Stopping.")
         webui_manager.bu_should_stop_agent = True
         if webui_manager.bu_agent:
             webui_manager.bu_agent.state.stopped = True
-    
+
     # Hallucination tracking
     current_action = None
     if hasattr(output, 'action') and output.action:
         current_action = str(output.action[0]) if isinstance(output.action, (list, tuple)) else str(output.action)
-    
+
     if webui_manager.check_hallucination(current_action):
         logger.error(f"HALLUCINATION: Action repeated {webui_manager.bu_repeated_action_count} times. Stopping.")
         webui_manager.bu_should_stop_agent = True
@@ -232,7 +233,7 @@ async def _handle_new_step(
     # Warnings
     failure_warning = ""
     if step_failed:
-        failure_warning += "âš ï¸ **STEP FAILED** - Retrying...<br/>"
+        failure_warning += "⚠️ **STEP FAILED** - Retrying...<br/>"
     if webui_manager.bu_should_stop_agent:
         if webui_manager.bu_hallucination_triggered:
             failure_warning += "🔴 **HALLUCINATION DETECTED** - Stopped.<br/>"
@@ -292,7 +293,7 @@ def _handle_done(webui_manager: WebuiManager, history: AgentHistoryList):
     logger.info("=" * 80)
     logger.info("REPORT GENERATION STARTED")
     logger.info("=" * 80)
-    
+
     try:
         logger.info(f"Task finished. Duration: {history.total_duration_seconds():.2f}s, Tokens: {history.total_input_tokens()}")
 
@@ -331,7 +332,7 @@ async def _ask_assistant_callback(
 ) -> Dict[str, Any]:
     """Callback for agent assistance requests."""
     logger.info("Agent needs assistance.")
-    
+
     webui_manager.bu_chat_history.append({
         "role": "assistant",
         "content": f"**Need Help:** {query}\nPlease respond below and click 'Submit Response'."
@@ -400,19 +401,34 @@ async def run_agent_task(
         yield {run_button_comp: gr.update(interactive=True)}
         return
 
+    # Agent settings for title generation & execution
+    llm_provider_name = "ollama"
+    llm_model_name = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b")
+    llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+    llm_base_url = os.getenv("LLM_BASE_URL")
+    ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16000"))
+
+    # Initialize LLM early for intelligent title generation
+    title_llm = await _initialize_llm(
+        provider=llm_provider_name,
+        model_name=llm_model_name,
+        temperature=llm_temperature,
+        base_url=llm_base_url,
+        api_key=None,
+        num_ctx=ollama_num_ctx
+    )
+
     # Generate task ID (Meaningful & Concise Format)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     short_uuid = str(uuid.uuid4())[:8]
-    
-    # Truncate task to first 6 meaningful words for the folder name
-    task_words = [w for w in task.split() if w.lower() not in ['to', 'on', 'with', 'the', 'a', 'an', 'in', 'for', 'from', 'using']]
-    short_task = " ".join(task_words[:6])
-    task_slug = slugify(short_task)[:50]
-    
+
+    # Use LLM to generate an intelligent title, with slugify as fallback
+    task_slug = generate_task_title(title_llm, task)
+
     webui_manager.bu_agent_task_id = f"{timestamp}_{task_slug}_{short_uuid}"
     set_run_id(webui_manager.bu_agent_task_id)
     webui_manager.reset_failure_tracking()
-    
+
     # Reset chat history and controller for fresh run
     webui_manager.bu_chat_history = []
     webui_manager.bu_controller = None
@@ -422,7 +438,7 @@ async def run_agent_task(
     uploaded_files = components.get(context_files_comp, [])
     context_info = ""
     available_file_paths = []
-    
+
     if uploaded_files:
         if not isinstance(uploaded_files, list):
             uploaded_files = [uploaded_files]
@@ -458,22 +474,17 @@ async def run_agent_task(
         gif_comp: gr.update(value=None),
     }
 
-    # Agent settings (Ollama only, low temp for strict mode)
-    llm_provider_name = "ollama"
-    llm_model_name = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b")
-    llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
-    use_vision = os.getenv("USE_VISION", "false").lower() == "true"
-    ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16000"))
-    llm_base_url = os.getenv("LLM_BASE_URL")
+    # Max steps & Action settings
     max_steps = int(os.getenv("MAX_STEPS", "25"))
     max_actions = int(os.getenv("MAX_ACTIONS", "3"))
     max_input_tokens = int(os.getenv("MAX_INPUT_TOKENS", "128000"))
-    
+    use_vision = os.getenv("USE_VISION", "false").lower() == "true"
+
     # Planner model settings (optional)
     planner_provider = os.getenv("PLANNER_LLM_PROVIDER")
     planner_model_name = os.getenv("PLANNER_LLM_MODEL_NAME")
     planner_temperature = float(os.getenv("PLANNER_LLM_TEMPERATURE", "1.0"))
-    
+
     # Extraction model settings (optional)
     extraction_provider = os.getenv("EXTRACTION_LLM_PROVIDER")
     extraction_model_name = os.getenv("EXTRACTION_LLM_MODEL_NAME")
@@ -502,7 +513,17 @@ async def run_agent_task(
    - NEVER use separate retrieve_value_by_element calls for multiple rows.
    - extract_table is 10x faster and more accurate for grids.
 
-4. 🖱️ HOVER DECISION TREE - READ THIS FIRST BEFORE ANY HOVER ACTION!
+4. 🖥️ SYSTEM OPERATION & OS AUTOMATION (EXTERNAL APPS & BROWSER CHROME):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   - Use these tools to interact with EVERYTHING outside the webpage.
+   - ⌨️ TYPE/PRESS: Use `system_type(text)` and `system_press_key(key)` for CMD input or OS dialogs.
+   - 🖱️ CLICK: Use `system_click(x, y)` for OS elements (Taskbar, Start Menu).
+   - 📸 SCREENSHOT: Use `system_screenshot(description)` to capture browser menus, certificates, or CMD windows.
+   - 💻 CMD/SHELL: Use `run_system_command(command)` (e.g., 'start cmd') to open apps or run scripts.
+   - 🛡️ CERTIFICATES: The padlock/lock icon is BROWSER CHROME. Use `system_screenshot` to verify it visually.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5. 🖱️ HOVER DECISION TREE - READ THIS FIRST BEFORE ANY HOVER ACTION!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 QUESTION: What are you trying to hover?
@@ -528,11 +549,11 @@ QUESTION: What are you trying to hover?
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ❌ WRONG: Task says "hover status icon left of Enterprise Update Distributor"
-          Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
+      Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
 
 ✅ RIGHT: Task says "hover status icon left of Enterprise Update Distributor" 
-          Action: hover_with_offset(index=18, direction="left", distance=30)
-          ↑ This hovers 30px LEFT of the text, where the icon is!
+      Action: hover_with_offset(index=18, direction="left", distance=30)
+      ↑ This hovers 30px LEFT of the text, where the icon is!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -583,11 +604,11 @@ QUESTION: What are you trying to hover?
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ❌ WRONG: Task says "hover status icon left of Enterprise Update Distributor"
-          Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
+      Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
 
 ✅ RIGHT: Task says "hover status icon left of Enterprise Update Distributor" 
-          Action: hover_with_offset(index=18, direction="left", distance=30)
-          ↑ This hovers 30px LEFT of the text, where the icon is!
+      Action: hover_with_offset(index=18, direction="left", distance=30)
+      ↑ This hovers 30px LEFT of the text, where the icon is!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -633,11 +654,11 @@ NEVER pass HTML to validate_value. Always retrieve first.
         llm_provider_name, llm_model_name, llm_temperature, 
         llm_base_url, None, ollama_num_ctx
     )
-    
+
     # Initialize planner model (optional)
     planner_llm = None
     # Planner disabled - only using main agent
-    
+
     # Initialize extraction model (optional) - used for page_extraction_llm
     page_extraction_llm = None
     if extraction_provider and extraction_model_name:
@@ -905,11 +926,17 @@ NEVER pass HTML to validate_value. Always retrieve first.
 
             if update_dict:
                 yield update_dict
+            
+            # CRITICAL: Always sleep to prevent event loop starvation
             await asyncio.sleep(0.5)
 
         # Finalize
-        webui_manager.bu_agent.state.paused = False
-        webui_manager.bu_agent.state.stopped = False
+        try:
+            if webui_manager.bu_agent:
+                webui_manager.bu_agent.state.paused = False
+                webui_manager.bu_agent.state.stopped = False
+        except Exception: pass
+        
         final_update = {}
         
         try:
@@ -924,7 +951,8 @@ NEVER pass HTML to validate_value. Always retrieve first.
                 report_generated = True
 
             # Save history
-            webui_manager.bu_agent.save_history(history_file)
+            if webui_manager.bu_agent:
+                webui_manager.bu_agent.save_history(history_file)
             if os.path.exists(history_file):
                 final_update[history_file_comp] = gr.File(value=history_file)
             
@@ -937,7 +965,7 @@ NEVER pass HTML to validate_value. Always retrieve first.
                 logger.info("Generating Playwright script via LLM...")
                 history_path = pathlib.Path(history_file)
                 from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
-                logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL} (agent model: {llm_provider_name}/{llm_model_name})")
+                logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL}")
                 script_path, script_content = generate_llm_script(
                     str(history_path),
                     model_name=SCRIPT_GEN_MODEL,
@@ -945,7 +973,6 @@ NEVER pass HTML to validate_value. Always retrieve first.
                     objective=task
                 )
                 logger.info(f"Playwright script saved to {script_path}")
-                logger.info(f"Script is ready to run: python {os.path.basename(script_path)}")
             except Exception as e:
                 logger.warning(f"Could not auto-generate enrichment or script: {e}", exc_info=True)
 
@@ -953,21 +980,9 @@ NEVER pass HTML to validate_value. Always retrieve first.
             if gif_path and os.path.exists(gif_path):
                 final_update[gif_comp] = gr.Image(value=gif_path)
 
-            # Playwright script - Use the content directly from the generator
+            # Playwright script
             if 'script_content' in locals() and script_content:
                 final_update[playwright_script_comp] = gr.Code(value=script_content, language="python")
-            else:
-                # Fallback to file search if variable is missing
-                custom_script_path = history_file.replace('.json', '_LLM.py')
-                if not os.path.exists(custom_script_path):
-                    custom_script_path = history_file.replace('.json', '.py')
-                
-                if os.path.exists(custom_script_path):
-                    with open(custom_script_path, 'r', encoding='utf-8') as f:
-                        script_content = f.read()
-                    final_update[playwright_script_comp] = gr.Code(value=script_content, language="python")
-                else:
-                    final_update[playwright_script_comp] = gr.Code(value="# Script generation not available or disabled", language="python")
 
             # DOCX
             docx_path = getattr(webui_manager, 'bu_docx_path', None)
@@ -976,15 +991,11 @@ NEVER pass HTML to validate_value. Always retrieve first.
 
         except asyncio.CancelledError:
             logger.info("Task cancelled.")
-            final_update[chatbot_comp] = gr.update(value=webui_manager.bu_chat_history)
         except Exception as e:
             logger.error(f"Execution error: {e}", exc_info=True)
             webui_manager.bu_chat_history.append({"role": "assistant", "content": f"**Error:** {e}"})
-            final_update[chatbot_comp] = gr.update(value=webui_manager.bu_chat_history)
         finally:
             webui_manager.bu_current_task = None
-            
-            # Always clean up agent to prevent state pollution
             webui_manager.bu_agent = None
             
             if should_close_browser_on_finish:
@@ -993,10 +1004,8 @@ NEVER pass HTML to validate_value. Always retrieve first.
                     await webui_manager.bu_browser_context.close()
                     webui_manager.bu_browser_context = None
                 if webui_manager.bu_browser:
-                    # Force kill browser to ensure it closes even if connected via CDP
                     await webui_manager.bu_browser.close(force=True)
                     webui_manager.bu_browser = None
-                logger.info("Browser closed successfully")
 
             final_update.update({
                 user_input_comp: gr.update(value="", interactive=True, placeholder="Enter next task..."),
@@ -1015,6 +1024,7 @@ NEVER pass HTML to validate_value. Always retrieve first.
             run_button_comp: gr.update(value="▶️ Submit Task", interactive=True),
             chatbot_comp: gr.update(value=webui_manager.bu_chat_history + [{"role": "assistant", "content": f"**Error:** {e}"}])
         }
+
 
 async def handle_submit(webui_manager: WebuiManager, components: Dict[Component, Any]):
     """Handle submit button clicks."""
@@ -1079,7 +1089,7 @@ async def handle_pause_resume(webui_manager: WebuiManager):
 async def handle_clear(webui_manager: WebuiManager):
     """Handle clear button."""
     logger.info("Clear clicked.")
-    
+
     task = webui_manager.bu_current_task
     if task and not task.done():
         if webui_manager.bu_agent:
@@ -1090,7 +1100,7 @@ async def handle_clear(webui_manager: WebuiManager):
             await asyncio.wait_for(task, timeout=TASK_CANCEL_TIMEOUT_S)
         except Exception:
             pass
-    
+
     webui_manager.bu_current_task = None
     if webui_manager.bu_controller:
         await webui_manager.bu_controller.close_mcp_client()
@@ -1177,7 +1187,7 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
         playwright_script=playwright_script,
         docx_report=docx_report,
     ))
-    
+
     webui_manager.add_components("browser_use_agent", tab_components)
     all_managed_components = list(webui_manager.get_components())
     run_tab_outputs = list(tab_components.values())
