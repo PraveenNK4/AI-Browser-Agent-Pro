@@ -352,6 +352,7 @@ async def check_certificate(page) -> dict:
     # ── 1. CDP security state ────────────────────────────────────────────────
     cdp_state = {}
     is_secure = False
+    cdp_failed = False
     try:
         cdp = await page.context.new_cdp_session(page)
         await cdp.send("Security.enable")
@@ -361,6 +362,7 @@ async def check_certificate(page) -> dict:
         is_secure = sec == "secure"
         await cdp.detach()
     except Exception as e:
+        cdp_failed = True
         print(f"[cert] CDP security check failed: {e}")
 
     # ── 2. Direct TLS handshake for full cert details ────────────────────────
@@ -368,10 +370,12 @@ async def check_certificate(page) -> dict:
     is_valid = False
     if is_https and hostname:
         try:
+            import hashlib
             ctx = _ssl.create_default_context()
             with socket.create_connection((hostname, port), timeout=10) as raw_sock:
                 with ctx.wrap_socket(raw_sock, server_hostname=hostname) as tls_sock:
                     cert    = tls_sock.getpeercert()
+                    cert_der = tls_sock.getpeercert(binary_form=True)
                     cipher  = tls_sock.cipher()           # (name, protocol, bits)
                     version = tls_sock.version()           # 'TLSv1.3' etc.
 
@@ -392,8 +396,45 @@ async def check_certificate(page) -> dict:
             days_left   = (not_after - now).days
             is_valid    = not_before <= now <= not_after
 
+            # If CDP failed but TLS handshake succeeded and cert is valid,
+            # treat the connection as secure (HTTPS + valid cert = secure)
+            if cdp_failed and is_valid and is_https:
+                is_secure = True
+
             san_list = [v for _, v in cert.get("subjectAltName", [])
                         if not v.startswith("*")][:6]
+
+            # SHA-256 fingerprint of the DER-encoded certificate
+            fp_sha256 = hashlib.sha256(cert_der).hexdigest() if cert_der else "—"
+            
+            # SHA-256 fingerprint of the Public Key (SPKI)
+            try:
+                from cryptography import x509
+                from cryptography.hazmat.primitives import serialization
+                cert_obj = x509.load_der_x509_certificate(cert_der)
+                pubkey = cert_obj.public_key()
+                pubkey_der = pubkey.public_bytes(
+                    encoding=serialization.Encoding.DER,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                )
+                pubkey_fp = hashlib.sha256(pubkey_der).hexdigest()
+            except Exception as e:
+                print(f"[cert] Could not compute public key fingerprint: {e}")
+                pubkey_fp = "—"
+
+            # Chrome-style date format
+            import os
+            fmt = "%A, %B %d, %Y at %#I:%M:%S %p" if os.name == 'nt' else "%A, %B %-d, %Y at %-I:%M:%S %p"
+            
+            # Convert naive datetime (which represents UTC) to local timezone to match Chrome's behavior
+            import datetime as dt_mod
+            utc_not_before = not_before.replace(tzinfo=dt_mod.timezone.utc)
+            utc_not_after = not_after.replace(tzinfo=dt_mod.timezone.utc)
+            local_valid_from = utc_not_before.astimezone()
+            local_valid_to = utc_not_after.astimezone()
+
+            valid_from_fmt = local_valid_from.strftime(fmt)
+            valid_to_fmt   = local_valid_to.strftime(fmt)
 
             cert_info = {
                 "hostname":      hostname,
@@ -401,8 +442,8 @@ async def check_certificate(page) -> dict:
                 "subject_org":   subject.get("organizationName", ""),
                 "issuer_cn":     issuer.get("commonName",  "Unknown CA"),
                 "issuer_org":    issuer.get("organizationName", ""),
-                "valid_from":    not_before.strftime("%d %b %Y"),
-                "valid_to":      not_after.strftime("%d %b %Y"),
+                "valid_from":    valid_from_fmt,
+                "valid_to":      valid_to_fmt,
                 "days_remaining": days_left,
                 "is_expired":    days_left < 0,
                 "cipher":        cipher[0] if cipher else "—",
@@ -410,6 +451,8 @@ async def check_certificate(page) -> dict:
                 "key_bits":      cipher[2] if cipher else "—",
                 "san":           san_list,
                 "serial":        str(cert.get("serialNumber", "—")),
+                "fingerprint_sha256": fp_sha256,
+                "pubkey_fingerprint": pubkey_fp,
             }
             print(f"[cert] ✅ {hostname} — valid for {days_left} more days")
         except _ssl.SSLCertVerificationError as e:
@@ -489,39 +532,91 @@ async def check_certificate(page) -> dict:
     # On non-Windows or if pywinauto/mss not installed → returns empty panels.
     native_shots: dict = {}
 
-    # ── Get browser PID — try 3 methods in order ──────────────────────────────
-    browser_pid = None
-
-    # Method 1: Playwright .process property (NOT callable — it's a property)
+    # ── Bring our page to front before native capture ────────────────────────
+    # Prevents "user switched tab" issue where omnibox shows wrong URL
     try:
-        br = page.context.browser
-        proc = getattr(br, "process", None)
-        if proc is not None and not callable(proc):
-            browser_pid = getattr(proc, "pid", None)
-        elif proc is not None and callable(proc):
-            p = proc()
-            browser_pid = getattr(p, "pid", None) if p else None
+        await page.bring_to_front()
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.5)   # let Chrome re-render the address bar
     except Exception:
         pass
 
-    # Method 2: psutil — find the Chrome process launched with remote-debugging-port
-    # (same technique custom_browser uses to kill it — 100% reliable)
+    # ── Get browser PID — try 3 methods in order ─────────────────────────────
+    browser_pid = None
+
+    # Method 1: CDP debug HTTP API — most reliable, returns the MAIN browser PID
+    # GET http://localhost:PORT/json/version → {"Browser": "Chrome/...", "pid": N}
+    try:
+        import urllib.request as _urllib, json as _json, re as _re2
+        br = page.context.browser
+        ws_url = getattr(br, "ws_endpoint", "") or ""
+        port_match = _re2.search(r"127\.0\.0\.1:(\d+)", ws_url)
+        if port_match:
+            debug_port = port_match.group(1)
+            api_url = f"http://127.0.0.1:{debug_port}/json/version"
+            with _urllib.urlopen(api_url, timeout=3) as resp:
+                version_info = _json.loads(resp.read())
+            # Chrome returns webSocketDebuggerUrl like ws://127.0.0.1:PORT/devtools/browser/UUID
+            # The process running that port IS the main browser process
+            # Use psutil to find it by port ownership
+            import psutil as _psutil
+            for conn in _psutil.net_connections(kind="tcp"):
+                if (conn.laddr.port == int(debug_port) and
+                        conn.status == "LISTEN" and conn.pid):
+                    browser_pid = conn.pid
+                    print(f"[cert] Got PID={browser_pid} via debug port {debug_port} socket owner")
+                    break
+    except Exception as e:
+        print(f"[cert] CDP port PID method failed: {e}")
+
+    # Method 2: psutil — find Chrome process that OWNS the debug port in its cmdline
+    # Walk up to parent if needed — renderer processes don't have the port flag
     if not browser_pid:
         try:
-            import psutil
-            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            import psutil as _psutil, re as _re3
+            br = page.context.browser
+            ws_url = getattr(br, "ws_endpoint", "") or ""
+            port_match = _re3.search(r":(\d{4,5})/", ws_url)
+            debug_port = port_match.group(1) if port_match else None
+
+            for proc in _psutil.process_iter(["pid", "name", "cmdline", "ppid"]):
                 try:
-                    name = proc.info.get("name") or ""
+                    name = (proc.info.get("name") or "").lower()
                     cmdline = proc.info.get("cmdline") or []
-                    if ("chrome" in name.lower() or "chromium" in name.lower()):
-                        if any("remote-debugging-port" in str(a) for a in cmdline):
-                            browser_pid = proc.info["pid"]
-                            print(f"[cert] Found browser PID={browser_pid} via psutil")
-                            break
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    if "chrome" not in name and "chromium" not in name:
+                        continue
+                    cmdline_str = " ".join(str(a) for a in cmdline)
+                    # Only the MAIN browser process has --remote-debugging-port
+                    # Renderer/GPU/utility processes do NOT have this flag
+                    if debug_port and f"remote-debugging-port={debug_port}" in cmdline_str:
+                        browser_pid = proc.info["pid"]
+                        print(f"[cert] Got PID={browser_pid} via psutil port={debug_port}")
+                        break
+                    elif not debug_port and "remote-debugging-port" in cmdline_str:
+                        browser_pid = proc.info["pid"]
+                        print(f"[cert] Got PID={browser_pid} via psutil (any port)")
+                        break
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied):
                     continue
         except Exception as e:
             print(f"[cert] psutil PID search failed: {e}")
+
+    # Method 3: Playwright internals
+    if not browser_pid:
+        try:
+            br = page.context.browser
+            for attr_path in [["_impl_obj", "process", "pid"], ["process", "pid"]]:
+                obj = br
+                for attr in attr_path:
+                    obj = getattr(obj, attr, None)
+                    if obj is None:
+                        break
+                if obj and isinstance(obj, int):
+                    browser_pid = obj
+                    print(f"[cert] Got PID={browser_pid} via Playwright internals")
+                    break
+        except Exception:
+            pass
 
     print(f"[cert] Browser PID for native capture: {browser_pid}")
 
@@ -630,42 +725,78 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
             print(f"[native] PID connect failed: {e} — falling back to window search")
             app = None
 
-    # Fallback: find the right Chrome window by matching URL in its title
+    # Fallback: find the right Chrome window — PID-less search
     if win is None:
         try:
             from pywinauto import Desktop
-            # Get all top-level windows with Chrome class
             desktop = Desktop(backend="uia")
             url_hostname = page_url.split("/")[2] if "//" in page_url else page_url
-            hostname_short = url_hostname.replace("www.", "").split(".")[0]  # e.g. "confluence"
 
-            all_wins = desktop.windows(class_name="Chrome_WidgetWin_1")
-            print(f"[native] Found {len(all_wins)} Chrome windows, searching for '{hostname_short}'")
+            # Get all real Chrome windows (skip tiny helper processes < 200px)
+            all_wins = [
+                w for w in desktop.windows(class_name="Chrome_WidgetWin_1")
+                if (w.rectangle().right - w.rectangle().left) > 200
+            ]
+            print(f"[native] Found {len(all_wins)} Chrome windows")
 
-            # Prefer a window whose title contains the hostname
+            best_win  = None
+            title_win = None
+
             for w in all_wins:
                 title = w.window_text() or ""
-                if hostname_short.lower() in title.lower():
-                    win = w
-                    print(f"[native] Matched window by title: '{title[:60]}'")
-                    break
 
-            # If no title match, take the window that has an omnibox with our URL
-            if win is None and all_wins:
-                # Try each window — look for one that has a visible address bar
-                # containing our domain. Use the first one as last resort.
-                for w in all_wins:
+                # ── Method A: read omnibox via UIA ────────────────────────────
+                omnibox_url = ""
+                for aid in ("omnibox", "LocationBar", "address-and-search-bar"):
                     try:
-                        # A window with many children is likely the real browser (not a helper)
-                        if len(w.children()) > 3:
-                            win = w
-                            print(f"[native] Using largest Chrome window: '{(w.window_text() or '')[:60]}'")
-                            break
+                        ob = w.child_window(auto_id=aid, control_type="Edit",
+                                            found_index=0)
+                        if ob.exists(timeout=0.5):
+                            omnibox_url = ob.get_value() or ""
+                            if omnibox_url:
+                                break
                     except Exception:
-                        continue
-                if win is None:
+                        pass
+
+                # Fallback: scan Edit descendants for one that looks like a URL
+                if not omnibox_url:
+                    try:
+                        for e in w.descendants(control_type="Edit")[:8]:
+                            try:
+                                val = e.get_value() or ""
+                                if val.startswith("http") or url_hostname in val:
+                                    omnibox_url = val
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                if omnibox_url:
+                    print(f"[native] Omnibox '{(w.window_text() or '')[:30]}': {omnibox_url[:60]}")
+                    if url_hostname in omnibox_url:
+                        best_win = w
+                        print(f"[native] ✅ URL matched in omnibox")
+                        break
+
+                # ── Method B: title match ─────────────────────────────────────
+                if url_hostname in title.lower() and title_win is None:
+                    title_win = w
+
+            win = best_win or title_win
+            if win:
+                src = "omnibox" if best_win else "title"
+                print(f"[native] Selected: '{(win.window_text() or '')[:55]}' ({src})")
+            elif all_wins:
+                # Last resort: pick largest window by child count
+                try:
+                    win = max(all_wins,
+                              key=lambda w: len(list(w.descendants())) if hasattr(w, 'descendants') else 0)
+                except Exception:
                     win = all_wins[0]
-                    print(f"[native] Using first Chrome window as last resort")
+                print(f"[native] ⚠️ No match — using largest window: "
+                      f"'{(win.window_text() or '')[:50]}'")
+
         except Exception as e:
             print(f"[native] Window search failed: {e}")
             return {}
@@ -681,42 +812,82 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
         print(f"[native] Could not focus window: {e}")
 
     # ── Step 2: Find the lock icon / security button ─────────────────────────
-    # Try AutomationIds used across Chrome versions, then fallback to Name search
     lock_btn = None
 
-    # AutomationId candidates (Chrome source code uses these names)
+    # Pass 1: AutomationId — most reliable across Chrome versions
     for aid in ("view-site-information-button", "security-indicator",
                 "location-icon-or-bubble", "page-info-button",
-                "LocationIconView", "security_status_chip_view"):
+                "LocationIconView", "security_status_chip_view",
+                "PageInfoChip", "omnibox-icon"):
         try:
-            btn = win.child_window(auto_id=aid, control_type="Button")
+            btn = win.child_window(auto_id=aid)
             if btn.exists(timeout=0.5):
                 lock_btn = btn
-                print(f"[native] Lock button found by AutomationId='{aid}'")
+                print(f"[native] Lock button by AutomationId='{aid}'  "
+                      f"Name='{btn.window_text()}'")
                 break
         except Exception:
             continue
 
-    # Name / title fallback
+    # Pass 2: Name / title match
     if lock_btn is None:
         for name in ("View site information", "Connection is secure",
                      "Connection not secure", "Not secure",
-                     "Your connection", "site information"):
+                     "Your connection to this site is not secure"):
             try:
-                btn = win.child_window(title_re=f".*{name}.*",
-                                       control_type="Button")
+                btn = win.child_window(title_re=f".*{name}.*")
                 if btn.exists(timeout=0.5):
                     lock_btn = btn
-                    print(f"[native] Lock button found by Name~='{name}'")
+                    print(f"[native] Lock button by Name~='{name}'")
                     break
             except Exception:
                 continue
 
+    # Pass 3: Scan ALL descendants for anything that looks like a lock/security button
+    # The lock icon sits left of the address bar in Chrome's toolbar
     if lock_btn is None:
-        print("[native] ❌ Lock icon button not found — trying keyboard shortcut fallback")
-        # Keyboard fallback: Alt+F to open menu, or F6 to focus address bar
-        # then Tab to reach lock icon
-        # This is a last-resort and may not work reliably
+        try:
+            print("[native] Scanning all descendants for lock button...")
+            for ctrl in win.descendants():
+                try:
+                    name = (ctrl.window_text() or "").lower()
+                    aid  = (getattr(ctrl, "automation_id", None) or
+                            ctrl.element_info.automation_id or "").lower()
+                    ctrl_type = ctrl.element_info.control_type or ""
+                    # Look for anything mentioning site info, security, or connection
+                    if any(kw in name for kw in
+                           ("site information", "connection", "secure", "not secure",
+                            "certificate", "lock")):
+                        lock_btn = ctrl
+                        print(f"[native] Lock button by scan: name='{ctrl.window_text()}' "
+                              f"auto_id='{aid}' type='{ctrl_type}'")
+                        break
+                    if any(kw in aid for kw in
+                           ("security", "site-info", "location-icon", "page-info",
+                            "lock", "omnibox-icon")):
+                        lock_btn = ctrl
+                        print(f"[native] Lock button by AutomId scan: '{aid}'")
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[native] Descendant scan failed: {e}")
+
+    if lock_btn is None:
+        print("[native] ❌ Lock icon not found after 3 passes — dumping toolbar buttons:")
+        try:
+            for ctrl in win.descendants():
+                try:
+                    ct = ctrl.element_info.control_type or ""
+                    if "Button" in ct:
+                        aid = ctrl.element_info.automation_id or ""
+                        nm  = ctrl.window_text() or ""
+                        if aid or nm:
+                            print(f"  Button | auto_id='{aid}' name='{nm}'")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         return {}
 
     # ── Step 3: Click lock → Panel 1 (Site info popup) ───────────────────────
@@ -930,7 +1101,7 @@ async def _stitch_native(p1: bytes, p2: bytes, p3: bytes, hostname: str) -> byte
         imgs   = [_PILImage.open(io.BytesIO(p)) for p in panels]
         total_w = sum(im.width for im in imgs) + 20 * (len(imgs) - 1)
         max_h   = max(im.height for im in imgs)
-        out = _PILImage.new("RGB", (total_w, max_h), (240, 242, 245))
+        out = _PILImage.new("RGB", (total_w, max_h), (30, 31, 33))
         x = 0
         for im in imgs:
             out.paste(im, (x, 0))
@@ -955,121 +1126,58 @@ async def _render_site_info_panel(
 
     sd = site_data or {}
     perms    = sd.get("permissions", {})
-    full_url = sd.get("full_url", f"https://{hostname}/")
 
-    conn_colour = "#1a6e2e" if is_secure else "#b31412"
+    conn_colour = "#81c995" if is_secure else "#f28b82"
     conn_text   = "Connection is secure" if is_secure else "Connection not secure"
 
-    def _perm_toggle(name: str) -> str:
-        """Render a toggle or text badge for a named permission."""
-        state = perms.get(name)  # 'granted' | 'denied' | 'prompt' | None
-        if state is None:
-            return ""   # permission not supported — omit entire row
-        if state == "granted":
-            return '<div class="toggle on">&#9679;</div>'
-        if state == "prompt":
-            return '<div class="perm-badge ask">Ask</div>'
-        return '<div class="toggle off">&#9679;</div>'  # denied
-
-    def _perm_row(icon: str, label: str, name: str) -> str:
-        """Emit a permission row only if the browser supports that permission."""
-        badge = _perm_toggle(name)
-        if badge == "":
-            return ""   # not supported — skip row entirely
-        return f"""
-  <div class="row">
-    <div class="row-left">
-      <div class="row-icon">{icon}</div>
-      <div><div class="row-label">{label}</div></div>
-    </div>
-    {badge}
-  </div>"""
-
-    # JavaScript status from live CDP Runtime check
-    js_enabled = sd.get("js_enabled", True)
-    js_badge   = (
-        '<span class="js-badge enabled">Allowed</span>'
-        if js_enabled else
-        '<span class="js-badge blocked">Blocked</span>'
-    )
-
-    # Cookie row — shows real count
-    cookie_count = sd.get("cookie_count", 0)
-    cookie_sub   = (
-        f'<div class="row-sub">{cookie_count} in use</div>'
-        if cookie_count > 0 else
-        '<div class="row-sub">None in use</div>'
-    )
-
-    # Only show "Reset permissions" if any permission was actually granted
-    has_granted = any(v == "granted" for v in perms.values())
-    reset_btn   = (
-        '<div class="reset-btn"><button>Reset permissions</button></div>'
-        if has_granted else ""
-    )
-
-    # Build permission rows for every supported permission
-    perm_rows = "".join([
-        _perm_row("&#x1F4CD;", "Location",              "geolocation"),
-        _perm_row("&#x1F514;", "Notifications",          "notifications"),
-        _perm_row("&#x1F4F7;", "Camera",                 "camera"),
-        _perm_row("&#x1F3A4;", "Microphone",             "microphone"),
-        _perm_row("&#x1F4CB;", "Clipboard read",         "clipboard-read"),
-        _perm_row("&#x1F4CB;", "Clipboard write",        "clipboard-write"),
-    ])
+    # Notification toggle (just one, like real Chrome)
+    notif_state = perms.get("notifications")
+    if notif_state == "granted":
+        notif_toggle = '<div class="toggle on">&#9679;</div>'
+        notif_sub = ""
+    elif notif_state == "denied":
+        notif_toggle = '<div class="toggle off">&#9679;</div>'
+        notif_sub = ""
+    else:
+        notif_toggle = '<div class="toggle off">&#9679;</div>'
+        notif_sub = '<div class="row-sub">Not allowed (default)</div>'
 
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
+html{{zoom:1.5;}}
 body{{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
-      background:#e8eaed;display:flex;align-items:center;justify-content:center;padding:24px;}}
-.panel{{background:#fff;border-radius:12px;
-        box-shadow:0 2px 10px rgba(0,0,0,.15),0 6px 30px rgba(0,0,0,.08);
-        width:320px;overflow:hidden;}}
-.header{{display:flex;align-items:flex-start;justify-content:space-between;
-         padding:14px 16px 10px;}}
-.header-text .site{{font-size:13px;font-weight:600;color:#202124;margin-bottom:2px;}}
-.header-text .url{{font-size:11px;color:#5f6368;word-break:break-all;max-width:260px;}}
-.close{{color:#5f6368;font-size:18px;cursor:pointer;margin-top:2px;}}
-.divider{{height:1px;background:#e8eaed;margin:0 0 4px;}}
+      -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+      background:#1e1f21;display:flex;align-items:center;justify-content:center;padding:24px;}}
+.panel{{background:#292a2d;border-radius:12px;
+        box-shadow:0 2px 10px rgba(0,0,0,.4),0 6px 30px rgba(0,0,0,.3);
+        width:320px;overflow:hidden;color:#e8eaed;}}
+.header{{display:flex;align-items:center;justify-content:space-between;
+         padding:14px 16px 12px;}}
+.hostname{{font-size:14px;font-weight:600;color:#e8eaed;}}
+.close{{color:#9aa0a6;font-size:18px;cursor:pointer;}}
+.divider{{height:1px;background:#3c3d41;}}
 .row{{display:flex;align-items:center;justify-content:space-between;
-      padding:10px 16px;cursor:pointer;}}
-.row:hover{{background:#f8f9fa;}}
+      padding:12px 16px;cursor:pointer;}}
 .row-left{{display:flex;align-items:center;gap:12px;}}
-.row-icon{{color:#5f6368;font-size:17px;width:20px;text-align:center;}}
-.row-label{{font-size:13.5px;color:#202124;}}
-.row-sub{{font-size:11px;color:#5f6368;margin-top:1px;}}
-.chevron{{font-size:14px;color:#80868b;}}
-.conn-colour{{color:{conn_colour};font-weight:500;}}
+.row-icon{{color:#9aa0a6;font-size:18px;width:22px;text-align:center;}}
+.row-label{{font-size:13.5px;color:#e8eaed;}}
+.row-sub{{font-size:11px;color:#9aa0a6;margin-top:2px;}}
+.chevron{{font-size:14px;color:#9aa0a6;}}
+.conn-colour{{color:{conn_colour};}}
 .toggle{{width:36px;height:20px;border-radius:10px;display:flex;
          align-items:center;justify-content:center;font-size:18px;}}
-.toggle.on{{background:#1a73e8;color:#fff;padding-left:16px;}}
-.toggle.off{{background:#dadce0;color:#fff;padding-right:16px;}}
-.perm-badge{{font-size:11px;padding:2px 8px;border-radius:4px;font-weight:600;}}
-.perm-badge.ask{{background:#fff3e0;color:#e65100;}}
-.js-badge{{font-size:11px;padding:2px 7px;border-radius:4px;}}
-.js-badge.enabled{{color:#5f6368;background:#f1f3f4;}}
-.js-badge.blocked{{color:#c5221f;background:#fce8e6;}}
-.reset-btn{{margin:8px 16px 4px;}}
-.reset-btn button{{
-  border:1px solid #dadce0;background:#fff;color:#1a73e8;
-  font-size:13px;padding:7px 16px;border-radius:20px;cursor:pointer;
-  font-family:inherit;width:100%;
-}}
-.section-divider{{height:1px;background:#e8eaed;margin:8px 0 4px;}}
-.ts{{padding:4px 16px 10px;font-size:10px;color:#9aa0a6;text-align:right;}}
+.toggle.on{{background:#8ab4f8;color:#202124;padding-left:16px;}}
+.toggle.off{{background:#5f6368;color:#292a2d;padding-right:16px;}}
 </style></head><body>
 <div class="panel">
   <div class="header">
-    <div class="header-text">
-      <div class="site">{hostname}</div>
-      <div class="url">{full_url}</div>
-    </div>
+    <div class="hostname">{hostname}</div>
     <div class="close">&#x2715;</div>
   </div>
   <div class="divider"></div>
 
-  <!-- Connection security row -->
+  <!-- Connection is secure -->
   <div class="row">
     <div class="row-left">
       <div class="row-icon">&#x1F512;</div>
@@ -1080,33 +1188,25 @@ body{{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
 
   <div class="divider"></div>
 
-  <!-- Dynamic permission rows — only shown for permissions the browser supports -->
-  {perm_rows}
-
-  <!-- JavaScript — real state from CDP Runtime -->
+  <!-- Notifications -->
   <div class="row">
     <div class="row-left">
-      <div class="row-icon" style="font-size:12px;font-family:monospace;font-weight:700">&lt;/&gt;</div>
-      <div><div class="row-label">JavaScript</div></div>
+      <div class="row-icon">&#x1F514;</div>
+      <div>
+        <div class="row-label">Notifications</div>
+        {notif_sub}
+      </div>
     </div>
-    <div style="display:flex;align-items:center;gap:6px">
-      {js_badge}
-      <span style="font-size:16px;color:#80868b">&#9783;</span>
-    </div>
+    {notif_toggle}
   </div>
 
-  {reset_btn}
+  <div class="divider"></div>
 
-  <div class="section-divider"></div>
-
-  <!-- Cookies — real count from context.cookies() -->
+  <!-- Cookies and site data -->
   <div class="row">
     <div class="row-left">
       <div class="row-icon">&#x1F36A;</div>
-      <div>
-        <div class="row-label">Cookies and site data</div>
-        {cookie_sub}
-      </div>
+      <div><div class="row-label">Cookies and site data</div></div>
     </div>
     <div class="chevron">&#x276F;</div>
   </div>
@@ -1117,10 +1217,8 @@ body{{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
       <div class="row-icon">&#x2699;&#xFE0F;</div>
       <div><div class="row-label">Site settings</div></div>
     </div>
-    <div style="font-size:14px;color:#5f6368">&#x2197;</div>
+    <div style="font-size:14px;color:#9aa0a6">&#x2197;</div>
   </div>
-
-  <div class="ts">Captured {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div>
 </body></html>"""
 
@@ -1137,121 +1235,92 @@ async def _render_cert_detail_panel(
     page, cert_info: dict, is_valid: bool, hostname: str,
 ) -> bytes:
     """Render Panel 3 — the 'Certificate is valid' detail drill-down."""
-    import datetime
+    # Fingerprint rows (SHA-256)
+    cert_fp = cert_info.get("fingerprint_sha256", cert_info.get("fingerprint", "—"))
+    pubkey_fp = cert_info.get("pubkey_fingerprint", "—")
 
-    days  = cert_info.get("days_remaining", 0)
-    expired = cert_info.get("is_expired", days < 0)
-
-    if expired:
-        bb, bf, bt = "#fce8e6", "#c5221f", "EXPIRED"
-        header_bg, header_colour = "#fce8e6", "#c5221f"
-        check_svg = '<svg width="18" height="18" viewBox="0 0 18 18"><path d="M9 1L1 16h16L9 1z" fill="#c5221f"/><text x="8.5" y="14" font-size="8" fill="white" font-weight="bold">!</text></svg>'
-        validity_label = "Certificate has EXPIRED"
-    elif days <= 30:
-        bb, bf, bt = "#fff3e0", "#e65100", f"Expires in {days} days"
-        header_bg, header_colour = "#fff3e0", "#e65100"
-        check_svg = '<svg width="18" height="18" viewBox="0 0 18 18"><circle cx="9" cy="9" r="8" fill="#e65100"/><text x="8" y="13" font-size="10" fill="white" font-weight="bold">!</text></svg>'
-        validity_label = f"Certificate expires soon ({days} days)"
-    else:
-        bb, bf, bt = "#e6f4ea", "#1a6e2e", f"Valid · {days} days remaining"
-        header_bg, header_colour = "#e6f4ea", "#1a6e2e"
-        check_svg = '<svg width="18" height="18" viewBox="0 0 18 18"><circle cx="9" cy="9" r="8" fill="#1a6e2e"/><polyline points="5,9 8,12 13,6" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-        validity_label = "Certificate is valid"
-
-    def row(lbl, val, mono=False):
+    def row(lbl, val):
         if not val or val == "—":
             return ""
-        mono_style = "font-family:monospace;font-size:11px;" if mono else ""
         return (f'<div class="row"><span class="lbl">{lbl}</span>'
-                f'<span class="val" style="{mono_style}">{val}</span></div>')
-
-    san_rows = "".join(
-        f'<div class="row"><span class="lbl">Alt name</span>'
-        f'<span class="val mono">{s}</span></div>'
-        for s in cert_info.get("san", [])
-    )
+                f'<span class="val">{val}</span></div>')
 
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
+html{{zoom:1.6;}}
 body{{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
-      background:#e8eaed;display:flex;align-items:center;justify-content:center;padding:24px;}}
-.panel{{background:#fff;border-radius:12px;
-        box-shadow:0 2px 10px rgba(0,0,0,.15),0 6px 30px rgba(0,0,0,.08);
-        width:340px;overflow:hidden;}}
-.top-bar{{display:flex;align-items:center;padding:14px 16px 12px;
-          border-bottom:1px solid #e8eaed;gap:10px;}}
-.back{{width:28px;height:28px;border-radius:50%;border:2px solid #1a73e8;
-       display:flex;align-items:center;justify-content:center;
-       color:#1a73e8;font-size:14px;flex-shrink:0;}}
-.top-title{{font-size:17px;font-weight:600;color:#202124;flex:1;}}
-.close{{color:#5f6368;font-size:18px;}}
-.validity-banner{{
-  display:flex;align-items:center;gap:12px;
-  padding:14px 16px;background:{header_bg};border-bottom:1px solid #e8eaed;
-}}
-.validity-text{{font-size:14px;font-weight:600;color:{header_colour};}}
-.section-hdr{{padding:10px 16px 4px;font-size:10.5px;font-weight:600;
-              letter-spacing:.6px;color:#80868b;text-transform:uppercase;}}
-.row{{display:flex;justify-content:space-between;align-items:baseline;
-      padding:6px 16px;font-size:12px;border-bottom:1px solid #f8f9fa;}}
-.lbl{{color:#80868b;flex-shrink:0;margin-right:8px;}}
-.val{{color:#202124;font-weight:500;text-align:right;
-      word-break:break-word;max-width:195px;}}
-.val.mono{{font-family:'Consolas',monospace;font-size:10.5px;}}
-.badge{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;
-        font-weight:600;background:{bb};color:{bf};}}
-.serial-row{{padding:8px 16px;background:#f8f9fa;border-top:1px solid #e8eaed;}}
-.serial-lbl{{font-size:10px;color:#80868b;margin-bottom:2px;}}
-.serial-val{{font-family:monospace;font-size:10.5px;color:#5f6368;word-break:break-all;}}
-.ts{{padding:6px 16px 10px;font-size:10px;color:#9aa0a6;text-align:right;}}
+      -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+      background:#1e1f21;display:flex;align-items:center;justify-content:center;padding:24px;}}
+.dialog{{background:#fff;border-radius:8px;
+         box-shadow:0 4px 20px rgba(0,0,0,.5);
+         width:420px;overflow:hidden;color:#202124;}}
+.title-bar{{display:flex;align-items:center;justify-content:space-between;
+            padding:12px 16px;background:#f0f4f8;border-bottom:1px solid #dadce0;}}
+.title-text{{font-size:13px;font-weight:600;color:#202124;}}
+.close{{color:#5f6368;font-size:16px;cursor:pointer;}}
+.tabs{{display:flex;border-bottom:2px solid #e8eaed;padding:0 16px;}}
+.tab{{padding:10px 16px;font-size:12px;color:#5f6368;cursor:pointer;
+      border-bottom:2px solid transparent;margin-bottom:-2px;}}
+.tab.active{{color:#1a73e8;border-bottom-color:#1a73e8;font-weight:600;}}
+.section-hdr{{padding:16px 16px 6px;font-size:12px;font-weight:700;
+              color:#1a73e8;}}
+.row{{display:flex;padding:4px 16px 4px 32px;font-size:12px;}}
+.lbl{{color:#5f6368;width:140px;flex-shrink:0;}}
+.val{{color:#202124;word-break:break-word;}}
+.section-space{{height:8px;}}
+.fp-section{{padding:16px 16px 6px;font-size:12px;font-weight:700;
+             color:#1a73e8;}}
+.fp-row{{padding:4px 16px 4px 32px;font-size:12px;}}
+.fp-lbl{{color:#5f6368;margin-bottom:2px;}}
+.fp-val{{font-family:'Consolas',monospace;font-size:11px;color:#202124;
+         word-break:break-all;line-height:1.5;}}
+.bottom-pad{{height:16px;}}
 </style></head><body>
-<div class="panel">
-  <div class="top-bar">
-    <div class="back">&#8592;</div>
-    <div class="top-title">Certificate viewer</div>
+<div class="dialog">
+  <div class="title-bar">
+    <div class="title-text">Certificate Viewer: {hostname}</div>
     <div class="close">&#x2715;</div>
   </div>
-  <div class="validity-banner">
-    {check_svg}
-    <div class="validity-text">{validity_label}</div>
+  <div class="tabs">
+    <div class="tab active">General</div>
+    <div class="tab">Details</div>
   </div>
 
-  <div class="section-hdr">Subject</div>
-  {row("Common name",   cert_info.get("subject_cn",  ""))}
-  {row("Organization",  cert_info.get("subject_org", ""))}
+  <div class="section-hdr">Issued To</div>
+  {row("Common Name (CN)", cert_info.get("subject_cn", ""))}
+  {row("Organization (O)", cert_info.get("subject_org", ""))}
+  {row("Organizational Unit (OU)", cert_info.get("subject_ou", "&lt;Not Part Of Certificate&gt;"))}
 
-  <div class="section-hdr">Issuer</div>
-  {row("Common name",   cert_info.get("issuer_cn",   ""))}
-  {row("Organization",  cert_info.get("issuer_org",  ""))}
+  <div class="section-space"></div>
 
-  <div class="section-hdr">Validity period</div>
-  {row("Valid from",    cert_info.get("valid_from",  ""))}
-  {row("Valid until",   cert_info.get("valid_to",    ""))}
-  <div class="row">
-    <span class="lbl">Status</span>
-    <span class="val"><span class="badge">{bt}</span></span>
-  </div>
+  <div class="section-hdr">Issued By</div>
+  {row("Common Name (CN)", cert_info.get("issuer_cn", ""))}
+  {row("Organization (O)", cert_info.get("issuer_org", ""))}
+  {row("Organizational Unit (OU)", cert_info.get("issuer_ou", "&lt;Not Part Of Certificate&gt;"))}
 
-  <div class="section-hdr">Technical details</div>
-  {row("Protocol",      cert_info.get("protocol",    ""))}
-  {row("Cipher suite",  cert_info.get("cipher",      ""), mono=True)}
-  {row("Key strength",  f'{cert_info.get("key_bits", "")} bits'
-                         if cert_info.get("key_bits") else "")}
-  {san_rows}
+  <div class="section-space"></div>
 
-  {'<div class="serial-row"><div class="serial-lbl">Serial number</div>'
-   f'<div class="serial-val">{cert_info.get("serial","—")}</div></div>'
-   if cert_info.get("serial") and cert_info.get("serial") != "—" else ""}
+  <div class="section-hdr">Validity Period</div>
+  {row("Issued On", cert_info.get("valid_from", ""))}
+  {row("Expires On", cert_info.get("valid_to", ""))}
 
-  <div class="ts">Verified {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+  <div class="section-space"></div>
+
+  <div class="fp-section">SHA-256 Fingerprints</div>
+  {'<div class="fp-row"><div class="fp-lbl">Certificate</div><div class="fp-val">'
+   + cert_fp + '</div></div>' if cert_fp and cert_fp != "—" else ""}
+  {'<div class="fp-row"><div class="fp-lbl">Public Key</div><div class="fp-val">'
+   + pubkey_fp + '</div></div>' if pubkey_fp and pubkey_fp != "—" else ""}
+
+  <div class="bottom-pad"></div>
 </div>
 </body></html>"""
 
     cert_page = await page.context.new_page()
     try:
         await cert_page.set_content(html, wait_until="networkidle")
-        shot = await cert_page.locator(".panel").screenshot(type="png")
+        shot = await cert_page.locator(".dialog").screenshot(type="png")
     finally:
         await cert_page.close()
     return shot
@@ -1290,32 +1359,33 @@ async def _composite_panels(
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
+html{{zoom:1.5;}}
 body{{
   font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
-  background:linear-gradient(135deg,#e8eaed 0%,#d2e3fc 100%);
-  padding:32px 24px;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  background:linear-gradient(135deg,#1e1f21 0%,#292a2d 100%);
+  padding:48px 36px;
 }}
 .flow{{display:flex;align-items:flex-start;gap:0;}}
 .step{{display:flex;flex-direction:column;align-items:center;gap:8px;}}
 .step-label{{
-  font-size:11px;font-weight:600;color:#5f6368;
+  font-size:11px;font-weight:600;color:#9aa0a6;
   text-transform:uppercase;letter-spacing:.5px;
-  background:rgba(255,255,255,.7);padding:3px 10px;border-radius:10px;
+  background:rgba(60,61,65,.7);padding:3px 10px;border-radius:10px;
 }}
 .step img{{border-radius:12px;
-           box-shadow:0 4px 16px rgba(0,0,0,.18),0 1px 4px rgba(0,0,0,.1);}}
+           box-shadow:0 4px 16px rgba(0,0,0,.4),0 1px 4px rgba(0,0,0,.3);}}
 .arrow{{
   display:flex;flex-direction:column;align-items:center;justify-content:center;
   padding:0 4px;margin-top:48px;
 }}
-.arrow-label{{font-size:10px;color:#1a73e8;font-weight:600;margin-bottom:4px;}}
+.arrow-label{{font-size:10px;color:#8ab4f8;font-weight:600;margin-bottom:4px;}}
 .title{{
   text-align:center;margin-bottom:20px;
-  font-size:15px;font-weight:700;color:#202124;
-  text-shadow:0 1px 2px rgba(255,255,255,.8);
+  font-size:15px;font-weight:700;color:#e8eaed;
 }}
-.subtitle{{text-align:center;margin-bottom:24px;font-size:11px;color:#5f6368;}}
-.ts{{text-align:center;margin-top:16px;font-size:10px;color:#80868b;}}
+.subtitle{{text-align:center;margin-bottom:24px;font-size:11px;color:#9aa0a6;}}
+.ts{{text-align:center;margin-top:16px;font-size:10px;color:#5f6368;}}
 </style></head><body>
   <div class="title">🔒 Security Certificate Check — {hostname}</div>
   <div class="subtitle">Click flow: Site info → Connection secure → Certificate detail</div>
@@ -1379,137 +1449,90 @@ async def _render_cert_panel(
     expired  = cert_info.get("is_expired", days < 0)
     error    = cert_info.get("error", "")
 
-    # Status colours mirror Chrome's UI
+    # Status colours mirror Chrome's dark theme UI
     if is_valid and is_secure:
-        status_colour = "#1a6e2e"
-        status_bg     = "#e6f4ea"
+        status_colour = "#81c995"
+        status_bg     = "#1b3a2a"
         lock_svg = (
             '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" '
             'xmlns="http://www.w3.org/2000/svg">'
-            '<rect x="3" y="9" width="14" height="10" rx="2" fill="#1a6e2e"/>'
-            '<path d="M7 9V6a3 3 0 016 0v3" stroke="#1a6e2e" stroke-width="2" '
+            '<rect x="3" y="9" width="14" height="10" rx="2" fill="#81c995"/>'
+            '<path d="M7 9V6a3 3 0 016 0v3" stroke="#81c995" stroke-width="2" '
             'stroke-linecap="round" fill="none"/>'
-            '<circle cx="10" cy="14" r="1.5" fill="white"/>'
+            '<circle cx="10" cy="14" r="1.5" fill="#292a2d"/>'
             '</svg>'
         )
         headline = "Connection is secure"
         subline  = ("Your information (for example, passwords or credit card "
                     "numbers) is private when it is sent to this site.")
     else:
-        status_colour = "#b31412"
-        status_bg     = "#fce8e6"
+        status_colour = "#f28b82"
+        status_bg     = "#3c2020"
         lock_svg = (
             '<svg width="20" height="20" viewBox="0 0 20 20" fill="none" '
             'xmlns="http://www.w3.org/2000/svg">'
-            '<path d="M10 2L2 17h16L10 2z" fill="#b31412"/>'
-            '<text x="9.5" y="15" font-size="9" fill="white" font-weight="bold">!</text>'
+            '<path d="M10 2L2 17h16L10 2z" fill="#f28b82"/>'
+            '<text x="9.5" y="15" font-size="9" fill="#292a2d" font-weight="bold">!</text>'
             '</svg>'
         )
         headline = "Connection not secure" if not is_secure else "Certificate issue"
         subline  = error or "The certificate for this site is invalid or expired."
 
-    # Validity badge
-    if expired:
-        badge_bg, badge_fg, badge_txt = "#fce8e6", "#c5221f", "EXPIRED"
-    elif days <= 30:
-        badge_bg, badge_fg, badge_txt = "#fff3e0", "#e65100", f"Expires in {days}d"
-    else:
-        badge_bg, badge_fg, badge_txt = "#e6f4ea", "#1a6e2e", f"Valid · {days}d left"
-
-    san_rows = "".join(
-        f'<div class="row"><span class="lbl">Alt name</span>'
-        f'<span class="val">{s}</span></div>'
-        for s in cert_info.get("san", [])
-    )
-
-    def row(label, value):
-        if not value or value == "—":
-            return ""
-        return (f'<div class="row"><span class="lbl">{label}</span>'
-                f'<span class="val">{value}</span></div>')
-
-    cert_block = "".join([
-        row("Issued to",     cert_info.get("subject_cn",  "")),
-        row("Organization",  cert_info.get("subject_org", "")),
-        row("Issued by",     cert_info.get("issuer_cn",   "")),
-        row("CA org",        cert_info.get("issuer_org",  "")),
-        row("Valid from",    cert_info.get("valid_from",  "")),
-        row("Valid until",   cert_info.get("valid_to",    "")),
-        row("Protocol",      cert_info.get("protocol",    "")),
-        row("Cipher suite",  cert_info.get("cipher",      "")),
-        row("Key strength",  f'{cert_info.get("key_bits", "")} bits'
-                              if cert_info.get("key_bits") else ""),
-        san_rows,
-    ])
-
     html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0;}}
+html{{zoom:1.5;}}
 body{{
   font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
-  background:#e8eaed;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+  background:#1e1f21;
   min-height:100vh;
   display:flex;align-items:center;justify-content:center;
   padding:24px;
 }}
 .panel{{
-  background:#fff;
+  background:#292a2d;
   border-radius:12px;
-  box-shadow:0 2px 10px rgba(0,0,0,.15),0 6px 30px rgba(0,0,0,.08);
+  box-shadow:0 2px 10px rgba(0,0,0,.4),0 6px 30px rgba(0,0,0,.3);
   width:340px;
   overflow:hidden;
+  color:#e8eaed;
 }}
 .top-bar{{
   display:flex;align-items:center;padding:14px 16px 12px;
-  border-bottom:1px solid #e8eaed;gap:10px;
+  border-bottom:1px solid #3c3d41;gap:10px;
 }}
 .back{{
-  width:28px;height:28px;border-radius:50%;border:2px solid #1a73e8;
+  width:28px;height:28px;border-radius:50%;border:2px solid #8ab4f8;
   display:flex;align-items:center;justify-content:center;
-  color:#1a73e8;font-size:14px;cursor:pointer;flex-shrink:0;
+  color:#8ab4f8;font-size:14px;cursor:pointer;flex-shrink:0;
 }}
-.top-title{{font-size:17px;font-weight:600;color:#202124;flex:1;}}
-.close{{color:#5f6368;font-size:18px;cursor:pointer;}}
-.url-line{{padding:4px 16px 12px;font-size:12px;color:#5f6368;
-           word-break:break-all;border-bottom:1px solid #e8eaed;}}
+.top-title{{font-size:17px;font-weight:600;color:#e8eaed;flex:1;}}
+.close{{color:#9aa0a6;font-size:18px;cursor:pointer;}}
+.url-line{{padding:8px 16px 12px;font-size:12px;color:#9aa0a6;
+           word-break:break-all;}}
 .sec-row{{
   display:flex;align-items:flex-start;gap:12px;
-  padding:14px 16px 12px;border-bottom:1px solid #e8eaed;
+  padding:14px 16px 16px;
 }}
 .sec-icon{{flex-shrink:0;margin-top:2px;}}
 .sec-text .headline{{
-  font-size:14px;font-weight:600;color:{status_colour};margin-bottom:4px;
+  font-size:14px;font-weight:600;color:{status_colour};margin-bottom:6px;
 }}
-.sec-text .sub{{font-size:12px;color:#5f6368;line-height:1.55;}}
-.sec-text .sub a{{color:#1a73e8;text-decoration:none;}}
-.section-hdr{{
-  padding:10px 16px 4px;
-  font-size:10.5px;font-weight:600;letter-spacing:.6px;
-  color:#80868b;text-transform:uppercase;
-}}
-.row{{
-  display:flex;justify-content:space-between;align-items:baseline;
-  padding:6px 16px;font-size:12px;border-bottom:1px solid #f8f9fa;
-}}
-.lbl{{color:#80868b;flex-shrink:0;margin-right:8px;}}
-.val{{color:#202124;font-weight:500;text-align:right;word-break:break-word;max-width:190px;}}
-.badge{{
-  display:inline-block;padding:1px 7px;border-radius:10px;
-  font-size:10.5px;font-weight:600;
-  background:{badge_bg};color:{badge_fg};margin-left:6px;
-}}
+.sec-text .sub{{font-size:12px;color:#9aa0a6;line-height:1.6;}}
+.sec-text .sub a{{color:#8ab4f8;text-decoration:none;}}
+.divider{{height:1px;background:#3c3d41;}}
 .cert-footer{{
   display:flex;align-items:center;gap:10px;
-  padding:11px 16px;background:#f8f9fa;
+  padding:12px 16px;cursor:pointer;
 }}
 .cert-check{{
-  width:20px;height:20px;border-radius:3px;background:#1a6e2e;
+  width:20px;height:20px;border-radius:3px;background:#81c995;
   display:flex;align-items:center;justify-content:center;
-  color:#fff;font-size:13px;flex-shrink:0;
+  color:#292a2d;font-size:13px;flex-shrink:0;
 }}
-.cert-label{{font-size:13px;font-weight:500;color:#202124;flex:1;}}
-.cert-arrow{{color:#5f6368;font-size:16px;}}
-.ts{{padding:6px 16px 10px;font-size:10px;color:#9aa0a6;text-align:right;}}
+.cert-label{{font-size:13px;font-weight:500;color:#e8eaed;flex:1;}}
+.cert-arrow{{color:#9aa0a6;font-size:16px;}}
 </style></head><body>
 <div class="panel">
   <div class="top-bar">
@@ -1525,18 +1548,12 @@ body{{
       <div class="sub">{subline} <a href="#">Learn more</a></div>
     </div>
   </div>
-  <div class="section-hdr">Certificate</div>
-  {cert_block}
-  <div class="row">
-    <span class="lbl">Validity</span>
-    <span class="val"><span class="badge">{badge_txt}</span></span>
-  </div>
+  <div class="divider"></div>
   <div class="cert-footer">
     <div class="cert-check">&#x2713;</div>
     <div class="cert-label">Certificate is valid</div>
     <div class="cert-arrow">&#x2197;</div>
   </div>
-  <div class="ts">Checked {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
 </div>
 </body></html>"""
 
@@ -1568,9 +1585,19 @@ async def generate_report(
     print("=" * 60 + "\n")
 
     try:
+        import sys as _sys
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Save next to the calling script (e.g. agent_history folder), not src/utils/
+        caller_script = os.path.abspath(_sys.argv[0]) if _sys.argv[0] else __file__
+        script_dir = os.path.dirname(caller_script)
         report_path = os.path.join(script_dir, f"report_{timestamp}.docx")
+
+        # Save screenshot as standalone PNG so it's visible outside the docx
+        if screenshot:
+            png_path = os.path.join(script_dir, f"certificate_{timestamp}.png")
+            with open(png_path, "wb") as f:
+                f.write(screenshot)
+            print(f"[+] Certificate screenshot saved: {png_path}")
 
         doc = Document()
         doc.add_heading(f"Report: {scenario}", 0)
