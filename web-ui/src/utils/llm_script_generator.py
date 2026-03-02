@@ -15,7 +15,6 @@ import argparse
 import re
 from pathlib import Path
 from typing import Dict, Any
-from datetime import datetime
 
 # Ensure we can import from src
 sys.path.append(str(Path(__file__).parent.parent.parent))
@@ -29,7 +28,7 @@ from src.utils.config import (
     TIMEOUT_FIND_IN_FRAMES_MS, TIMEOUT_ELEMENT_VISIBLE_MS,
     TIMEOUT_FILL_MS, TIMEOUT_CLICK_MS,
     TIMEOUT_FILE_CHOOSER_MS, TIMEOUT_UPLOAD_CLICK_MS, TIMEOUT_UPLOAD_FALLBACK_MS,
-    TIMEOUT_TABLE_WAIT_MS, TIMEOUT_NETWORKIDLE_MS,
+    TIMEOUT_TABLE_WAIT_MS,
 )
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -38,317 +37,35 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def _build_system_prompt() -> str:
-    """Build the LLM system prompt. The LLM generates fully self-contained scripts —
-    no external helper imports. All functions the script needs are written inline."""
+    """Build the LLM system prompt. All runtime helpers live in script_helpers.py —
+    the LLM must only write the async def run() body."""
 
-    # Dynamic vault prefix discovery (avoid hardcoding "OTCS")
-    from src.utils.vault import vault
-    available_keys = vault.list_keys()
-    
-    # If a prefix is in environment, use it. 
-    # Otherwise, if only one key exists, use it.
-    # Otherwise, default to "vault_key" as a generic placeholder.
-    if VAULT_CREDENTIAL_PREFIX and VAULT_CREDENTIAL_PREFIX != "OTCS":
-        vault_prefix = VAULT_CREDENTIAL_PREFIX
-    elif len(available_keys) == 1:
-        vault_prefix = available_keys[0]
-    else:
-        # Fallback to config but allow the LLM to override based on context
-        vault_prefix = VAULT_CREDENTIAL_PREFIX 
+    pw_sel          = LOGIN_PASS_SELECTORS[0] if LOGIN_PASS_SELECTORS else "input[type='password']"
+    vault_prefix    = VAULT_CREDENTIAL_PREFIX
+    table_wait_ms   = TIMEOUT_TABLE_WAIT_MS
+    file_chooser_ms = TIMEOUT_FILE_CHOOSER_MS
 
-    # Serialize selector lists so the LLM can embed them
-
-    # Serialize selector lists so the LLM can embed them
-    user_sels_str   = json.dumps(LOGIN_USER_SELECTORS)
-    pass_sels_str   = json.dumps(LOGIN_PASS_SELECTORS)
-    submit_sels_str = json.dumps(LOGIN_SUBMIT_SELECTORS)
-
-    # Minimal script header — includes path bootstrap for vault access
-    script_header = f'''
+    # Minimal script header the LLM should reproduce verbatim
+    script_header = '''\
 import asyncio
-import os
 import sys
-from datetime import datetime
-from pathlib import Path
+import os
 from playwright.async_api import async_playwright
 
-# Fix Windows console encoding for special characters
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding='utf-8')
-        sys.stderr.reconfigure(encoding='utf-8')
-    except:
-        import codecs
-        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
-        sys.stderr = codecs.getwriter("utf-8")(sys.stderr.detach())
-
 # Path bootstrap — keeps the script runnable from any working directory
-# Ensures we can import from src.utils.vault
 current_dir = os.getcwd()
 if "web-ui" not in current_dir and os.path.exists(os.path.join(current_dir, "web-ui")):
     sys.path.append(os.path.join(current_dir, "web-ui"))
 else:
     sys.path.append(current_dir)
 
-from src.utils.vault import vault
-from src.utils.report_templates import generate_script_report
-
-# ── Configuration (adjust via environment or inline) ──
-TIMEOUT_FILL_MS        = int(os.environ.get("TIMEOUT_FILL_MS", "{TIMEOUT_FILL_MS}"))
-TIMEOUT_CLICK_MS       = int(os.environ.get("TIMEOUT_CLICK_MS", "{TIMEOUT_CLICK_MS}"))
-TIMEOUT_TABLE_WAIT_MS  = int(os.environ.get("TIMEOUT_TABLE_WAIT_MS", "{TIMEOUT_TABLE_WAIT_MS}"))
-TIMEOUT_NETWORKIDLE_MS = int(os.environ.get("TIMEOUT_NETWORKIDLE_MS", "{TIMEOUT_NETWORKIDLE_MS}"))
-
-# Vault Prefix (Dynamic Discovery)
-VAULT_PREFIX = os.environ.get("VAULT_CREDENTIAL_PREFIX", "{vault_prefix}")
-if not vault.get_credentials(VAULT_PREFIX):
-    keys = vault.list_keys()
-    if keys:
-        VAULT_PREFIX = keys[0]
-
-def clean_text(text):
-    if not text: return ""
-    import re
-    # Remove non-breaking spaces and redundant whitespace
-    text = text.replace("\\u00a0", " ").replace("\\xa0", " ")
-    text = re.sub(r'\\s+', ' ', text).strip()
-    return text
-
-# Screenshot Directory Setup
-SCREENSHOT_DIR = Path(__file__).parent / "screenshots"
-SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-
-_screenshot_count = 0
-
-async def take_full_screenshot(page, description):
-    global _screenshot_count
-    import re
-    _screenshot_count += 1
-    slug = re.sub(r'[^a-z0-9]+', '_', description.lower()).strip('_')
-    if not slug: slug = "screenshot"
-    filename = f"{{_screenshot_count:02d}}_{{slug}}.png"
-    path = SCREENSHOT_DIR / filename
-    try:
-        # Use OS-level screen capture to include URL bar and full browser chrome
-        import pyautogui
-        await page.wait_for_timeout(500)  # Brief pause for rendering
-        screenshot = pyautogui.screenshot()
-        screenshot.save(str(path))
-        print(f"📸 Full-screen screenshot saved: {{path}}")
-    except ImportError:
-        # Fallback to Playwright page-only screenshot if pyautogui not available
-        try:
-            await page.screenshot(path=str(path), full_page=True)
-            print(f"📸 Screenshot saved (page only): {{path}}")
-        except Exception as e:
-            print(f"⚠️ Failed to take screenshot '{{description}}': {{e}}")
-    except Exception as e:
-        print(f"⚠️ Failed to take screenshot '{{description}}': {{e}}")
-'''
-
-    return f'''You are an expert Playwright automation engineer. Generate a fully **self-contained** Python script from the execution history below.
-
-### ✅ WHAT TO GENERATE
-Write a COMPLETE, STANDALONE Python script that:
-1. Needs NO external project imports — only standard library + `playwright`.
-2. Defines any helper functions it needs INLINE in the script.
-3. Can be run from any directory with just `python script.py`.
-
-### 🛡️ GOLDEN RULES
-1.  **Self-contained** — The script MUST be fully standalone. Do NOT import from project-internal modules **except for the ones provided in the template header (vault, generate_script_report)**. Define all other helper functions you need directly in the script.
-
-2.  **Credentials** — Read from the project vault using `vault.get_credentials(VAULT_PREFIX)`.
-    The script header automatically attempts to find the correct `VAULT_PREFIX` from available keys. 
-    NEVER hardcode actual credentials.
-
-3.  **Login handling** — If the execution history shows that the agent encountered a login screen or performed authentication:
-    - Write an `async def login(page)` function at the start of your script.
-    - Call `await login(page)` in the `run()` function before navigation.
-    - If NO login is detected in history, do NOT define or call the login function. Keep the script lean.
-    - Inside your `login()` function, use these common selectors to find fields (embedded directly):
-      - Username: {user_sels_str}
-      - Password: {pass_sels_str}
-      - Submit/Sign-in: {submit_sels_str}
-    - Template for `login()`:
-      ```python
-      async def login(page):
-          creds = vault.get_credentials(VAULT_PREFIX)
-          if not creds: return
-          username, password = creds.get("username"), creds.get("password")
-          
-          # Use short timeouts for field probes
-          for sel in [ ... list of selectors from above ... ]:
-              try:
-                  await page.locator(sel).fill(username, timeout=2000)
-                  break
-              except: continue
-          # ... repeat for password and click submit ...
-      ```
-
-        async def extract_table(page, selector, column_names):
-            print(f"DEBUG: Extracting table with selector: {{selector}}")
-            try:
-                await page.wait_for_selector(selector, timeout=TIMEOUT_TABLE_WAIT_MS)
-            except Exception as e:
-                if selector.strip() != "table":
-                    try:
-                        print(f"DEBUG: Specific selector failed, falling back to generic 'table'")
-                        await page.wait_for_selector("table", timeout=10000)
-                        selector = "table"
-                    except: raise e
-                else: raise e
-
-            tables = await page.locator(selector).all()
-            print(f"DEBUG: Found {{len(tables)}} tables matching selector.")
-
-            best_table_data = []
-            best_score = -1
-            best_exact_count = -1
-
-            for table_idx, table in enumerate(tables):
-                # Skip layout tables that contain nested tables
-                nested_count = await table.locator("table").count()
-                if nested_count > 0:
-                    print(f"DEBUG: Table {{table_idx}} has {{nested_count}} nested tables, skipping (layout table).")
-                    continue
-
-                # Use direct-child row selectors to avoid inheriting nested table rows
-                rows = await table.locator(":scope > tbody > tr, :scope > thead > tr, :scope > tr").all()
-                if len(rows) < 2: continue
-
-                table_best_indices = {{}}
-                table_best_header_idx = -1
-                table_best_score = -1
-                table_best_exact = -1
-
-                search_limit = min(len(rows), 8)
-                for r_idx in range(search_limit):
-                    cells = await rows[r_idx].locator(":scope > th, :scope > td").all()
-                    current_headers = [clean_text(await c.text_content()) for c in cells]
-
-                    exact_count = 0
-                    fuzzy_count = 0
-                    indices = {{}}
-
-                    for col in column_names:
-                        for i, h in enumerate(current_headers):
-                            if col.lower() == h.lower():
-                                if col not in indices and i not in indices.values():
-                                    indices[col] = i
-                                    exact_count += 1
-                                    break
-
-                    for col in column_names:
-                        if col in indices: continue
-                        for i, h in enumerate(current_headers):
-                            if i in indices.values(): continue
-                            if col.lower() in h.lower() and len(h) < 50:
-                                indices[col] = i
-                                fuzzy_count += 1
-                                break
-
-                    score = exact_count * 10 + fuzzy_count
-                    if score > table_best_score or (score == table_best_score and exact_count > table_best_exact):
-                        table_best_score = score
-                        table_best_exact = exact_count
-                        table_best_indices = indices
-                        table_best_header_idx = r_idx
-
-                if table_best_score > 0 and table_best_header_idx >= 0:
-                    data = []
-                    for row in rows[table_best_header_idx + 1:]:
-                        cells = await row.locator(":scope > th, :scope > td").all()
-                        if len(cells) < len(table_best_indices): continue
-                        row_data = {{}}
-                        found_any = False
-                        for col, idx in table_best_indices.items():
-                            if idx < len(cells):
-                                val = clean_text(await cells[idx].text_content())
-                                row_data[col] = val
-                                if val: found_any = True
-                        if found_any:
-                            data.append(row_data)
-
-                    if len(data) > 0 and (table_best_score > best_score or (table_best_score == best_score and table_best_exact > best_exact_count)):
-                        best_score = table_best_score
-                        best_exact_count = table_best_exact
-                        best_table_data = data
-                        print(f"DEBUG: Table {{table_idx}} scored {{table_best_score}} (exact={{table_best_exact}}), found {{len(data)}} rows.")
-
-            return best_table_data
-
-    5.  **Selectors** — Use selectors from `dom_elements.selectors` in the history
-        (`preferred` > `css` > `recommended_selector` > `xpath`).
-        If `dom_elements` is empty, use scoped selectors like `form#id table`.
-        NEVER hallucinate selectors. NEVER use bare `"table"` — always scope it.
-
-    6.  **Report output** — Print results in a clear format. At the END of the script, call `generate_script_report()` to save a Word (.docx) report. NEVER save results to a `.txt` file.
-
-    7.  **URL handling** — CRITICAL: Use the BASE application URL (e.g. `http://host/app/`),
-        NOT login/auth redirect URLs. The base URL auto-redirects to login if needed.
-        Use `timeout=TIMEOUT_TABLE_WAIT_MS` for `page.goto`.
-
-    8.  **Post-navigation waits** — ALWAYS add:
-        - `await page.wait_for_load_state("domcontentloaded")` after `page.goto(...)`
-        - `await page.wait_for_load_state("networkidle", timeout=TIMEOUT_NETWORKIDLE_MS)` after login
-
-9.  **Loops** — ALWAYS `elements = await locator.all()` then `for el in elements:`.
-    Never `async for`.
-
-10. **No noise** — Skip failed/retried actions from history. Only generate the successful path.
-
-11. **Empty DOM** — If a step has empty `dom_elements`, do NOT invent selectors.
-    Use scoped selectors from form IDs or container IDs.
-
-    12. **Column hints** — If a step has `required_columns_hint`, extract those EXACT
-        columns. Include ALL columns listed in the hint, plus any identity column
-        (Server, Name) if not already present.
-        CRITICAL: NEVER use URLs, paths, or credentials as column names.
-        If a hint contains a URL, ignore that item. Column names MUST be simple strings like 'Status' or 'Worker ID'.
-
-    13. **Resilience & JSON** — 
-        - ALWAYS use `.get('Column', '')` when accessing row dictionaries (e.g., `row.get('ID', 'N/A')`). NEVER use direct access like `row['ID']`. This is MANDATORY to prevent `KeyError`.
-        - Keep column lists SEPARATE for different logical tables. Do not merge all columns into one list if the history shows distinct extraction goals.
-        - NEVER generate conversational summaries in the report script based on your own knowledge. 
-        - ONLY use the data returned by `extract_table`.
-        - If the extraction result is empty, handle it gracefully (e.g., `print("No data found")`).
-
-    14. **Full-Page Screenshots** — ALWAYS call `await take_full_screenshot(page, "Descriptive Name")` at these points:
-        - After a successful login.
-        - After every major navigation to a new URL.
-        - Immediately after extracting data from a table (to verify findings).
-        The name MUST be relevant to the page content (e.g., "login_success", "agent_status_table").
-
-    15. **Scrolling Resilience** — If the execution history shows `scroll_to_text(...)` failing (text not found or visible), or if you need to reach the bottom of a long page (like a Distributed Agent Status page with many workers):
-        - Prefer `await page.mouse.wheel(0, 800)` or `scroll_page(direction='down', amount=800)` logic if text-based scrolling is brittle.
-        - ALWAYS add `await page.wait_for_timeout(1000)` after a large scroll to allow lazy-loaded content to render.
-
-    16. **Dynamic Success Statements** — At the end of the script before generating the report, write a generic, dynamic `print()` statement that describes what the script ACTUALLY did (e.g., checking if agents had to be started vs were already running).
-        - DO NOT blindly copy the specific, hardcoded conclusion text from the execution history's `done` step.
-        - Use the variables in your script (e.g., `if all_running:... else:...`) to print an accurate summary of the execution path.
-
-    17. **Word Report** — At the END of the script (before `await browser.close()`), call:
-        ```python
-        steps = []  # Build this as you go: steps.append({{"action": "action_name", "output": "captured text"}})
-        generate_script_report(
-            script_name=os.path.basename(__file__),
-            steps=steps,
-            screenshots_dir=str(SCREENSHOT_DIR),
-            output_path=str(SCREENSHOT_DIR.parent / f"report_{{datetime.now().strftime('%Y%m%d_%H%M%S')}}.docx"),
-            status="Execution Complete",
-            captured_outputs="<combined text output>",
-        )
-        ```
-        Build the `steps` list incrementally: after each action or extraction, append a dict with `{{"action": ..., "output": ...}}`.
-        The `screenshots_dir` is SCREENSHOT_DIR, which already holds the numbered screenshots.
-
-### 📝 STRUCTURE
-Use this header, then write helper functions and `async def run()`:
-
-```python
-{script_header}
-
-# Define helper functions here (login, extract_table, etc.) as needed
+from src.utils.script_helpers import (
+    get_secret, find_in_frames,
+    resilient_fill, resilient_click, click_and_upload_file,
+    maybe_login, resilient_extract_table, generate_report,
+    check_certificate,
+)
+from src.utils.config import TIMEOUT_TABLE_WAIT_MS, TIMEOUT_FILL_MS
 
 async def run():
     async with async_playwright() as p:
@@ -356,179 +73,202 @@ async def run():
         context = await browser.new_context(no_viewport=True)
         page = await context.new_page()
 
-        # ... navigation, login, extraction, report ...
+        # Navigate and handle login
+        await page.goto("<URL from history>", timeout=60000)
+        await maybe_login(page)
 
+        # Wait for target element, then extract / interact
+        table_selector = "<selector from dom_context>"
+        await page.wait_for_selector(table_selector, timeout=TIMEOUT_TABLE_WAIT_MS)
+        rows = await resilient_extract_table(page, table_selector, ["Col1", "Col2"])
+        output = "\\n".join([
+            f"Identity: {row.get('Server') or row.get('Name') or 'Unknown'}, "
+            f"Status: {row.get('Status', '')}, Errors: {row.get('Errors', '')}"
+            for row in rows
+        ])
+        await generate_report("Task Name", bool(rows), output=output)
         await browser.close()
 
 if __name__ == "__main__":
     asyncio.run(run())
-```
-
-Write helper functions ABOVE `async def run()` or inline inside it.
-Only import additional standard library modules if needed (e.g. `import re`, `from datetime import datetime`).
 '''
 
-def columns_from_results(results: list) -> list[str]:
-    """Parse leaf-row keys from extracted_content fenced JSON in agent results.
-    
-    Strategy (per spec §3.A):
-      1. Parse fenced ```json``` blocks from extracted_content.
-      2. Walk nested objects/lists and collect all leaf-dict keys.
-      3. Return deduplicated ordered list of column names found.
-    """
-    if not results:
-        return []
-    for res in results:
-        if not isinstance(res, dict):
-            continue
-        content = res.get("extracted_content") or ""
-        # Accept both fenced and raw JSON blobs
-        json_candidates = []
-        m = re.search(r'```(?:json)?\s*([\[\{].*?)\s*```', content, re.DOTALL)
-        if m:
-            json_candidates.append(m.group(1))
-        else:
-            # Try the entire content as JSON
-            stripped = content.strip()
-            if stripped.startswith(('[', '{')):
-                json_candidates.append(stripped)
+    return f'''You are an expert Playwright automation engineer. Generate a MINIMAL, CORRECT Python script from the execution history below.
 
-        for candidate in json_candidates:
-            try:
-                data = json.loads(candidate)
-            except Exception:
-                continue
-            cols = []
-            seen_cols = set()
+### ✅ WHAT TO GENERATE
+Only write `async def run()` and the standard header shown in the STRUCTURE section.
+Do NOT redefine any helper functions — they all come pre-built from `src.utils.script_helpers`.
 
-            def walk(obj, depth=0):
-                if depth > 10: return
-                if isinstance(obj, dict):
-                    if obj and all(not isinstance(v, (dict, list)) for v in obj.values()):
-                        for k in obj.keys():
-                            if k not in seen_cols:
-                                seen_cols.add(k)
-                                cols.append(k)
-                    else:
-                        for v in obj.values(): walk(v, depth + 1)
-                elif isinstance(obj, list):
-                    for v in obj: walk(v, depth + 1)
+### 🛡️ GOLDEN RULES
+1.  **Helpers are pre-built** — NEVER redefine `get_secret`, `find_in_frames`, `resilient_fill`,
+    `resilient_click`, `click_and_upload_file`, `maybe_login`, `resilient_extract_table`,
+    `generate_report`, or `check_certificate`. Import and call them; do not copy their implementation.
+2.  **Vault** — Use `await get_secret("KEY_USERNAME")` / `"KEY_PASSWORD"`. Never hardcode credentials.
+    The vault prefix is currently `"{vault_prefix}"`.
+3.  **Login hook** — After every `await page.goto(...)` for a protected URL, call `await maybe_login(page)`.
+    `maybe_login` is smart: it does nothing if no login form is present.
+4.  **Table extraction**:
+    - ALWAYS use `await resilient_extract_table(page, table_selector, required_columns)`.
+    - `table_selector` MUST come from `dom_elements.selectors` in the history (`preferred` > `css` > `xpath`).
+      NEVER use a bare `"table"` or a login-field selector like `"input[type='password']"`.
+    - `required_columns` MUST include the columns from `required_columns_hint` PLUS an identity
+      key (`"Server"` or `"Name"`) if not already present.
+    - After `await maybe_login(page)`, wait for `table_selector`, NOT a login field:
+      `await page.wait_for_selector(table_selector, timeout=TIMEOUT_TABLE_WAIT_MS)`
+5.  **Selectors** — Use `[aria-label]`, `[title]`, or descriptive attributes. Avoid brittle
+    positional selectors. For exact-text menus: `re.compile(f"^{{target}}$", re.I)`.
+6.  **Uploads** — Use `await click_and_upload_file(page, label, path)` with `TIMEOUT_FILE_CHOOSER_MS`
+    (currently {file_chooser_ms}ms).
+7.  **Loops** — ALWAYS `elements = await locator.all()` then `for el in elements:`.
+    Never `async for`.
+8.  **Report output** — Format rows as:
+    `f"Identity: {{row.get('Server') or row.get('Name') or 'Unknown'}}, Status: {{row.get('Status', '')}}, ..."`
+    Then call `await generate_report(scenario, bool(rows), output=output)`.
+9.  **No noise** — Skip failed/retried actions from history. Only generate the successful path.
+10. **Imports** — Only import what `run()` actually uses beyond the standard header.
+    Common extras: `import re` (if using regex), `import time` (if using sleep).
+11. **Certificate / security checks** — NEVER click the browser lock icon (it is above the page
+    and unreachable from Playwright). Instead call:
+    ```python
+    result = await check_certificate(page)
+    # result keys: screenshot (PNG bytes), cert_info (dict), is_valid (bool),
+    #              is_secure (bool), hostname (str)
+    cert = result["cert_info"]
+    output = (
+        f"Host: {{result['hostname']}}\\n"
+        f"Valid: {{result['is_valid']}} | Secure: {{result['is_secure']}}\\n"
+        f"Issued to: {{cert.get('subject_cn')}} ({{cert.get('subject_org')}})\\n"
+        f"Issued by: {{cert.get('issuer_cn')}}\\n"
+        f"Valid from {{cert.get('valid_from')}} to {{cert.get('valid_to')}} "
+        f"({{cert.get('days_remaining')}}d remaining)\\n"
+        f"Protocol: {{cert.get('protocol')}} | Cipher: {{cert.get('cipher')}}\\n"
+        f"Expired: {{cert.get('is_expired')}}"
+    )
+    await generate_report("Certificate Check", result["is_valid"],
+                          screenshot=result["screenshot"], output=output)
+    ```
+    `check_certificate` uses CDP + direct TLS — no coordinates, no OS-specific UI automation.
 
-            walk(data)
-            if cols: return cols
-        
-        # 3. FALLBACK: Parse Markdown tables or lists if JSON is missing
-        md_cols = []
-        table_match = re.search(r'\|\s*([^|]+)\s*\|\s*([^|]+)\s*\|', content)
-        if table_match and "---" in content:
-            header_line = table_match.group(0)
-            md_cols = [c.strip() for c in header_line.split("|") if c.strip()]
-        
-        if not md_cols:
-            bullet_matches = re.findall(r'^[ \t]*[-*+]\s*\*\*?([^\*:]+)\*\*?:\s*', content, re.MULTILINE)
-            if bullet_matches:
-                md_cols = list(dict.fromkeys([b.strip() for b in bullet_matches]))
-        
-        if md_cols:
-            filtered_md = [c for c in md_cols if len(c) < 40 and not any(n in c.lower() for n in ['http', '/', 'click', 'page'])]
-            if filtered_md: return filtered_md
-    return []
+### 📝 STRUCTURE
+Reproduce this header exactly, then write only `async def run()`:
 
-def infer_required_columns(text: str) -> list[str]:
-    """Infer required columns from the user's objective/goal."""
-    if not text: return []
-    candidates = []
-    candidates += re.findall(r'"([^"]{2,30})"', text)
-    candidates += re.findall(r"'([^']{2,30})'", text)
-    for line in re.split(r'[\r\n]+', text):
-        if ":" in line or " - " in line:
-            tail = re.split(r'[:\-]\s*', line, maxsplit=1)[-1]
-            parts = re.split(r',| and ', tail, flags=re.IGNORECASE)
-            candidates += [p.strip() for p in parts if p.strip()]
-    for m in re.findall(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})', text):
-        if len(m) > 40: continue
-        if "http" in m.lower() or "/" in m: continue
-        candidates.append(m)
+```python
+{script_header}
+```
 
-    common_noisy_words = {
-        'navigate', 'click', 'http', 'https', 'login', 'server', 'secret', 'password', 'username', 'check', 'extract', 
-        'read', 'done', 'log', 'in', 'do', 'find', 'locate', 'entire', 'table', 'once', 'see', 'results', 'consolidated',
-        'report', 'summarizing', 'findings', 'key', 'points', 'distributed', 'system', 'agent', 'dashboard'
-    }
-    cleaned = []
-    seen = set()
-    for c in candidates:
-        c = c.strip().strip(".:'\"[]()")
-        c_lower = c.lower()
-        if not c or len(c) < 2 or len(c) > 40: continue
-        words = c_lower.split()
-        noisy_count = sum(1 for w in words if w in common_noisy_words)
-        if noisy_count >= len(words) / 2: continue
-        if "://" in c or "/" in c or "\\" in c: continue
-        if c not in seen:
-            seen.add(c)
-            cleaned.append(c)
-    return cleaned
+The header imports EVERYTHING from `script_helpers`. Only add extra imports if `run()` needs them
+(e.g. `import re` for regex matching, `import time` for explicit waits).
+'''
 
 SYSTEM_PROMPT = _build_system_prompt()
 
-def clean_history_json(history_data: Dict[str, Any], objective: str = None, history_path: str = None) -> str:
-    """Optimize JSON payload by pruning redundant actions, failed attempts, and duplicate navigations.
-    
-    Args:
-        history_data: Raw history dict
-        objective: Task objective string
-        history_path: Path to history JSON file (used to resolve DOM snapshots)
-    """
-    # ── Snapshot resolution: find DOM snapshots directory for this run ──
-    _snapshots_by_step = {}  # step_index -> snapshot dict
-    if history_path:
-        try:
-            hp = Path(history_path).resolve()
-            # Walk up the directory tree to find a sibling "dom_snapshots" folder
-            dom_root = None
-            for parent in hp.parents:
-                candidate = parent / "dom_snapshots"
-                if candidate.exists() and candidate.is_dir():
-                    dom_root = candidate
-                    break
-            # Try multiple candidate directory names
-            if dom_root:
-                for candidate in [hp.stem, hp.parent.name]:
-                    snap_dir = dom_root / candidate
-                    if snap_dir.exists():
-                        for snap_file in sorted(snap_dir.glob("*.json"), key=lambda p: int(p.stem)):
-                            try:
-                                with snap_file.open("r", encoding="utf-8") as sf:
-                                    snap_data = json.load(sf)
-                                step_idx = snap_data.get("metadata", {}).get("step_index")
-                                if step_idx is not None:
-                                    _snapshots_by_step[step_idx] = snap_data
-                            except Exception:
-                                continue
-                        if _snapshots_by_step:
-                            logger.info(f"Loaded {len(_snapshots_by_step)} DOM snapshots from {snap_dir}")
-                            break
-                # Also try orchestration-style path (snapshot dir name includes process name)
-                if not _snapshots_by_step:
-                    for entry in dom_root.iterdir():
-                        if entry.is_dir() and hp.stem in entry.name:
-                            for snap_file in sorted(entry.glob("*.json"), key=lambda p: int(p.stem)):
-                                try:
-                                    with snap_file.open("r", encoding="utf-8") as sf:
-                                        snap_data = json.load(sf)
-                                    step_idx = snap_data.get("metadata", {}).get("step_index")
-                                    if step_idx is not None:
-                                        _snapshots_by_step[step_idx] = snap_data
-                                except Exception:
-                                    continue
-                            if _snapshots_by_step:
-                                logger.info(f"Loaded {len(_snapshots_by_step)} DOM snapshots from {entry}")
-                                break
-        except Exception as e:
-            logger.debug(f"Could not load DOM snapshots: {e}")
+def clean_history_json(history_data: Dict[str, Any], objective: str = None) -> str:
+    """Optimize JSON payload by pruning redundant actions, failed attempts, and duplicate navigations."""
+    def columns_from_results(results):
+        """Parse leaf-row keys from extracted_content fenced JSON in agent results.
+        
+        Strategy (per spec §3.A):
+          1. Parse fenced ```json``` blocks from extracted_content.
+          2. Walk nested objects/lists and collect all leaf-dict keys (dict where all
+             values are scalars – i.e. an actual data row).
+          3. Return deduplicated ordered list of column names found.
+        """
+        if not results:
+            return []
+        for res in results:
+            if not isinstance(res, dict):
+                continue
+            content = res.get("extracted_content") or ""
+            # Accept both fenced and raw JSON blobs
+            json_candidates = []
+            m = re.search(r'```(?:json)?\s*([\[\{].*?)\s*```', content, re.DOTALL)
+            if m:
+                json_candidates.append(m.group(1))
+            else:
+                # Try the entire content as JSON
+                stripped = content.strip()
+                if stripped.startswith(('[', '{')):
+                    json_candidates.append(stripped)
+
+            for candidate in json_candidates:
+                try:
+                    data = json.loads(candidate)
+                except Exception:
+                    continue
+                cols = []
+                seen_cols = set()
+
+                def walk(obj, depth=0):
+                    if depth > 10:
+                        return
+                    if isinstance(obj, dict):
+                        # Leaf row: dict where ALL values are scalars
+                        if obj and all(not isinstance(v, (dict, list)) for v in obj.values()):
+                            for k in obj.keys():
+                                if k not in seen_cols:
+                                    seen_cols.add(k)
+                                    cols.append(k)
+                        else:
+                            for v in obj.values():
+                                walk(v, depth + 1)
+                    elif isinstance(obj, list):
+                        for v in obj:
+                            walk(v, depth + 1)
+
+                walk(data)
+                if cols:
+                    return cols
+        return []
     simplified = []
     seen_urls = []
+
+    def infer_required_columns(text: str) -> list[str]:
+        """
+        Infer required columns from the user's objective/goal without hardcoded domain terms.
+        Strategy:
+          1) Extract quoted phrases (single or double quotes).
+          2) Extract list after keywords like "columns", "fields", "extract".
+          3) Extract Title Case multi-word phrases as a fallback.
+        """
+        if not text:
+            return []
+
+        candidates = []
+
+        # 1) Quoted phrases: "Status", 'Errors', etc.
+        candidates += re.findall(r'"([^"]{2,})"', text)
+        candidates += re.findall(r"'([^']{2,})'", text)
+
+    # 2) List after delimiters (colon or dash), derived from the text itself
+        for line in re.split(r'[\r\n]+', text):
+            if ":" in line or " - " in line:
+                tail = re.split(r'[:\-]\s*', line, maxsplit=1)[-1]
+                parts = re.split(r',| and ', tail, flags=re.IGNORECASE)
+                candidates += [p.strip() for p in parts if p.strip()]
+
+        # 3) Title Case phrases (e.g., "Enterprise Update Distributor")
+        candidates += re.findall(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', text)
+
+        # Normalize and filter noise using dynamic stopwords from the text
+        tokens = re.findall(r'[A-Za-z]+', text.lower())
+        freq = {}
+        for t in tokens:
+            freq[t] = freq.get(t, 0) + 1
+        common = sorted(freq, key=freq.get, reverse=True)[:15]
+        stopwords = set(common)
+        cleaned = []
+        seen = set()
+        for c in candidates:
+            c = c.strip().strip(".:")
+            if not c or c in stopwords:
+                continue
+            if len(c) < 2:
+                continue
+            if c not in seen:
+                seen.add(c)
+                cleaned.append(c)
+
+        return cleaned
     
     for item in history_data.get('history', []):
         state = item.get('state', {})
@@ -643,88 +383,6 @@ def clean_history_json(history_data: Dict[str, Any], objective: str = None, hist
                     required = infer_required_columns(f"{objective or ''} {goal}")
                 if required:
                     step_info["required_columns_hint"] = required
-
-                # ── Snapshot enrichment: inject real table selectors ──────
-                # If dom_elements is empty for this extract step, try to
-                # find the best matching table from the DOM snapshot.
-                if not step_info['dom_elements'] and _snapshots_by_step:
-                    # Get extracted content text for matching
-                    extracted_text = ""
-                    for r in results:
-                        if isinstance(r, dict) and r.get("extracted_content"):
-                            extracted_text = r["extracted_content"]
-                            break
-
-                    # Find the closest snapshot (same step or nearest before)
-                    snap = None
-                    step_meta = item.get('metadata', {})
-                    current_step_num = step_meta.get('step_number', step_idx + 1)
-                    for try_idx in [current_step_num, current_step_num - 1, current_step_num + 1]:
-                        if try_idx in _snapshots_by_step:
-                            snap = _snapshots_by_step[try_idx]
-                            break
-                    # Fallback: use the last available snapshot
-                    if not snap and _snapshots_by_step:
-                        snap = _snapshots_by_step[max(_snapshots_by_step.keys())]
-
-                    if snap:
-                        snap_elements = snap.get("elements", [])
-                        tables = [
-                            e for e in snap_elements
-                            if e.get("identity", {}).get("tagName", "").lower() == "table"
-                        ]
-                        if tables:
-                            # Score each table by text overlap with extracted content
-                            # + specificity bonus (prefer deeper/narrower tables)
-                            extracted_lower = extracted_text.lower() if extracted_text else ""
-                            best_table = None
-                            best_score = -1
-                            for tbl in tables:
-                                sp = tbl.get("selector_provenance", {})
-                                tbl_text = sp.get("text", "").lower()
-                                if not tbl_text or len(tbl_text) < 10:
-                                    continue
-                                # Base score: word overlap with extracted content
-                                ext_words = set(re.findall(r'\w{3,}', extracted_lower))
-                                tbl_words = set(re.findall(r'\w{3,}', tbl_text))
-                                overlap = len(ext_words & tbl_words)
-                                # Bonus: column name matches (weighted higher)
-                                if required:
-                                    col_matches = sum(1 for c in required if c.lower() in tbl_text)
-                                    overlap += col_matches * 3
-                                # Specificity bonus: prefer deeper tables (longer selector path)
-                                # This avoids picking broad outer containers
-                                preferred = sp.get("preferred", "")
-                                depth = preferred.count(">")
-                                overlap += min(depth, 5)  # Cap bonus at 5
-                                # Penalty: tables whose text is identical to a parent/sibling
-                                # (container tables that just inherit child text) — penalize
-                                # tables with very long text relative to actual column headers
-                                if required and len(tbl_text) > 500 and col_matches < len(required):
-                                    overlap -= 2  # Likely a container, not the data table
-                                if overlap > best_score:
-                                    best_score = overlap
-                                    best_table = tbl
-
-                            if best_table and best_score > 0:
-                                sp = best_table.get("selector_provenance", {})
-                                af = best_table.get("attribute_fingerprint", {})
-                                table_element = {
-                                    "tag": "table",
-                                    "id": af.get("id", ""),
-                                    "text": sp.get("text", "")[:200],
-                                    "selectors": {
-                                        k: v for k, v in {
-                                            "preferred": sp.get("preferred", ""),
-                                            "css": sp.get("css", ""),
-                                            "xpath": sp.get("xpath", ""),
-                                        }.items() if v
-                                    },
-                                    "class_list": af.get("class_list", []),
-                                    "_source": "dom_snapshot",
-                                }
-                                step_info['dom_elements'].append(table_element)
-                                logger.info(f"Step {step_idx}: Enriched extract_content with table selector from DOM snapshot (score={best_score})")
                  
         # Final Pruning: Skip steps that contain no successful actions unless it's a Terminal step
         if not step_info['actions'] and "done" not in str(step_info['goal']).lower():
@@ -992,34 +650,83 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
         )
 
 
-    # ── 1 & 2: REMOVED — scripts are now fully self-contained ─────────────────
-    # The LLM writes all functions inline. No script_helpers import is injected,
-    # and no helper functions are stripped. The LLM decides what functions to write.
-    #
-    # Strip any accidental project-internal imports the LLM may still emit:
-    # EXCEPT for src.utils.vault which we now explicitly use.
-    code = re.sub(r'^from src\.utils\.script_helpers import[^\n]*\n', '', code, flags=re.MULTILINE)
-    code = re.sub(r'^(?!from src\.utils\.vault)from src\.utils import[^\n]*\n', '', code, flags=re.MULTILINE)
-    code = re.sub(r'^from src\.utils\.config import[^\n]*\n', '', code, flags=re.MULTILINE)
-    # Safety net: replace any hallucinated maybe_login with login
-    code = code.replace('await maybe_login(page)', 'await login(page)')
-    code = code.replace('maybe_login(page)', 'login(page)')
-    # Strip redundant path bootstrap blocks if the LLM hallucinated its own
+    # ── 1: Ensure script_helpers import is present ────────────────────────────
+    helpers_import = (
+        "from src.utils.script_helpers import (\n"
+        "    get_secret, find_in_frames,\n"
+        "    resilient_fill, resilient_click, click_and_upload_file,\n"
+        "    maybe_login, resilient_extract_table, generate_report,\n"
+        "    check_certificate,\n"
+        ")"
+    )
+    if "from src.utils.script_helpers import" not in code:
+        # Insert AFTER the entire if/else bootstrap block, not inside it.
+        # The bootstrap always ends with the else-branch sys.path.append line.
+        # Pattern: else:\n    sys.path.append(...)\n
+        inserted = False
+        if "sys.path.append" in code:
+            # Match the full bootstrap block: if ...:\n    sys.path.append\nelse:\n    sys.path.append
+            new_code = re.sub(
+                r'((?:if[^\n]+\n[ \t]+sys\.path\.append\([^\n]+\)\n'   # if branch
+                r'else:\n[ \t]+sys\.path\.append\([^\n]+\)\n))',         # else branch
+                r'\1\n' + helpers_import + '\n',
+                code, count=1,
+            )
+            if new_code != code:
+                code = new_code
+                inserted = True
+            else:
+                # Fallback: after the last sys.path.append line in the file header
+                new_code = re.sub(
+                    r'(sys\.path\.append\([^\n]+\)\n)(?!\n*sys\.path\.append)',
+                    r'\1\n' + helpers_import + '\n',
+                    code, count=1,
+                )
+                if new_code != code:
+                    code = new_code
+                    inserted = True
+
+        if not inserted:
+            code = re.sub(
+                r'(from playwright\.async_api import async_playwright\n)',
+                r'\1' + helpers_import + '\n',
+                code, count=1,
+            )
+        if "from src.utils.script_helpers import" not in code:
+            code = helpers_import + "\n" + code
+
+    # Strip now-redundant imports that script_helpers already handles internally
+    code = re.sub(r'^from docx import Document\s*\n', '', code, flags=re.MULTILINE)
+    code = re.sub(r'^from src\.utils\.vault import vault\s*\n', '', code, flags=re.MULTILINE)
+    # Strip old monolithic config import (script_helpers + generated header cover these)
     code = re.sub(
-        r'(?m)^# Path bootstrap[^\n]*\n'
-        r'(?:current_dir[^\n]*\n)?'
-        r'(?:if[^\n]*web-ui[^\n]*\n'
-        r'[ \t]+sys\.path\.append[^\n]*\n'
-        r'else:\n'
-        r'[ \t]+sys\.path\.append[^\n]*\n)?',
-        '', code,
+        r'^from src\.utils\.config import \([^)]+\)\n', '', code, flags=re.MULTILINE | re.DOTALL
     )
 
-    # ── 3: Rewrite wrong/login-field table selectors (ONLY if generic/wrong) ──
+    # ── 2: Strip hallucinated helper function definitions ─────────────────────
+    # Names that must NOT be redefined — they live in script_helpers.py
+    _HELPER_NAMES = (
+        "get_secret", "find_in_frames", "resilient_fill", "resilient_click",
+        "click_and_upload_file", "maybe_login", "resilient_extract_table",
+        "generate_report",
+    )
+
+    def _strip_async_def(src: str, fn_name: str) -> str:
+        """Remove an async def block for fn_name from src."""
+        pattern = rf'(?m)^async def {re.escape(fn_name)}\b.*?(?=\n(?:async def |def |class |\Z))'
+        match = re.search(pattern, src, re.DOTALL)
+        if match:
+            logger.info(f"[POST] Stripped hallucinated helper: async def {fn_name}")
+            src = src[:match.start()] + src[match.end():]
+        return src
+
+    for name in _HELPER_NAMES:
+        if re.search(rf'^async def {re.escape(name)}\b', code, re.MULTILINE):
+            code = _strip_async_def(code, name)
+
+    # ── 3: Rewrite wrong/login-field table selectors ──────────────────────────
     def _should_replace(sel_str: str) -> bool:
         s = sel_str.strip().strip('"\'')
-        # Only replace if the LLM used a very generic 'table' or a login field.
-        # If it found a specific ID like '#workerTable', leave it as the primary intent.
         return s == "table" or _is_login_selector(s)
 
     if selector:
@@ -1030,10 +737,8 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
         code = re.sub(r'page\.wait_for_selector\((["\'][^"\']+["\'])', _fix_wait, code)
 
         def _fix_extract(m):
-            # Only fix the FIRST extract_table call if it's generic, 
-            # as different tables likely need different selectors.
-            return f'extract_table(page, {sel_literal}' if _should_replace(m.group(1)) else m.group(0)
-        code = re.sub(r'extract_table\(\s*page\s*,\s*(["\'][^"\']+["\'])', _fix_extract, code, count=1)
+            return f'resilient_extract_table(page, {sel_literal}' if _should_replace(m.group(1)) else m.group(0)
+        code = re.sub(r'resilient_extract_table\(\s*page\s*,\s*(["\'][^"\']+["\'])', _fix_extract, code)
 
         def _fix_table_var(m):
             return f'table_selector = {sel_literal}' if _should_replace(m.group(1)) else m.group(0)
@@ -1043,32 +748,31 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
             return f'page.locator({sel_literal}' if _should_replace(m.group(1)) else m.group(0)
         code = re.sub(r'page\.locator\((["\'][^"\']+["\'])', _fix_locator, code)
 
-    # ── 4: SAFETY: Always ensure each extract_table has its own column list ──
-    # The post-processor previously merged all hints. We now ensure
-    # the LLM's original specific lists survive unless they are bare hallucinations.
-    # We only inject 'Server' if it's completely missing from the script.
-    if required and "Server" not in code:
-        # Check if the code has a generic empty list or obviously wrong list
+    # ── 4: Inject required columns (with identity key) ────────────────────────
+    if required:
+        if not any(c.lower() in ('server', 'name') for c in required):
+            required = list(required) + ['Server']
+        req_literal = json.dumps(required)
         code = re.sub(
-            r'(extract_table\(\s*page\s*,\s*[^,]+,\s*)(\[\])',
-            rf'\1{json.dumps(required)}', code
+            r'(resilient_extract_table\(\s*page\s*,\s*[^,]+,\s*)(\[[^\]]*\])',
+            rf'\1{req_literal}', code,
         )
 
-    # ── 5: Ensure login(page) is called after first page.goto ────────────────
-    if "login(page)" not in code:
+    # ── 5: Ensure maybe_login(page) is called after first page.goto ──────────
+    if "maybe_login(page)" not in code:
         code = re.sub(
             r'(await page\.goto\([^\n]+\)\n)',
-            r'\1        await login(page)\n',
+            r'\1        await maybe_login(page)\n',
             code, count=1,
         )
 
     # ── 6: Fix post-login wait if it targets a login-field selector ──────────
-    if selector and "await login(page)" in code:
+    if selector and "await maybe_login(page)" in code:
         sel_literal = json.dumps(selector)
         lines = code.splitlines(keepends=True)
         past_login, fixed_lines = False, []
         for line in lines:
-            if "await login(page)" in line:
+            if "await maybe_login(page)" in line:
                 past_login = True
             if past_login and "wait_for_selector" in line:
                 m = re.search(r'wait_for_selector\((["\'][^"\']+["\'])', line)
@@ -1180,26 +884,27 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
                 code, count=1,
             )
 
-    # ── 11: Strip redundant manual login steps after login() ──────────────────
-    # If the script calls login(page) AND then also manually does
-    # page.fill(<login_sel>, ...) + page.click(<login_sel>),
+    # ── 11: Strip redundant manual login steps after maybe_login ─────────────
+    # If the script calls maybe_login(page) AND then also manually does
+    # resilient_fill(page, <login_sel>, ...) + resilient_click(page, <login_sel>),
     # the manual steps are redundant and must be removed.
-    if "await login(page)" in code:
+    if "await maybe_login(page)" in code:
         lines = code.splitlines(keepends=True)
         past_login, out_lines = False, []
         i = 0
         while i < len(lines):
             line = lines[i]
-            if "await login(page)" in line:
+            if "await maybe_login(page)" in line:
                 past_login = True
                 out_lines.append(line)
                 i += 1
                 continue
             if past_login:
                 stripped = line.strip()
-                # Detect manual login: page.fill/page.click targeting a login-field selector
+                # Detect manual login: resilient_fill/click/page.fill/page.click
+                # targeting a login-field selector
                 is_login_fill = bool(re.search(
-                    r'(?:resilient_fill|page\.fill)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])',
+                    r'(?:resilient_fill|page\.fill)\s*\(\s*page\s*,\s*(["\'][^"\']+["\'])',
                     stripped
                 )) and bool(re.search(
                     r'(?:resilient_fill|page\.fill)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])',
@@ -1215,7 +920,8 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
                     if re.search(r'(?:resilient_click|page\.click)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])', stripped)
                     else ""
                 )
-                # Also catch login button patterns
+                # Also catch: await resilient_click(page, "#loginbutton")
+                # and login button patterns
                 is_login_submit = bool(re.search(
                     r'(?:resilient_click|page\.click)\s*\(\s*(?:page\s*,\s*)?["\']'
                     r'(?:#login(?:button|btn|submit)|button\[type=["\']submit["\']|input\[type=["\']submit["\'])',
@@ -1255,7 +961,7 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
     # ── 13: Inject missing process URL navigation ─────────────────────────────
     # If history has a target URL (with query params, not a login page) and the
     # script never navigates there, inject a goto BEFORE the first table wait.
-    if process_url and "await login(page)" in code:
+    if process_url and "await maybe_login(page)" in code:
         # Check if the process URL is already in a goto call
         if process_url not in code:
             # Find the first wait_for_selector AFTER maybe_login and insert goto before it
@@ -1263,7 +969,7 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
             past_login, injected = False, False
             new_lines = []
             for line in lines:
-                if "await login(page)" in line:
+                if "await maybe_login(page)" in line:
                     past_login = True
                 if (past_login and not injected
                         and "wait_for_selector" in line
@@ -1277,78 +983,6 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
             if injected:
                 code = "".join(new_lines)
 
-    # ── 14: Replace login/auth redirect URLs with base app URL ────────────────
-    # When the LLM uses a login redirect URL (e.g. /login?RFA=..., /otdsws/...,
-    # /signin?...) as the first page.goto, replace it with the base app URL.
-    # The base URL auto-redirects to login if needed, and maybe_login handles it.
-    _login_url_kws = ("login", "otdsws", "signin", "auth/login", "auth/realms")
-
-    def _is_login_url(url: str) -> bool:
-        return any(kw in url.lower() for kw in _login_url_kws)
-
-    # Find a base URL from the process_url or infer from the login URL
-    goto_matches = list(re.finditer(r'await page\.goto\((["\'])([^"\']+)\1\)', code))
-    if goto_matches:
-        first_goto_url = goto_matches[0].group(2)
-        if _is_login_url(first_goto_url):
-            # Try to derive base URL: strip everything after the path
-            # e.g. http://host:port/otdsws/login?... → http://host:port/OTCS/cs.exe
-            # Use process_url if available, otherwise strip query params from first non-login URL
-            replacement_url = None
-            if process_url and not _is_login_url(process_url):
-                # Use the base portion: scheme+host+path (no query)
-                from urllib.parse import urlparse, urlunparse
-                parsed = urlparse(process_url)
-                replacement_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
-            if not replacement_url:
-                # Fallback: any non-login URL in the goto list
-                for gm in goto_matches[1:]:
-                    if not _is_login_url(gm.group(2)):
-                        replacement_url = gm.group(2)
-                        break
-            if replacement_url:
-                old_goto = goto_matches[0].group(0)
-                new_goto = f'await page.goto({json.dumps(replacement_url)})'
-                code = code.replace(old_goto, new_goto, 1)
-                logger.info(f"[POST] Replaced login URL with base URL: {replacement_url}")
-
-    # ── 15: Inject wait_for_load_state after page.goto and maybe_login ────────
-    # Enterprise apps need networkidle waits after navigation and login.
-    lines = code.splitlines(keepends=True)
-    injected_lines = []
-    for i, line in enumerate(lines):
-        injected_lines.append(line)
-        stripped = line.strip()
-        # Check next line (if exists) to see if wait_for_load_state already follows
-        next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
-        already_has_wait = "wait_for_load_state" in next_line
-
-        if already_has_wait:
-            continue
-
-        indent = re.match(r'^(\s*)', line).group(1)
-
-        # After page.goto(...) — inject domcontentloaded wait
-        if re.search(r'await page\.goto\(', stripped) and not stripped.startswith("#"):
-            injected_lines.append(f'{indent}await page.wait_for_load_state("domcontentloaded")\n')
-            logger.info("[POST] Injected wait_for_load_state after page.goto")
-
-        # After login(page) — inject networkidle wait
-        if "await login(page)" in stripped:
-            injected_lines.append(f'{indent}await page.wait_for_load_state("networkidle", timeout=TIMEOUT_NETWORKIDLE_MS)\n')
-            logger.info("[POST] Injected wait_for_load_state after login")
-
-    code = "".join(injected_lines)
-
-    # Ensure TIMEOUT_NETWORKIDLE_MS is imported if we just introduced it
-    if "TIMEOUT_NETWORKIDLE_MS" in code and "TIMEOUT_NETWORKIDLE_MS" not in code.split("async def run")[0]:
-        code = re.sub(
-            r'(from src\.utils\.config import[^\n]*)',
-            lambda m: m.group(0) + ', TIMEOUT_NETWORKIDLE_MS'
-                if 'TIMEOUT_NETWORKIDLE_MS' not in m.group(0) else m.group(0),
-            code, count=1,
-        )
-
     # ── Quality gate ─────────────────────────────────────────────────────────
     issues = []
     if re.search(r'resilient_extract_table\(\s*page\s*,\s*["\']table["\']', code):
@@ -1359,14 +993,14 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
         issues.append("table_selector still assigned literal 'table'")
     if re.search(r'page\.locator\(\s*["\']tr["\']', code):
         issues.append("global page.locator('tr') without table scoping")
-    # Check for login-field selectors used in extraction/wait calls
-    for fn in ("extract_table", "wait_for_selector"):
+    if "maybe_login(page)" not in code:
+        issues.append("maybe_login(page) call missing after page.goto")
+    for fn in ("resilient_extract_table", "wait_for_selector"):
         m = re.search(rf'{fn}\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])', code)
         if m and _is_login_selector(m.group(1).strip("'\"")):
             issues.append(f"{fn} still uses a login-field selector: {m.group(1)!r}")
-    # Warn if script still imports from project internals
-    if any("from src.utils" in line and "vault" not in line for line in code.splitlines()):
-        issues.append("script still imports from src.utils — should be self-contained")
+    if "from src.utils.script_helpers import" not in code:
+        issues.append("script_helpers import missing")
 
     if issues:
         warning = "# ⚠️  POST-PROCESSING WARNINGS:\n" + "\n".join(f"# - {i}" for i in issues) + "\n\n"
@@ -1375,25 +1009,66 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
             raise RuntimeError(f"[QUALITY GATE] Cannot auto-fix — no DOM selector resolved. Issues: {issues}")
         code = warning + code
 
-    # ── 16: Safe login() injection (Final Robustness) ──────────────────────────
-    # If the LLM called await login(page) but forgot to define the function,
-    # inject a safe skip-nop definition.
-    if "await login(page)" in code and "async def login" not in code:
-        logger.warning("[POST] Injecting missing login() definition to prevent NameError")
-        login_nop = """
-async def login(page):
-    # Auto-injected NOP to prevent NameError. 
-    # LLM called login but no definition was provided in history context.
-    pass
-
-"""
-        # Insert after imports
-        if "from src.utils" in code:
-            code = re.sub(r'(from src\.utils\.report_templates import[^\n]*\n)', r'\1' + login_nop, code, count=1)
-        else:
-            code = re.sub(r'(import [^\n]*\n)', r'\1' + login_nop, code, count=1)
-
     return code
+
+def _build_cert_script(target_url: str, scenario: str) -> str:
+    """Return a ready-to-run Playwright script that calls check_certificate(page)."""
+    return f'''import asyncio
+import sys
+import os
+
+current_dir = os.getcwd()
+if "web-ui" not in current_dir and os.path.exists(os.path.join(current_dir, "web-ui")):
+    sys.path.append(os.path.join(current_dir, "web-ui"))
+else:
+    sys.path.append(current_dir)
+
+from playwright.async_api import async_playwright
+from src.utils.script_helpers import (
+    get_secret, maybe_login, generate_report, check_certificate,
+)
+from src.utils.config import TIMEOUT_TABLE_WAIT_MS
+
+
+async def run():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+        context = await browser.new_context(no_viewport=True)
+        page    = await context.new_page()
+
+        await page.goto({repr(target_url)}, timeout=60000)
+        await maybe_login(page)
+
+        # check_certificate uses CDP + direct TLS handshake.
+        # On Windows (headed) it also captures the native OS popup via
+        # Windows UI Automation — no hardcoded coordinates.
+        result = await check_certificate(page)
+
+        cert = result["cert_info"]
+        output = (
+            f"Host: {{result['hostname']}}\\n"
+            f"Valid: {{result['is_valid']}} | Secure: {{result['is_secure']}}\\n"
+            f"Issued to: {{cert.get('subject_cn')}} ({{cert.get('subject_org')}})\\n"
+            f"Issued by: {{cert.get('issuer_cn')}}\\n"
+            f"Valid from {{cert.get('valid_from')}} to {{cert.get('valid_to')}} "
+            f"({{cert.get('days_remaining')}}d remaining)\\n"
+            f"Protocol: {{cert.get('protocol')}} | Cipher: {{cert.get('cipher')}}\\n"
+            f"Expired: {{cert.get('is_expired')}}"
+        )
+
+        await generate_report(
+            {repr(scenario)},
+            result["is_valid"],
+            screenshot=result["screenshot"],
+            output=output,
+        )
+        await browser.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
+'''
+
 
 def generate_script(history_path: str, output_path: str = None, model_name: str = None, provider: str = None, objective: str = None, mandatory_history_path: str = None):
     """
@@ -1442,10 +1117,39 @@ def generate_script(history_path: str, output_path: str = None, model_name: str 
                 logger.warning(f"Failed to merge mandatory history: {merge_err}. Proceeding with process-only history.")
         
         # Prepare content
-        cleaned_history = clean_history_json(history_data, objective=objective, history_path=history_path)
+        cleaned_history = clean_history_json(history_data, objective=objective)
         logger.info(f"Cleaned History Context (First 500 chars): {cleaned_history[:500]}...")
-        
-        # Save a debug copy of the cleaned history for inspection
+
+        # ── Cert task short-circuit: skip LLM, emit check_certificate script ──
+        import re as _re
+        _CERT_RE = r'\b(ssl|tls|certificate|https cert|cert detail|cert valid|lock icon|connection secure)\b'
+        _obj_text = (objective or history_data.get('task', '')).lower()
+        if _re.search(_CERT_RE, _obj_text, _re.IGNORECASE):
+            # Extract target URL from history
+            _url = None
+            try:
+                _h = json.loads(cleaned_history)
+                _steps = _h.get('steps') if isinstance(_h, dict) else _h
+                for _s in (_steps or []):
+                    _u = _s.get('url', '')
+                    if _u and _u.startswith('http') and 'about:blank' not in _u:
+                        _url = _u
+                        break
+            except Exception:
+                pass
+            _url = _url or "# REPLACE_WITH_TARGET_URL"
+            cert_script = _build_cert_script(_url, objective or "SSL Certificate Check")
+            
+            if not output_path:
+                output_path = str(Path(history_path).parent / f"{run_id}_LLM.py")
+                
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(cert_script)
+            logger.info(f"[cert-shortcircuit] Cert script written to: {output_path}")
+            
+            return output_path, cert_script
+
+
         try:
             debug_path = history_path.replace('.json', '_cleaned.json')
             with open(debug_path, 'w', encoding='utf-8') as f:

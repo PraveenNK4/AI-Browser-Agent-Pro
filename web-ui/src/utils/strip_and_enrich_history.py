@@ -367,7 +367,7 @@ def find_best_element_for_extraction(snapshot: Dict[str, Any], extracted_content
         # Fallback to heuristic verification only
         tag_name = best_element.get('identity', {}).get('tagName')
         logger.debug(f"  ⚠️  Ollama not available - using heuristic only: {tag_name} ({best_verification:.1f}%)")
-        if best_verification < 20:
+        if best_verification < 30:
             logger.warning(f"  WARNING: Element has low heuristic score ({best_verification:.1f}%) - start Ollama for 100% accuracy")
             return None
         return best_element

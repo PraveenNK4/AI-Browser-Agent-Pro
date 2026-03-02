@@ -1,0 +1,7 @@
+Distributed Agent Status:
+ID: DAAgent_otcsvm_2099_1, Status: Running
+
+Worker Status:
+ID: Worker_OTCSVM_2099_001, Status: Idle, Last Update: 02/24/2026 01:10 AM
+ID: Worker_OTCSVM_2099_002, Status: Idle, Last Update: 02/24/2026 01:10 AM
+ID: Worker_OTCSVM_2099_003, Status: Idle, Last Update: 02/24/2026 01:10 AM

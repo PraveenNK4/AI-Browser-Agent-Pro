@@ -863,220 +863,76 @@ class CustomController(Controller):
                 return ActionResult(error=f'Hover with offset failed: {str(e)}')
 
 
-        @self.registry.action('Audit current site security connection and SSL/TLS certificates.')
-        async def get_site_security_info(browser: BrowserContext):
-            """
-            Extract security details of the current page's connection, 
-            including SSL/TLS certificate information.
-            """
+        @self.registry.action(
+            'Check SSL/TLS certificate for the current page. '
+            'USE THIS for ANY task involving: SSL, TLS, certificate, HTTPS, '
+            '"connection secure", "lock icon", "cert valid". '
+            'DO NOT try to click the browser lock icon — call this action instead. '
+            'Captures the full 3-panel certificate flow screenshot automatically.'
+        )
+        async def check_ssl_certificate(browser: BrowserContext):
+            """Call check_certificate() from script_helpers to get full TLS details + screenshots."""
+            import os, base64, datetime
             try:
+                from src.utils.script_helpers import check_certificate as _check_cert
                 page = await browser.get_current_page()
-                url = page.url
-                is_https = url.startswith('https://')
-                
-                # Basic security metadata from the DOM/Window context
-                security_meta = await page.evaluate('''() => {
-                    return {
-                        protocol: window.location.protocol,
-                        origin: window.location.origin,
-                        isSecureContext: window.isSecureContext
-                    }
-                }''')
-                
-                msg = f"🛡️ Site Security Audit for: {url}\n"
-                msg += f"--------------------------------------------------\n"
-                msg += f"Connection: {'✅ SECURE (HTTPS)' if is_https else '❌ INSECURE (HTTP)'}\n"
-                msg += f"Context: {'✅ Secure Context' if security_meta.get('isSecureContext') else '❌ Non-Secure Context'}\n"
-                
-                if not is_https:
-                    return ActionResult(extracted_content=msg, include_in_memory=True)
 
-                # Fetch detailed certificate info via ssl module (Robust fallback)
-                try:
-                    import ssl
-                    import socket
-                    from urllib.parse import urlparse
-                    from datetime import datetime
-                    import hashlib
-                    
-                    parsed = urlparse(url)
-                    hostname = parsed.hostname
-                    if not hostname:
-                        return ActionResult(extracted_content=msg + "\n⚠️ Could not parse hostname from URL.", include_in_memory=True)
-                        
-                    port = parsed.port or 443
-                    
-                    # Get Certificate info via socket
-                    # We try verified first, then unverified to at least get metadata
-                    cert_info = None
-                    last_err = None
-                    der_cert = None
-                    
-                    for verify in [True, False]:
-                        try:
-                            context = ssl.create_default_context()
-                            if not verify:
-                                context.check_hostname = False
-                                context.verify_mode = ssl.CERT_NONE
-                            
-                            with socket.create_connection((hostname, port), timeout=5) as sock:
-                                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                                    cert_info = ssock.getpeercert()
-                                    der_cert = ssock.getpeercert(binary_form=True)
-                                    
-                                    if not cert_info and der_cert:
-                                        # For CERT_NONE, getpeercert() is empty. 
-                                        # Use cryptography to parse binary DER cert
-                                        try:
-                                            from cryptography import x509
-                                            from cryptography.hazmat.backends import default_backend
-                                            x509_cert = x509.load_der_x509_certificate(der_cert, default_backend())
-                                            
-                                            # Helper to extract all values for a given OID/Attribute
-                                            def get_attr(cert_obj, attr_name):
-                                                try:
-                                                    return ", ".join([str(val.value) for val in cert_obj.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)])
-                                                except: return "N/A"
+                result = await _check_cert(page)
 
-                                            cert_info = {
-                                                'subject': [[(k.oid._name, k.value)] for k in x509_cert.subject],
-                                                'issuer': [[(k.oid._name, k.value)] for k in x509_cert.issuer],
-                                                'notBefore': x509_cert.not_valid_before_utc.strftime('%b %d %H:%M:%S %Y GMT'),
-                                                'notAfter': x509_cert.not_valid_after_utc.strftime('%b %d %H:%M:%S %Y GMT'),
-                                            }
-                                        except Exception as parse_err:
-                                            logger.debug(f"Cryptography parse failed: {parse_err}")
-                                    
-                                    if cert_info or der_cert:
-                                        break
-                        except Exception as e:
-                            last_err = e
-                            continue
-                    
-                    if cert_info or der_cert:
-                        def format_dn(dn):
-                            if isinstance(dn, list):
-                                try:
-                                    return ", ".join([f"{item[0][0]}={item[0][1]}" for item in dn])
-                                except: return str(dn)
-                            return str(dn)
+                cert  = result["cert_info"]
+                host  = result["hostname"]
+                valid = result["is_valid"]
+                secure = result["is_secure"]
 
-                        msg += f"\nCertificate Details:\n"
-                        if cert_info:
-                            msg += f" • Issuer: {format_dn(cert_info.get('issuer'))}\n"
-                            msg += f" • Subject: {format_dn(cert_info.get('subject'))}\n"
-                            msg += f" • Valid From: {cert_info.get('notBefore', 'N/A')}\n"
-                            msg += f" • Valid To: {cert_info.get('notAfter', 'N/A')}\n"
-                        
-                        if der_cert:
-                            sha256_fingerprint = hashlib.sha256(der_cert).hexdigest().upper()
-                            msg += f" • SHA256 Fingerprint: {sha256_fingerprint[:2]}:" + ":".join([sha256_fingerprint[i:i+2] for i in range(2, len(sha256_fingerprint), 2)]) + "\n"
+                # ── Save all screenshots to agent history dir ──────────────────
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                save_dir = os.path.join("tmp", "cert_screenshots")
+                os.makedirs(save_dir, exist_ok=True)
 
-                        # Expiration check
-                        if cert_info and cert_info.get('notAfter'):
-                            try:
-                                expiry_str = cert_info.get('notAfter')
-                                for fmt in ['%b %d %H:%M:%S %Y %Z', '%b %d %H:%M:%S %Y GMT']:
-                                    try:
-                                        expiry_dt = datetime.strptime(expiry_str, fmt)
-                                        if expiry_dt < datetime.now():
-                                            msg += f" • Status: ❌ EXPIRED\n"
-                                        else:
-                                            msg += f" • Status: ✅ VALID\n"
-                                        break
-                                    except: continue
-                            except: pass
-                    else:
-                        msg += f"\n⚠️ Certificate extraction failed: {str(last_err)}\n"
-                
-                except Exception as cert_err:
-                    msg += f"\n⚠️ Deep certificate scan failed: {str(cert_err)}\n"
+                saved = []
+                for key, fname in [
+                    ("screenshot",           f"cert_flow_composite_{ts}.png"),
+                    ("screenshot_site_info", f"cert_panel1_siteinfo_{ts}.png"),
+                    ("screenshot_security",  f"cert_panel2_security_{ts}.png"),
+                    ("screenshot_cert",      f"cert_panel3_detail_{ts}.png"),
+                ]:
+                    data = result.get(key)
+                    if data:
+                        path = os.path.join(save_dir, fname)
+                        with open(path, "wb") as f:
+                            f.write(data)
+                        saved.append(path)
 
-                return ActionResult(extracted_content=msg, include_in_memory=True)
+                # ── Build summary text ─────────────────────────────────────────
+                msg = (
+                    f"✅ SSL Certificate Check Complete\n"
+                    f"{'='*50}\n"
+                    f"Host:          {host}\n"
+                    f"Connection:    {'🔒 SECURE' if secure else '⚠️  NOT SECURE'}\n"
+                    f"Certificate:   {'✅ VALID' if valid else '❌ INVALID/EXPIRED'}\n"
+                    f"{'='*50}\n"
+                    f"Issued to:     {cert.get('subject_cn','?')} ({cert.get('subject_org','?')})\n"
+                    f"Issued by:     {cert.get('issuer_cn','?')} ({cert.get('issuer_org','?')})\n"
+                    f"Valid from:    {cert.get('valid_from','?')}\n"
+                    f"Valid until:   {cert.get('valid_to','?')}\n"
+                    f"Days left:     {cert.get('days_remaining','?')}\n"
+                    f"Protocol:      {cert.get('protocol','?')}\n"
+                    f"Cipher:        {cert.get('cipher','?')}\n"
+                    f"Key strength:  {cert.get('key_bits','?')} bits\n"
+                    f"SANs:          {', '.join(cert.get('san', []))}\n"
+                    f"Serial:        {cert.get('serial','?')}\n"
+                    f"{'='*50}\n"
+                    f"Screenshots saved ({len(saved)}):\n"
+                    + "\n".join(f"  {p}" for p in saved)
+                    + (f"\n\nNative capture: {'Yes (Windows UIA)' if result.get('native_capture') else 'No (HTML panels)'}")
+                )
+
+                return ActionResult(
+                    extracted_content=msg,
+                    include_in_memory=True,
+                )
             except Exception as e:
-                return ActionResult(error=f'Security audit failed: {str(e)}')
-
-        # --- SYSTEM OPERATION & OS AUTOMATION TOOLS ---
-        
-        @self.registry.action('Execute an OS-level shell command (e.g., "start cmd", "dir", "ipconfig").')
-        async def run_system_command(command: str):
-            """
-            Execute a system command using subprocess.
-            Use this to open apps (like 'start cmd'), list files, or run system utilities.
-            """
-            try:
-                import subprocess
-                # Use shell=True for 'start' commands on Windows
-                process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                stdout, stderr = process.communicate(timeout=5)
-                
-                output = f"Command: {command}\n"
-                if stdout: output += f"Output:\n{stdout}\n"
-                if stderr: output += f"Error:\n{stderr}\n"
-                if not stdout and not stderr: output += "Command executed (no output)."
-                
-                return ActionResult(extracted_content=output, include_in_memory=True)
-            except Exception as e:
-                return ActionResult(error=f"System command failed: {str(e)}")
-
-        @self.registry.action('Capture a full-screen screenshot of the entire OS (not just the browser viewport).')
-        async def system_screenshot(description: str = "system_capture"):
-            """
-            Capture the entire screen including taskbar, browser chrome, and external windows.
-            Essential for verifying browser-level popups (like security certificates) or external apps.
-            """
-            try:
-                import pyautogui
-                from datetime import datetime
-                import re
-                
-                # Setup directory
-                shot_dir = Path("tmp/system_screenshots")
-                shot_dir.mkdir(parents=True, exist_ok=True)
-                
-                timestamp = datetime.now().strftime("%H%M%S")
-                slug = re.sub(r'[^a-z0-9]+', '_', description.lower()).strip('_')
-                filename = f"{timestamp}_{slug}.png"
-                path = shot_dir / filename
-                
-                screenshot = pyautogui.screenshot()
-                screenshot.save(str(path))
-                
-                return ActionResult(extracted_content=f"📸 Full-system screenshot saved: {path}", include_in_memory=True)
-            except Exception as e:
-                return ActionResult(error=f"System screenshot failed: {str(e)}")
-
-        @self.registry.action('Perform an OS-level mouse click at coordinates (x, y). Use this for non-web elements.')
-        async def system_click(x: int, y: int):
-            """Click anywhere on the OS screen using absolute coordinates."""
-            try:
-                import pyautogui
-                pyautogui.click(x, y)
-                return ActionResult(extracted_content=f"Clicked at ({x}, {y})", include_in_memory=True)
-            except Exception as e:
-                return ActionResult(error=f"System click failed: {str(e)}")
-
-        @self.registry.action('Perform OS-level keyboard typing. Use this to input text into CMD or browser search bars.')
-        async def system_type(text: str):
-            """Type text at the current OS focus point."""
-            try:
-                import pyautogui
-                pyautogui.write(text, interval=0.1)
-                return ActionResult(extracted_content=f"Typed: {text}", include_in_memory=True)
-            except Exception as e:
-                return ActionResult(error=f"System type failed: {str(e)}")
-
-        @self.registry.action('Press a specific OS-level key (e.g., "enter", "win", "esc", "tab").')
-        async def system_press_key(key: str):
-            """Press a key (e.g., 'enter', 'f5', 'win')."""
-            try:
-                import pyautogui
-                pyautogui.press(key)
-                return ActionResult(extracted_content=f"Pressed key: {key}", include_in_memory=True)
-            except Exception as e:
-                return ActionResult(error=f"System key press failed: {str(e)}")
-
-        # --- END SYSTEM TOOLS ---
+                return ActionResult(error=f'Certificate check failed: {str(e)}')
 
 
         @self.registry.action('Check if checkbox/radio is checked; click only if unchecked. Works for checkboxes, radio buttons, and toggle inputs.')
@@ -1268,138 +1124,46 @@ class CustomController(Controller):
             except Exception as e:
                 return ActionResult(error=f"Smart login failed: {str(e)}")
 
-        @self.registry.action('Extract page content. Best for general text extraction or unstructured data.')
-        async def extract_content(goal: str, browser: BrowserContext, should_strip_link_urls: bool = True):
-            """
-            Extract specific information from the current page.
-            """
+        @self.registry.action('Extract full page content (interactive elements + text)')
+        async def extract_page_content(browser: BrowserContext):
             try:
                 page = await browser.get_current_page()
-                
-                # Performance: detect if goal is about a table, redirect if so
-                table_keywords = ['table', 'columns', 'rows', 'data', 'list', 'status', 'id']
-                if any(kw in goal.lower() for kw in table_keywords):
-                    # Try to find a table and extract it
-                    tables = await page.query_selector_all('table')
-                    if tables:
-                        msg = "Goal mentions tabular data. Suggest using extract_table for better results if this general extraction is insufficient."
-                        logger.info(msg)
-                
-                # Standard extraction logic (generic)
-                content = await page.evaluate("""() => {
-                    // Generic extraction: get all visible text but prioritize clean structure
-                    return document.body.innerText;
-                }""")
-                
+                interactive_elements = await page.evaluate('''
+                    () => {
+                        const elements = [];
+                        const selectors = ['a', 'button', 'input', 'select', 'textarea', '[role="button"]', '[tabindex]'];
+                        document.querySelectorAll(selectors.join(',')).forEach((el, idx) => {
+                            let label = el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                            elements.push({tag: el.tagName, label: label.trim(), index: idx});
+                        });
+                        return elements;
+                    }
+                ''')
+
+                full_text_content = await page.evaluate('''
+                    () => {
+                        function getVisibleText(node) {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                if (node.parentElement && window.getComputedStyle(node.parentElement).display !== 'none' && node.textContent.trim())
+                                    return node.textContent.trim();
+                                return '';
+                            }
+                            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+                            if (window.getComputedStyle(node).display === 'none' || node.tagName === 'SCRIPT' || node.tagName === 'STYLE') return '';
+                            let text = '';
+                            for (let child of node.childNodes) text += getVisibleText(child) + '\n';
+                            return text;
+                        }
+                        return getVisibleText(document.body).replace(/\n+/g, '\n').trim();
+                    }
+                ''')
+
                 return ActionResult(
-                    extracted_content=f"Page content for goal '{goal}':\n\n{content[:5000]}",
+                    extracted_content={'interactive_elements': interactive_elements, 'full_text_content': full_text_content},
                     include_in_memory=True
                 )
             except Exception as e:
                 return ActionResult(error=str(e))
-
-        @self.registry.action('Extract structured table data. REQUIRED for reports containing lists, IDs, or status grids.')
-        async def extract_table(
-            goal: str, 
-            browser: BrowserContext, 
-            header_keywords: Optional[list[str]] = None,
-            table_index: int = 0
-        ):
-            """
-            Extract structured data from tables. 
-            Provide header_keywords to filter columns.
-            """
-            try:
-                page = await browser.get_current_page()
-                
-                # Robust extraction logic aligned with script_helpers.py
-                # 1. Find the table
-                tables = await page.query_selector_all('table')
-                if not tables:
-                    return ActionResult(error="No tables found on the current page.")
-                
-                if table_index >= len(tables):
-                    table_index = 0 # Fallback to first
-                
-                table = tables[table_index]
-                
-                # 2. Extract rows
-                rows = await table.query_selector_all('tr')
-                if not rows:
-                    return ActionResult(error="Table found but contains no rows (tr elements).")
-                
-                # 3. Resolve headers
-                col_map = {}
-                header_row_idx = -1
-                
-                # Scan first 10 rows for headers if not found in first
-                num_to_scan = min(10, len(rows))
-                
-                headers_found = []
-                for i in range(num_to_scan):
-                    cells = await rows[i].query_selector_all('th, td')
-                    texts = [(await c.inner_text()).strip() for c in cells]
-                    
-                    if header_keywords:
-                        # Find indices for requested keywords
-                        current_map = {}
-                        for kw in header_keywords:
-                            idx = next((j for j, t in enumerate(texts) if kw.lower() in t.lower()), -1)
-                            if idx != -1:
-                                current_map[kw] = idx
-                        
-                        if len(current_map) >= len(header_keywords) * 0.5: # 50% match
-                            col_map = current_map
-                            header_row_idx = i
-                            headers_found = texts
-                            break
-                    else:
-                        # Use first row with > 1 columns as header
-                        if len(texts) > 1:
-                            headers_found = texts
-                            header_row_idx = i
-                            col_map = {h: idx for idx, h in enumerate(texts)}
-                            break
-                
-                if not headers_found:
-                    # Fallback: invent headers Col 1, Col 2...
-                    header_row_idx = -1
-                    cells = await rows[0].query_selector_all('td, th')
-                    headers_found = [f"Col {idx+1}" for idx in range(len(cells))]
-                    col_map = {h: idx for idx, h in enumerate(headers_found)}
-
-                # 4. Extract data
-                data_results = []
-                for i in range(header_row_idx + 1, len(rows)):
-                    cells = await rows[i].query_selector_all('td')
-                    if len(cells) < len(headers_found):
-                        continue
-                        
-                    row_data = {}
-                    for h, idx in col_map.items():
-                        if idx < len(cells):
-                            row_data[h] = (await cells[idx].inner_text()).strip()
-                    
-                    if row_data:
-                        data_results.append(row_data)
-                
-                if not data_results:
-                    return ActionResult(error=f"Table found with headers {headers_found}, but no data rows followed.")
-
-                # Format as JSON string
-                import json
-                json_data = json.dumps(data_results, indent=2)
-                
-                # Keep it under token limit
-                if len(json_data) > 3000:
-                    json_data = json_data[:3000] + "... [TRUNCATED]"
-
-                return ActionResult(
-                    extracted_content=f"Extracted {len(data_results)} rows from table (Goal: {goal}):\n\n```json\n{json_data}\n```",
-                    include_in_memory=True
-                )
-            except Exception as e:
-                return ActionResult(error=f"Table extraction failed: {str(e)}")
 
     @time_execution_sync('--act')
     async def act(
@@ -1422,9 +1186,8 @@ class CustomController(Controller):
             if browser_context:
                 try:
                     page = await browser_context.get_current_page()
-                    # CRITICAL SPEED OPTIMIZATION: Reduce timeout for load state checks
-                    # Performance: Use 'domcontentloaded' instead of 'networkidle' for faster turns where safe
-                    await asyncio.wait_for(page.wait_for_load_state('domcontentloaded', timeout=500), timeout=0.6)
+                    # Use a shorter timeout and continue if it takes too long
+                    await asyncio.wait_for(page.wait_for_load_state('networkidle', timeout=1000), timeout=1.2)
                 except (asyncio.TimeoutError, Exception):
                     pass
 
@@ -1434,26 +1197,14 @@ class CustomController(Controller):
                     page = await browser_context.get_current_page()
                     url = page.url
                     title = await page.title()
-                    scroll_pos = await page.evaluate("() => ({ x: window.scrollX, y: window.scrollY })")
-                    state_hash = f"{url}:{title}:{content_len}:{scroll_pos['x']}:{scroll_pos['y']}"
+                    content_len = len(await page.content())
+                    state_hash = f"{url}:{title}:{content_len}"
                     self.state_history.append(state_hash)
                     if len(self.state_history) > 20:
                         self.state_history.pop(0)
-                        
-                    # Looser loop detection for non-mutating actions (threshold 5)
-                    action_data = action.model_dump(exclude_unset=True)
-                    # Add 'wait' and 'extract_table' to whitelist to prevent premature loop detection
-                    non_mutating_actions = ['extract_content', 'extract_table', 'scroll_page', 'scroll_to_text', 'wait_for_element', 'done', 'retrieve_value_by_element', 'wait']
-                    is_non_mutating = any(name in action_data for name in non_mutating_actions)
-                    
-                    max_repeats = 5 if is_non_mutating else 3
-                    
-                    if self.state_history.count(state_hash) > max_repeats:
-                        if 'done' in action_data:
-                            logger.info(f"Bypassing loop detection for 'done' action at {state_hash}")
-                        else:
-                            logger.warning(f"Loop detected: {state_hash} (Repeats: {self.state_history.count(state_hash)})")
-                            return ActionResult(error=f"Loop detected: Same page state repeated {max_repeats}+ times. Try moving the page (scroll, click) or use a different approach.")
+                    if self.state_history.count(state_hash) > 3:
+                        logger.warning(f"Loop detected: {state_hash}")
+                        return ActionResult(error="Loop detected: Same page state repeated. Try different approach.")
                 except Exception:
                     pass
 
@@ -1617,23 +1368,20 @@ class CustomController(Controller):
                     # Only add hints after MULTIPLE failures (2+ attempts)
                     # This allows normal scrolling/retries before suggesting alternatives
                     
-                    # Detect scroll_to_text failures (after 2 failures)
+                    # Detect scroll_to_text failures on pages with tables (after 2 failures)
                     if action_name == "scroll_to_text" and ("not found" in original_error.lower() or "not visible" in original_error.lower()) and failure_count >= 2:
                         try:
                             # Check if page has table elements
                             page = await browser_context.get_current_page()
                             has_tables = await page.evaluate("() => document.querySelectorAll('table').length > 0")
                             
-                            hint = f"{original_error}\n💡 HINT: Failed {failure_count} times."
-                            
                             if has_tables:
-                                hint += " This page contains tables. Text within table cells may not be searchable with scroll_to_text. "
-                                hint += "Consider using 'extract_content' to get the full table data."
-                            else:
-                                hint += " If the text is hard to find or the page layout is complex, try using 'scroll_page' with direction='down' and a large amount (e.g. 800) to move through the page manually."
-                                
-                            result.error = hint
-                            logger.info(f"Enhanced scroll_to_text error with fallback hint (after {failure_count} failures)")
+                                result.error = (
+                                    f"{original_error}\n"
+                                    f"💡 HINT: Failed {failure_count} times. This page contains tables. Text within table cells may not be searchable with scroll_to_text. "
+                                    f"Consider using 'extract_content' to get the full table data, then verify the content within the extracted text."
+                                )
+                                logger.info(f"Enhanced scroll_to_text error with table extraction hint (after {failure_count} failures)")
                         except Exception as e:
                             logger.debug(f"Could not check for tables: {e}")
                     

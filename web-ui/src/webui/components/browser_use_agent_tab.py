@@ -14,7 +14,7 @@ import time
 import uuid
 import builtins
 from datetime import datetime
-from src.utils.utils import slugify, generate_task_title
+from src.utils.utils import slugify
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from browser_use.agent.views import AgentHistoryList, AgentOutput
@@ -154,12 +154,11 @@ def _format_agent_output(model_output: AgentOutput) -> str:
                 content += f"**LLM Reasoning:**\n{llm_response}\n\n"
 
             # Actions JSON
-            if hasattr(model_output, 'action') and model_output.action:
-                action_dump = [action.model_dump(exclude_none=True) for action in model_output.action]
-                state_dump = model_output.current_state.model_dump(exclude_none=True)
-                output_dump = {"current_state": state_dump, "action": action_dump}
-                json_str = json.dumps(output_dump, indent=4, ensure_ascii=False)
-                content += f"**Actions:**\n<pre><code class='language-json'>{json_str}</code></pre>"
+            action_dump = [action.model_dump(exclude_none=True) for action in model_output.action]
+            state_dump = model_output.current_state.model_dump(exclude_none=True)
+            output_dump = {"current_state": state_dump, "action": action_dump}
+            json_str = json.dumps(output_dump, indent=4, ensure_ascii=False)
+            content += f"**Actions:**\n<pre><code class='language-json'>{json_str}</code></pre>"
         except Exception as e:
             logger.error(f"Error formatting output: {e}", exc_info=True)
             content = f"<pre><code>Error formatting output: {e}\nRaw: {str(model_output)}</code></pre>"
@@ -172,19 +171,19 @@ async def _handle_new_step(
     """Callback for each agent step."""
     if not hasattr(webui_manager, "bu_chat_history"):
         webui_manager.bu_chat_history = []
-
+    
     step_num -= 1
     step_end_time = time.perf_counter()
     step_duration = 0.0
     if webui_manager.bu_step_start_time:
         step_duration = round(step_end_time - webui_manager.bu_step_start_time, 3)
-
+    
     logger.info(f"Step {step_num} completed.")
 
     # Progression tracking
     if webui_manager.check_step_progression(step_num):
         logger.error(f"Step {step_num}: Excessive backward progression.")
-
+    
     # Failure tracking
     step_failed = False
     if hasattr(output, 'error'):
@@ -192,18 +191,18 @@ async def _handle_new_step(
         if error:
             step_failed = True
             logger.warning(f"Step {step_num} failed: {error}")
-
+    
     if webui_manager.check_step_failure(step_num, step_failed):
         logger.error(f"Step {step_num} exceeded 3 failures. Stopping.")
         webui_manager.bu_should_stop_agent = True
         if webui_manager.bu_agent:
             webui_manager.bu_agent.state.stopped = True
-
+    
     # Hallucination tracking
     current_action = None
     if hasattr(output, 'action') and output.action:
         current_action = str(output.action[0]) if isinstance(output.action, (list, tuple)) else str(output.action)
-
+    
     if webui_manager.check_hallucination(current_action):
         logger.error(f"HALLUCINATION: Action repeated {webui_manager.bu_repeated_action_count} times. Stopping.")
         webui_manager.bu_should_stop_agent = True
@@ -233,7 +232,7 @@ async def _handle_new_step(
     # Warnings
     failure_warning = ""
     if step_failed:
-        failure_warning += "⚠️ **STEP FAILED** - Retrying...<br/>"
+        failure_warning += "âš ï¸ **STEP FAILED** - Retrying...<br/>"
     if webui_manager.bu_should_stop_agent:
         if webui_manager.bu_hallucination_triggered:
             failure_warning += "🔴 **HALLUCINATION DETECTED** - Stopped.<br/>"
@@ -250,39 +249,152 @@ async def _handle_new_step(
 
 
 def generate_docx_report(webui_manager: WebuiManager, history: AgentHistoryList, task: str):
-    """Generate comprehensive DOCX report using the execution template."""
+    """Generate comprehensive DOCX report with screenshots and findings."""
     try:
-        logger.info("Generating DOCX report via template...")
+        logger.info("Generating DOCX report...")
         if not webui_manager or not hasattr(webui_manager, 'bu_agent_task_id'):
             logger.error("Missing webui_manager or task_id")
             return None
+        
+        doc = Document()
+        doc.add_heading('AI Browser Agent Execution Report', 0)
 
-        from src.utils.report_templates import generate_execution_report
+        # Task summary
+        doc.add_heading('Task Summary', level=1)
+        task_para = doc.add_paragraph()
+        task_para.add_run('Task: ').bold = True
+        task_para.add_run(task)
 
+        duration = history.total_duration_seconds()
+        tokens = history.total_input_tokens()
+        final_result = history.final_result()
+
+        summary_table = doc.add_table(rows=5, cols=2)
+        summary_table.style = 'Table Grid'
+        summary_table.rows[0].cells[0].text = 'Duration'
+        summary_table.rows[0].cells[1].text = f"{duration:.2f}s"
+        summary_table.rows[1].cells[0].text = 'Tokens'
+        summary_table.rows[1].cells[1].text = str(tokens)
+        summary_table.rows[2].cells[0].text = 'Steps'
+        summary_table.rows[2].cells[1].text = str(len(history.history))
+        summary_table.rows[3].cells[0].text = 'Status'
+        summary_table.rows[3].cells[1].text = 'Completed' if final_result else 'Failed'
+        summary_table.rows[4].cells[0].text = 'Task ID'
+        summary_table.rows[4].cells[1].text = webui_manager.bu_agent_task_id or 'Unknown'
+
+        # Final result
+        doc.add_heading('Final Result', level=1)
+        if final_result:
+            result_para = doc.add_paragraph()
+            result_para.add_run('Outcome: ').bold = True
+            result_para.add_run(final_result)
+        
+        step_failures = getattr(webui_manager, 'bu_step_failures', {})
+        total_failures = sum(step_failures.values())
+        status_para = doc.add_paragraph()
+        status_para.add_run('Status: ').bold = True
+        if total_failures > 0:
+            status_para.add_run(f"Completed with {total_failures} failures")
+        else:
+            status_para.add_run("All steps successful")
+
+        # Step details
+        doc.add_heading('Step-by-Step Execution', level=1)
+        for i, step in enumerate(history.history, 1):
+            step_status = "PASS" if step_failures.get(i, 0) == 0 else f"FAIL ({step_failures.get(i, 0)}x)"
+            doc.add_heading(f'Step {i} - {step_status}', level=2)
+
+            # Goal
+            goal_para = doc.add_paragraph()
+            goal_para.add_run('Goal: ').bold = True
+            goal_text = "Execute action"
+            if hasattr(step, 'model_output') and step.model_output:
+                if hasattr(step.model_output, 'current_state') and step.model_output.current_state:
+                    if hasattr(step.model_output.current_state, 'next_goal') and step.model_output.current_state.next_goal:
+                        goal_text = str(step.model_output.current_state.next_goal)
+            goal_para.add_run(goal_text)
+
+            # Action
+            action_para = doc.add_paragraph()
+            action_para.add_run('Action: ').bold = True
+            action_desc = "No action"
+            if hasattr(step, 'action'):
+                action = getattr(step, 'action', None)
+                if action:
+                    action_desc = str(action[0]) if isinstance(action, (list, tuple)) else str(action)
+            action_para.add_run(action_desc)
+
+            # Screenshot
+            if hasattr(step, 'state') and hasattr(step.state, 'screenshot') and step.state.screenshot:
+                try:
+                    screenshot_data = step.state.screenshot
+                    if screenshot_data.startswith('data:image'):
+                        screenshot_data = screenshot_data.split(',')[1]
+                    image_data = base64.b64decode(screenshot_data)
+                    image = Image.open(io.BytesIO(image_data))
+                    
+                    if image.width > 900:
+                        ratio = 900 / image.width
+                        image = image.resize((int(image.width * ratio), int(image.height * ratio)), Image.Resampling.LANCZOS)
+                    
+                    if image.mode in ("RGBA", "LA", "P"):
+                        image = image.convert("RGB")
+                    
+                    img_buffer = io.BytesIO()
+                    image.save(img_buffer, format='JPEG', quality=95)
+                    img_buffer.seek(0)
+                    
+                    doc.add_picture(img_buffer, width=Inches(6))
+                    caption = doc.add_paragraph(f'Step {i} screenshot')
+                    caption.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                except Exception as e:
+                    logger.warning(f"Failed to add screenshot for step {i}: {e}")
+
+            # Result
+            result_para = doc.add_paragraph()
+            result_para.add_run('Result: ').bold = True
+            result_text = "No result"
+            if hasattr(step, 'result') and step.result:
+                # result is list[ActionResult], take first if available
+                if isinstance(step.result, list) and len(step.result) > 0:
+                    first_result = step.result[0]
+                    if hasattr(first_result, 'extracted_content'):
+                        extracted = getattr(first_result, 'extracted_content', None)
+                        if extracted:
+                            result_text = str(extracted)
+                        else:
+                            result_text = str(first_result)
+                    else:
+                        result_text = str(first_result)
+                else:
+                    result_text = str(step.result)
+            result_para.add_run(result_text)
+
+            doc.add_paragraph()
+
+        # Errors
+        errors = history.errors()
+        if errors and any(errors):
+            doc.add_heading('Errors', level=1)
+            for error in errors:
+                if error:
+                    doc.add_paragraph(f'Error: {str(error)}')
+
+        # Save
         task_id = webui_manager.bu_agent_task_id
         if not task_id:
             logger.error("Task ID is None")
             return None
-
         agent_history_path = os.getenv("AGENT_HISTORY_PATH", "./tmp/agent_history")
         task_dir = os.path.join(agent_history_path, task_id)
         os.makedirs(task_dir, exist_ok=True)
-
+        
+        # Sanitize task_id for filename (it may contain slashes if it's a nested process)
         safe_filename = task_id.replace("/", "_").replace("\\", "_")
         docx_path = os.path.join(task_dir, f"{safe_filename}_report.docx")
-
-        step_failures = getattr(webui_manager, 'bu_step_failures', {})
-
-        result = generate_execution_report(
-            history=history,
-            task=task,
-            task_id=task_id,
-            output_path=docx_path,
-            step_failures=step_failures,
-        )
-        if result:
-            logger.info(f"DOCX report saved: {result}")
-        return result
+        doc.save(docx_path)
+        logger.info(f"DOCX report saved: {docx_path}")
+        return docx_path
     except Exception as e:
         logger.error(f"DOCX generation failed: {e}", exc_info=True)
         return None
@@ -293,7 +405,7 @@ def _handle_done(webui_manager: WebuiManager, history: AgentHistoryList):
     logger.info("=" * 80)
     logger.info("REPORT GENERATION STARTED")
     logger.info("=" * 80)
-
+    
     try:
         logger.info(f"Task finished. Duration: {history.total_duration_seconds():.2f}s, Tokens: {history.total_input_tokens()}")
 
@@ -332,7 +444,7 @@ async def _ask_assistant_callback(
 ) -> Dict[str, Any]:
     """Callback for agent assistance requests."""
     logger.info("Agent needs assistance.")
-
+    
     webui_manager.bu_chat_history.append({
         "role": "assistant",
         "content": f"**Need Help:** {query}\nPlease respond below and click 'Submit Response'."
@@ -401,34 +513,14 @@ async def run_agent_task(
         yield {run_button_comp: gr.update(interactive=True)}
         return
 
-    # Agent settings for title generation & execution
-    llm_provider_name = "ollama"
-    llm_model_name = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b")
-    llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
-    llm_base_url = os.getenv("LLM_BASE_URL")
-    ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16000"))
-
-    # Initialize LLM early for intelligent title generation
-    title_llm = await _initialize_llm(
-        provider=llm_provider_name,
-        model_name=llm_model_name,
-        temperature=llm_temperature,
-        base_url=llm_base_url,
-        api_key=None,
-        num_ctx=ollama_num_ctx
-    )
-
-    # Generate task ID (Meaningful & Concise Format)
+    # Generate task ID (Readable Format)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     short_uuid = str(uuid.uuid4())[:8]
-
-    # Use LLM to generate an intelligent title, with slugify as fallback
-    task_slug = generate_task_title(title_llm, task)
-
+    task_slug = slugify(task)[:50] # Limit length
     webui_manager.bu_agent_task_id = f"{timestamp}_{task_slug}_{short_uuid}"
     set_run_id(webui_manager.bu_agent_task_id)
     webui_manager.reset_failure_tracking()
-
+    
     # Reset chat history and controller for fresh run
     webui_manager.bu_chat_history = []
     webui_manager.bu_controller = None
@@ -438,7 +530,7 @@ async def run_agent_task(
     uploaded_files = components.get(context_files_comp, [])
     context_info = ""
     available_file_paths = []
-
+    
     if uploaded_files:
         if not isinstance(uploaded_files, list):
             uploaded_files = [uploaded_files]
@@ -461,6 +553,34 @@ async def run_agent_task(
                 except Exception as e:
                     logger.error(f"Failed to save {filename}: {e}")
     task += context_info
+
+    # ── Cert task detection & rewrite ────────────────────────────────────────
+    import re as _re
+    _CERT_RE = r'\b(ssl|tls|certificate|https cert|cert detail|cert valid|lock icon|connection secure)\b'
+    _obj_text = task.lower()
+    if _re.search(_CERT_RE, _obj_text, _re.IGNORECASE):
+        _url_match = _re.search(r'(https?://[^\s\]\)\'"]+)', task)
+        _url_hint  = _url_match.group(1).rstrip('.,;)') if _url_match else None
+
+        _nav_step = f'go_to_url("{_url_hint}")' if _url_hint else "go_to_url to navigate to the target URL"
+        task = (
+            f"SSL Certificate Check Task\n"
+            f"{'='*50}\n"
+            f"{'URL: ' + _url_hint if _url_hint else 'Navigate to the URL in the original task.'}\n"
+            f"{'='*50}\n\n"
+            f"EXACT STEPS — execute in order, nothing else:\n"
+            f"Step 1: {_nav_step}\n"
+            f"Step 2: check_ssl_certificate()\n"
+            f"Step 3: done(success=true, text='Certificate check complete')\n\n"
+            f"RULES:\n"
+            f"- check_ssl_certificate() is a registered action — USE IT\n"
+            f"- Do NOT click anything in the browser\n"
+            f"- Do NOT use extract_content\n"
+            f"- Do NOT try to access the lock icon\n"
+            f"- After check_ssl_certificate() returns, immediately call done()"
+        )
+        logger.info(f"[task-rewrite] Cert task → replaced with 3-step check_ssl_certificate flow")
+
     webui_manager.bu_chat_history.append({"role": "user", "content": task})
 
     yield {
@@ -474,17 +594,22 @@ async def run_agent_task(
         gif_comp: gr.update(value=None),
     }
 
-    # Max steps & Action settings
+    # Agent settings (Ollama only, low temp for strict mode)
+    llm_provider_name = "ollama"
+    llm_model_name = os.getenv("LLM_MODEL_NAME", "qwen2.5:7b")
+    llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.3"))
+    use_vision = os.getenv("USE_VISION", "false").lower() == "true"
+    ollama_num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16000"))
+    llm_base_url = os.getenv("LLM_BASE_URL")
     max_steps = int(os.getenv("MAX_STEPS", "25"))
     max_actions = int(os.getenv("MAX_ACTIONS", "3"))
     max_input_tokens = int(os.getenv("MAX_INPUT_TOKENS", "128000"))
-    use_vision = os.getenv("USE_VISION", "false").lower() == "true"
-
+    
     # Planner model settings (optional)
     planner_provider = os.getenv("PLANNER_LLM_PROVIDER")
     planner_model_name = os.getenv("PLANNER_LLM_MODEL_NAME")
     planner_temperature = float(os.getenv("PLANNER_LLM_TEMPERATURE", "1.0"))
-
+    
     # Extraction model settings (optional)
     extraction_provider = os.getenv("EXTRACTION_LLM_PROVIDER")
     extraction_model_name = os.getenv("EXTRACTION_LLM_MODEL_NAME")
@@ -508,22 +633,7 @@ async def run_agent_task(
    - Ensure URLs are correct. NEVER use double dots (e.g., http://host..domain).
    - Use the exact URL provided in the task.
 
-3. 📊 DATA EXTRACTION (SPEED & ACCURACY):
-   - For ANY tabular data, status lists, or multiple records, use extract_table(goal, header_keywords).
-   - NEVER use separate retrieve_value_by_element calls for multiple rows.
-   - extract_table is 10x faster and more accurate for grids.
-
-4. 🖥️ SYSTEM OPERATION & OS AUTOMATION (EXTERNAL APPS & BROWSER CHROME):
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   - Use these tools to interact with EVERYTHING outside the webpage.
-   - ⌨️ TYPE/PRESS: Use `system_type(text)` and `system_press_key(key)` for CMD input or OS dialogs.
-   - 🖱️ CLICK: Use `system_click(x, y)` for OS elements (Taskbar, Start Menu).
-   - 📸 SCREENSHOT: Use `system_screenshot(description)` to capture browser menus, certificates, or CMD windows.
-   - 💻 CMD/SHELL: Use `run_system_command(command)` (e.g., 'start cmd') to open apps or run scripts.
-   - 🛡️ CERTIFICATES: The padlock/lock icon is BROWSER CHROME. Use `system_screenshot` to verify it visually.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-5. 🖱️ HOVER DECISION TREE - READ THIS FIRST BEFORE ANY HOVER ACTION!
+2. 🎯 HOVER DECISION TREE - READ THIS FIRST BEFORE ANY HOVER ACTION!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 QUESTION: What are you trying to hover?
@@ -549,17 +659,17 @@ QUESTION: What are you trying to hover?
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ❌ WRONG: Task says "hover status icon left of Enterprise Update Distributor"
-      Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
+          Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
 
 ✅ RIGHT: Task says "hover status icon left of Enterprise Update Distributor" 
-      Action: hover_with_offset(index=18, direction="left", distance=30)
-      ↑ This hovers 30px LEFT of the text, where the icon is!
+          Action: hover_with_offset(index=18, direction="left", distance=30)
+          ↑ This hovers 30px LEFT of the text, where the icon is!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 CRITICAL RULES:
 1. Execute ONLY the exact task requested. No extra steps.
-2. For tabular data/lists: ALWAYS use extract_table().
+2. Use retrieve_value_by_element to extract data, then validate_value to check it.
 3. For clicks: prefer click_element_by_text(text) over indices.
 4. Use scroll_page() to access content below fold.
 
@@ -569,8 +679,8 @@ FILE UPLOAD — HARD RULE:
 - Paths must come from available context files only
 
 RETRIEVAL PATTERN:
-Step 1: extract_table() or retrieve_value_by_element(index=N)
-Step 2: validate_value(actual=extracted_text, expected=value, operator="equals")
+Step 1: retrieve_value_by_element(index=N) → extracts plain text
+Step 2: validate_value(actual=text, expected=value, operator="equals")
 
 NEVER pass HTML to validate_value. Always retrieve first.
 """
@@ -604,11 +714,11 @@ QUESTION: What are you trying to hover?
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ❌ WRONG: Task says "hover status icon left of Enterprise Update Distributor"
-      Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
+          Action: hover_element(index=18)  ← This hovers the TEXT, not the icon!
 
 ✅ RIGHT: Task says "hover status icon left of Enterprise Update Distributor" 
-      Action: hover_with_offset(index=18, direction="left", distance=30)
-      ↑ This hovers 30px LEFT of the text, where the icon is!
+          Action: hover_with_offset(index=18, direction="left", distance=30)
+          ↑ This hovers 30px LEFT of the text, where the icon is!
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -644,9 +754,42 @@ Step 1: retrieve_value_by_element(index=N) → extracts plain text
 Step 2: validate_value(actual=text, expected=value, operator="equals")
 
 NEVER pass HTML to validate_value. Always retrieve first.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚫 extract_content IS BANNED — DO NOT USE IT EVER
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+extract_content is FORBIDDEN in ALL tasks. It dumps the entire page as
+raw HTML/text and is never the right tool. It is always wrong.
+
+INSTEAD — use the correct targeted action:
+  ❌ extract_content  →  ✅ retrieve_value_by_element(index=N)
+  ❌ extract_content  →  ✅ done(text="...") with data already visible on screen
+
+If you are tempted to call extract_content, STOP.
+Read what is already visible. Use retrieve_value_by_element for specific values.
+Call done() when you have the information.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔒 SSL / CERTIFICATE TASKS — MANDATORY APPROACH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When the task mentions: "SSL certificate", "certificate details",
+"certificate validity", "lock icon", "connection secure", "TLS", "HTTPS cert"
+
+EXACT SEQUENCE — nothing else:
+  1. go_to_url("the target URL")
+  2. check_ssl_certificate()    ← registered action, use it
+  3. done(success=true)
+
+YOU MUST NOT:
+  ❌ Click the lock icon (it is in the browser chrome — unreachable)
+  ❌ Use extract_content for cert data
+  ❌ Look for cert info in the DOM
+  ❌ Try to open any security popup
+  ❌ Use get_site_security_info (replaced by check_ssl_certificate)
+
 """
 
-    stream_vw = 70
+
     stream_vh = int(70 * window_h // window_w)
 
     # Initialize LLM
@@ -654,11 +797,11 @@ NEVER pass HTML to validate_value. Always retrieve first.
         llm_provider_name, llm_model_name, llm_temperature, 
         llm_base_url, None, ollama_num_ctx
     )
-
+    
     # Initialize planner model (optional)
     planner_llm = None
     # Planner disabled - only using main agent
-
+    
     # Initialize extraction model (optional) - used for page_extraction_llm
     page_extraction_llm = None
     if extraction_provider and extraction_model_name:
@@ -774,8 +917,9 @@ NEVER pass HTML to validate_value. Always retrieve first.
                 use_vision=use_vision,
                 max_input_tokens=max_input_tokens,
                 max_actions_per_step=max_actions,
-                enable_memory=enable_memory,  # Pass memory setting from env
-                sensitive_data=sensitive_data, # Pass sensitive data to agent
+                enable_memory=enable_memory,
+                sensitive_data=sensitive_data,
+                extend_system_message=extend_system_prompt,  # appended to system prompt by prompts.py
             )
             # ALSO update the controller's sensitive data directly, 
             # because CustomController.input_text uses self.sensitive_data
@@ -823,7 +967,8 @@ NEVER pass HTML to validate_value. Always retrieve first.
                          'step_callback': step_callback_wrapper,
                          'webui_manager': webui_manager,
                          'sensitive_data': sensitive_data,
-                         'browser_context_config': context_config
+                         'browser_context_config': context_config,
+                         'extend_system_prompt': extend_system_prompt,
                      }
                      
                      results, output_dir = await run_all_processes(
@@ -926,17 +1071,11 @@ NEVER pass HTML to validate_value. Always retrieve first.
 
             if update_dict:
                 yield update_dict
-            
-            # CRITICAL: Always sleep to prevent event loop starvation
             await asyncio.sleep(0.5)
 
         # Finalize
-        try:
-            if webui_manager.bu_agent:
-                webui_manager.bu_agent.state.paused = False
-                webui_manager.bu_agent.state.stopped = False
-        except Exception: pass
-        
+        webui_manager.bu_agent.state.paused = False
+        webui_manager.bu_agent.state.stopped = False
         final_update = {}
         
         try:
@@ -951,8 +1090,7 @@ NEVER pass HTML to validate_value. Always retrieve first.
                 report_generated = True
 
             # Save history
-            if webui_manager.bu_agent:
-                webui_manager.bu_agent.save_history(history_file)
+            webui_manager.bu_agent.save_history(history_file)
             if os.path.exists(history_file):
                 final_update[history_file_comp] = gr.File(value=history_file)
             
@@ -965,7 +1103,7 @@ NEVER pass HTML to validate_value. Always retrieve first.
                 logger.info("Generating Playwright script via LLM...")
                 history_path = pathlib.Path(history_file)
                 from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
-                logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL}")
+                logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL} (agent model: {llm_provider_name}/{llm_model_name})")
                 script_path, script_content = generate_llm_script(
                     str(history_path),
                     model_name=SCRIPT_GEN_MODEL,
@@ -973,6 +1111,7 @@ NEVER pass HTML to validate_value. Always retrieve first.
                     objective=task
                 )
                 logger.info(f"Playwright script saved to {script_path}")
+                logger.info(f"Script is ready to run: python {os.path.basename(script_path)}")
             except Exception as e:
                 logger.warning(f"Could not auto-generate enrichment or script: {e}", exc_info=True)
 
@@ -980,9 +1119,21 @@ NEVER pass HTML to validate_value. Always retrieve first.
             if gif_path and os.path.exists(gif_path):
                 final_update[gif_comp] = gr.Image(value=gif_path)
 
-            # Playwright script
+            # Playwright script - Use the content directly from the generator
             if 'script_content' in locals() and script_content:
                 final_update[playwright_script_comp] = gr.Code(value=script_content, language="python")
+            else:
+                # Fallback to file search if variable is missing
+                custom_script_path = history_file.replace('.json', '_LLM.py')
+                if not os.path.exists(custom_script_path):
+                    custom_script_path = history_file.replace('.json', '.py')
+                
+                if os.path.exists(custom_script_path):
+                    with open(custom_script_path, 'r', encoding='utf-8') as f:
+                        script_content = f.read()
+                    final_update[playwright_script_comp] = gr.Code(value=script_content, language="python")
+                else:
+                    final_update[playwright_script_comp] = gr.Code(value="# Script generation not available or disabled", language="python")
 
             # DOCX
             docx_path = getattr(webui_manager, 'bu_docx_path', None)
@@ -991,11 +1142,15 @@ NEVER pass HTML to validate_value. Always retrieve first.
 
         except asyncio.CancelledError:
             logger.info("Task cancelled.")
+            final_update[chatbot_comp] = gr.update(value=webui_manager.bu_chat_history)
         except Exception as e:
             logger.error(f"Execution error: {e}", exc_info=True)
             webui_manager.bu_chat_history.append({"role": "assistant", "content": f"**Error:** {e}"})
+            final_update[chatbot_comp] = gr.update(value=webui_manager.bu_chat_history)
         finally:
             webui_manager.bu_current_task = None
+            
+            # Always clean up agent to prevent state pollution
             webui_manager.bu_agent = None
             
             if should_close_browser_on_finish:
@@ -1004,8 +1159,10 @@ NEVER pass HTML to validate_value. Always retrieve first.
                     await webui_manager.bu_browser_context.close()
                     webui_manager.bu_browser_context = None
                 if webui_manager.bu_browser:
+                    # Force kill browser to ensure it closes even if connected via CDP
                     await webui_manager.bu_browser.close(force=True)
                     webui_manager.bu_browser = None
+                logger.info("Browser closed successfully")
 
             final_update.update({
                 user_input_comp: gr.update(value="", interactive=True, placeholder="Enter next task..."),
@@ -1024,7 +1181,6 @@ NEVER pass HTML to validate_value. Always retrieve first.
             run_button_comp: gr.update(value="▶️ Submit Task", interactive=True),
             chatbot_comp: gr.update(value=webui_manager.bu_chat_history + [{"role": "assistant", "content": f"**Error:** {e}"}])
         }
-
 
 async def handle_submit(webui_manager: WebuiManager, components: Dict[Component, Any]):
     """Handle submit button clicks."""
@@ -1089,7 +1245,7 @@ async def handle_pause_resume(webui_manager: WebuiManager):
 async def handle_clear(webui_manager: WebuiManager):
     """Handle clear button."""
     logger.info("Clear clicked.")
-
+    
     task = webui_manager.bu_current_task
     if task and not task.done():
         if webui_manager.bu_agent:
@@ -1100,7 +1256,7 @@ async def handle_clear(webui_manager: WebuiManager):
             await asyncio.wait_for(task, timeout=TASK_CANCEL_TIMEOUT_S)
         except Exception:
             pass
-
+    
     webui_manager.bu_current_task = None
     if webui_manager.bu_controller:
         await webui_manager.bu_controller.close_mcp_client()
@@ -1187,7 +1343,7 @@ def create_browser_use_agent_tab(webui_manager: WebuiManager):
         playwright_script=playwright_script,
         docx_report=docx_report,
     ))
-
+    
     webui_manager.add_components("browser_use_agent", tab_components)
     all_managed_components = list(webui_manager.get_components())
     run_tab_outputs = list(tab_components.values())

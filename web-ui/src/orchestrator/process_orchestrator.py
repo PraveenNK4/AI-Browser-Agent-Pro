@@ -61,6 +61,7 @@ async def run_process(
     done_callback=None,
     webui_manager=None,
     sensitive_data: dict = None,
+    extend_system_prompt: str = None,
 ) -> ProcessResult:
     """
     Execute a single process with isolated agent and controller.
@@ -232,6 +233,9 @@ async def run_process(
                 agent_kwargs['planner_system_message'] = planner_system_message
         else:
             agent_kwargs['planner_interval'] = 0
+
+        if extend_system_prompt:
+            agent_kwargs['extend_system_message'] = extend_system_prompt
 
         agent = BrowserUseAgent(**agent_kwargs)
         
@@ -463,21 +467,9 @@ async def run_all_processes(
     # Create orchestration output directory
     if orchestration_output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Add a hint from the first process name for better folder naming
-        hint = ""
-        if processes:
-            try:
-                from src.utils.utils import generate_task_title
-                # Generate an intelligent title from the first process name
-                hint_slug = generate_task_title(llm, processes[0].name)
-                hint = f"_{hint_slug}"
-            except Exception:
-                pass
-                
         orchestration_output_dir = os.path.join(
             agent_history_path,
-            f'orchestration_{timestamp}{hint}'
+            f'orchestration_{timestamp}'
         )
     
     os.makedirs(orchestration_output_dir, exist_ok=True)

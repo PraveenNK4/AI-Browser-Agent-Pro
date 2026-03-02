@@ -44,7 +44,7 @@ OOM_RETRY_NUM_PREDICT = int(os.getenv("OOM_RETRY_NUM_PREDICT", "2048"))
 # ---------------------------------------------------------------------------
 # Vault key prefix used by the target application's credentials.
 # E.g. "OTCS" means vault.get_credentials("OTCS") -> {username, password}.
-VAULT_CREDENTIAL_PREFIX = os.getenv("VAULT_CREDENTIAL_PREFIX", "vault_key")
+VAULT_CREDENTIAL_PREFIX = os.getenv("VAULT_CREDENTIAL_PREFIX", "OTCS")
 
 # ---------------------------------------------------------------------------
 # Login selectors (used by maybe_login helper injected into generated scripts)
@@ -72,13 +72,12 @@ LOGIN_SUBMIT_SELECTORS: list[str] = _sel_list(
 # ---------------------------------------------------------------------------
 TIMEOUT_FIND_IN_FRAMES_MS   = int(os.getenv("TIMEOUT_FIND_IN_FRAMES_MS",   "5000"))
 TIMEOUT_ELEMENT_VISIBLE_MS  = int(os.getenv("TIMEOUT_ELEMENT_VISIBLE_MS",  "1000"))
-TIMEOUT_FILL_MS             = int(os.getenv("TIMEOUT_FILL_MS",             "5000"))
-TIMEOUT_CLICK_MS            = int(os.getenv("TIMEOUT_CLICK_MS",            "5000"))
+TIMEOUT_FILL_MS             = int(os.getenv("TIMEOUT_FILL_MS",             "3000"))
+TIMEOUT_CLICK_MS            = int(os.getenv("TIMEOUT_CLICK_MS",            "3000"))
 TIMEOUT_FILE_CHOOSER_MS     = int(os.getenv("TIMEOUT_FILE_CHOOSER_MS",     "7000"))
 TIMEOUT_UPLOAD_CLICK_MS     = int(os.getenv("TIMEOUT_UPLOAD_CLICK_MS",     "5000"))
 TIMEOUT_UPLOAD_FALLBACK_MS  = int(os.getenv("TIMEOUT_UPLOAD_FALLBACK_MS",  "5000"))
-TIMEOUT_TABLE_WAIT_MS       = int(os.getenv("TIMEOUT_TABLE_WAIT_MS",       "45000"))
-TIMEOUT_NETWORKIDLE_MS      = int(os.getenv("TIMEOUT_NETWORKIDLE_MS",      "30000"))
+TIMEOUT_TABLE_WAIT_MS       = int(os.getenv("TIMEOUT_TABLE_WAIT_MS",       "10000"))
 
 # ---------------------------------------------------------------------------
 # Ollama / Verifier settings

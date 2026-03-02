@@ -268,13 +268,13 @@ class BrowserUseAgent(Agent):
                         
                         history_path = Path(self._history_file_path)
                         if history_path.exists():
-                            logger.debug(f'📝 Enriching history with DOM context (background): {history_path.name}')
-                            # Use to_thread to avoid blocking Gradio event loop
-                            asyncio.create_task(asyncio.to_thread(strip_and_enrich, history_path))
+                            logger.debug(f'📝 Enriching history with DOM context: {history_path.name}')
+                            strip_and_enrich(history_path)
+                            logger.debug('✅ History enrichment complete')
                     except Exception as enrich_err:
-                        logger.warning(f'⚠️ Failed to start history enrichment: {enrich_err}')
+                        logger.warning(f'⚠️ Failed to enrich history: {enrich_err}', exc_info=True)
 
-                # GIF generation (keep sync if needed, but consider backgrounding if slow)
+                # GIF generation
                 if hasattr(self.settings, 'generate_gif') and self.settings.generate_gif:
                     try:
                         output_path: str = 'agent_history.gif'
@@ -285,20 +285,22 @@ class BrowserUseAgent(Agent):
                         create_history_gif(task=self.task, history=self.state.history, output_path=output_path)
                         logger.debug(f"✅ GIF created: {output_path}")
                     except Exception as gif_err:
-                        logger.error(f'❌ Failed to create GIF: {gif_err}')
+                        logger.error(f'❌ Failed to create GIF: {gif_err}', exc_info=True)
 
                 # Playwright script generation - CUSTOM IMPLEMENTATION
                 if hasattr(self, 'playwright_script_path') and self.playwright_script_path:
                     try:
-                        # Use to_thread to avoid blocking Gradio event loop
-                        asyncio.create_task(asyncio.to_thread(
-                            generate_playwright_script_from_history,
-                            self.state.history,
-                            self.playwright_script_path
-                        ))
-                        logger.info(f"🎬 Playwright script generation started in background")
+                        # logger.info(f"🎬 Generating Playwright script: {self.playwright_script_path}")
+                        success = generate_playwright_script_from_history(
+                            history=self.state.history,
+                            output_path=self.playwright_script_path
+                        )
+                        if success:
+                            logger.info(f"✅ Playwright script saved: {self.playwright_script_path}")
+                        else:
+                            logger.warning(f"⚠️ Playwright script generation incomplete")
                     except Exception as script_err:
-                        logger.error(f'❌ Failed to start Playwright script generation: {script_err}')
+                        logger.error(f'❌ Failed to generate Playwright script: {script_err}', exc_info=True)
                 
                 logger.debug('✅ Agent cleanup complete')
 
