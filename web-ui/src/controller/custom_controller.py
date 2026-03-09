@@ -884,21 +884,47 @@ class CustomController(Controller):
                 valid = result["is_valid"]
                 secure = result["is_secure"]
 
-                # ── Save all screenshots to agent history dir ──────────────────
+                # ── Save all screenshots to the current run's agent_history folder ──
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_dir = os.path.join("tmp", "cert_screenshots")
+
+                # Find the current task run folder — it's the most recently
+                # touched subfolder in tmp/agent_history/ (the agent is writing
+                # to it right now, so it is always the newest one).
+                save_dir = os.path.join("tmp", "cert_screenshots")   # safe fallback
+                try:
+                    history_root = os.path.join("tmp", "agent_history")
+                    if os.path.isdir(history_root):
+                        subdirs = [
+                            os.path.join(history_root, d)
+                            for d in os.listdir(history_root)
+                            if os.path.isdir(os.path.join(history_root, d))
+                        ]
+                        if subdirs:
+                            save_dir = max(subdirs, key=os.path.getmtime)
+                except Exception:
+                    pass
+
                 os.makedirs(save_dir, exist_ok=True)
 
                 saved = []
-                for key, fname in [
-                    ("screenshot",           f"cert_flow_composite_{ts}.png"),
-                    ("screenshot_site_info", f"cert_panel1_siteinfo_{ts}.png"),
-                    ("screenshot_security",  f"cert_panel2_security_{ts}.png"),
-                    ("screenshot_cert",      f"cert_panel3_detail_{ts}.png"),
-                ]:
-                    data = result.get(key)
+                if result.get("native_capture"):
+                    # Native: save individual panel PNGs (real Chrome UI)
+                    for key, fname in [
+                        ("screenshot_site_info", f"certificate_panel1_{ts}.png"),
+                        ("screenshot_security",  f"certificate_panel2_{ts}.png"),
+                        ("screenshot_cert",      f"certificate_panel3_{ts}.png"),
+                    ]:
+                        data = result.get(key)
+                        if data:
+                            path = os.path.join(save_dir, fname)
+                            with open(path, "wb") as f:
+                                f.write(data)
+                            saved.append(path)
+                else:
+                    # Fallback: save HTML composite as single file
+                    data = result.get("screenshot")
                     if data:
-                        path = os.path.join(save_dir, fname)
+                        path = os.path.join(save_dir, f"certificate_{ts}.png")
                         with open(path, "wb") as f:
                             f.write(data)
                         saved.append(path)
@@ -1074,12 +1100,17 @@ class CustomController(Controller):
                     return ActionResult(error="Could not find username or password field automatically. Use manual indexing.")
 
                 # Handle sensitive data substitution
-                un_val = username
-                pw_val = password
+                un_val = str(username)
+                pw_val = str(password)
                 if self.sensitive_data:
                     for k, v in self.sensitive_data.items():
                         un_val = un_val.replace(f"{{{{{k}}}}}", v).replace(f"{{{k}}}", v)
                         pw_val = pw_val.replace(f"{{{{{k}}}}}", v).replace(f"{{{k}}}", v)
+
+                # The framework automatically substitutes credentials before passing them here,
+                # Unconditionally strip the literal XML tags.
+                un_val = un_val.replace("<secret>", "").replace("</secret>", "").strip()
+                pw_val = pw_val.replace("<secret>", "").replace("</secret>", "").strip()
 
                 # Execute interactions
                 await username_el.fill(un_val)

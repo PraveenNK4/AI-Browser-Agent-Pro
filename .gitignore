@@ -1,5 +1,8 @@
 # Temporary files
 tmp/
+**/tmp/
+tests/
+**/tests/
 
 # Python
 __pycache__/
@@ -14,3 +17,9 @@ __pycache__/
 # OS
 Thumbs.db
 .DS_Store
+
+# Temp test/debug scripts
+test_atspi*.py
+test_click*.py
+debug_*.py
+*.log

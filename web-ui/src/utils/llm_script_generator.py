@@ -131,8 +131,9 @@ Do NOT redefine any helper functions — they all come pre-built from `src.utils
     and unreachable from Playwright). Instead call:
     ```python
     result = await check_certificate(page)
-    # result keys: screenshot (PNG bytes), cert_info (dict), is_valid (bool),
-    #              is_secure (bool), hostname (str)
+    # result keys: screenshot (composite PNG), cert_info (dict), is_valid (bool),
+    #              is_secure (bool), hostname (str), native_capture (bool)
+    #              screenshot_site_info/screenshot_security/screenshot_cert (panel PNGs, native only)
     cert = result["cert_info"]
     output = (
         f"Host: {{result['hostname']}}\\n"
@@ -144,8 +145,16 @@ Do NOT redefine any helper functions — they all come pre-built from `src.utils
         f"Protocol: {{cert.get('protocol')}} | Cipher: {{cert.get('cipher')}}\\n"
         f"Expired: {{cert.get('is_expired')}}"
     )
-    await generate_report("Certificate Check", result["is_valid"],
-                          screenshot=result["screenshot"], output=output)
+    # When native capture succeeded → pass individual panels; else pass HTML composite
+    await generate_report(
+        "Certificate Check", result["is_valid"], output=output,
+        screenshot=result["screenshot"] if not result.get("native_capture") else None,
+        panels={{
+            "panel1": result.get("screenshot_site_info"),
+            "panel2": result.get("screenshot_security"),
+            "panel3": result.get("screenshot_cert"),
+        }} if result.get("native_capture") else None,
+    )
     ```
     `check_certificate` uses CDP + direct TLS — no coordinates, no OS-specific UI automation.
 
@@ -1032,12 +1041,18 @@ from src.utils.config import TIMEOUT_TABLE_WAIT_MS
 
 async def run():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+        browser = await p.chromium.launch(
+            headless=False,
+            args=["--start-maximized", "--remote-debugging-port=9223"],
+        )
         context = await browser.new_context(no_viewport=True)
         page    = await context.new_page()
 
         await page.goto({repr(target_url)}, timeout=60000)
         await maybe_login(page)
+        
+        await page.bring_to_front()
+        await asyncio.sleep(1.0)
 
         # check_certificate uses CDP + direct TLS handshake.
         # On Windows (headed) it also captures the native OS popup via
@@ -1059,8 +1074,13 @@ async def run():
         await generate_report(
             {repr(scenario)},
             result["is_valid"],
-            screenshot=result["screenshot"],
+            screenshot=result["screenshot"] if not result.get("native_capture") else None,
             output=output,
+            panels={{
+                "panel1": result.get("screenshot_site_info"),
+                "panel2": result.get("screenshot_security"),
+                "panel3": result.get("screenshot_cert"),
+            }} if result.get("native_capture") else None,
         )
         await browser.close()
 

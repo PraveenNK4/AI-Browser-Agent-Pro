@@ -697,6 +697,26 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
 
     results: dict = {}
 
+    def _safe_text(ctrl):
+        try:
+            t = getattr(ctrl, "window_text", None)
+            if not t: return ""
+            val = t() if callable(t) else t
+            return str(val or "").strip()
+        except Exception:
+            return ""
+
+    def _safe_aid(ctrl):
+        try:
+            a = getattr(ctrl, "automation_id", None)
+            if a is None and hasattr(ctrl, "element_info"):
+                a = getattr(ctrl.element_info, "automation_id", None)
+            if not a: return ""
+            val = a() if callable(a) else a
+            return str(val or "").strip()
+        except Exception:
+            return ""
+
     # ── Helper: screenshot a rectangle from screen ───────────────────────────
     def _shot(left, top, width, height) -> bytes:
         if width <= 0 or height <= 0:
@@ -795,7 +815,7 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                 except Exception:
                     win = all_wins[0]
                 print(f"[native] ⚠️ No match — using largest window: "
-                      f"'{(win.window_text() or '')[:50]}'")
+                      f"'{_safe_text(win)[:50]}'")
 
         except Exception as e:
             print(f"[native] Window search failed: {e}")
@@ -824,54 +844,31 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
             if btn.exists(timeout=0.5):
                 lock_btn = btn
                 print(f"[native] Lock button by AutomationId='{aid}'  "
-                      f"Name='{btn.window_text()}'")
+                      f"Name='{_safe_text(btn)}'")
                 break
         except Exception:
             continue
 
-    # Pass 2: Name / title match
-    if lock_btn is None:
-        for name in ("View site information", "Connection is secure",
-                     "Connection not secure", "Not secure",
-                     "Your connection to this site is not secure"):
-            try:
-                btn = win.child_window(title_re=f".*{name}.*")
-                if btn.exists(timeout=0.5):
-                    lock_btn = btn
-                    print(f"[native] Lock button by Name~='{name}'")
-                    break
-            except Exception:
-                continue
-
-    # Pass 3: Scan ALL descendants for anything that looks like a lock/security button
-    # The lock icon sits left of the address bar in Chrome's toolbar
+    # Pass 2: Fast descendant scan by control type
     if lock_btn is None:
         try:
-            print("[native] Scanning all descendants for lock button...")
-            for ctrl in win.descendants():
-                try:
-                    name = (ctrl.window_text() or "").lower()
-                    aid  = (getattr(ctrl, "automation_id", None) or
-                            ctrl.element_info.automation_id or "").lower()
-                    ctrl_type = ctrl.element_info.control_type or ""
-                    # Look for anything mentioning site info, security, or connection
-                    if any(kw in name for kw in
-                           ("site information", "connection", "secure", "not secure",
-                            "certificate", "lock")):
-                        lock_btn = ctrl
-                        print(f"[native] Lock button by scan: name='{ctrl.window_text()}' "
-                              f"auto_id='{aid}' type='{ctrl_type}'")
-                        break
-                    if any(kw in aid for kw in
-                           ("security", "site-info", "location-icon", "page-info",
-                            "lock", "omnibox-icon")):
-                        lock_btn = ctrl
-                        print(f"[native] Lock button by AutomId scan: '{aid}'")
-                        break
-                except Exception:
-                    continue
+            print("[native] Scanning Button descendants for lock icon...")
+            for btn in win.descendants(control_type="Button"):
+                name = _safe_text(btn).lower()
+                aid  = _safe_aid(btn).lower()
+                
+                if any(kw in name for kw in ("view site information", "connection is secure", 
+                                             "connection not secure", "not secure", "certificate")):
+                    lock_btn = btn
+                    print(f"[native] Lock button found by Name: '{name}'")
+                    break
+                if any(kw in aid for kw in ("security", "site-info", "location-icon", 
+                                            "page-info", "lock", "omnibox-icon")):
+                    lock_btn = btn
+                    print(f"[native] Lock button found by AutomationId: '{aid}'")
+                    break
         except Exception as e:
-            print(f"[native] Descendant scan failed: {e}")
+            print(f"[native] Button descendant scan failed: {e}")
 
     if lock_btn is None:
         print("[native] ❌ Lock icon not found after 3 passes — dumping toolbar buttons:")
@@ -880,8 +877,8 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                 try:
                     ct = ctrl.element_info.control_type or ""
                     if "Button" in ct:
-                        aid = ctrl.element_info.automation_id or ""
-                        nm  = ctrl.window_text() or ""
+                        aid = _safe_aid(ctrl)
+                        nm  = _safe_text(ctrl)
                         if aid or nm:
                             print(f"  Button | auto_id='{aid}' name='{nm}'")
                 except Exception:
@@ -905,40 +902,61 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
     time.sleep(0.9)  # wait for popup animation to complete
 
     # ── Helper: find a popup that appeared after a click ─────────────────────
-    def _find_popup(timeout=4.0):
-        """Search desktop for Chrome popup by known class names."""
+    def _find_popup(timeout=4.5):
+        """Search desktop for Chrome site-info/security popup.
+
+        Two strategies:
+          A) Child of the known browser window (agent mode — most reliable)
+          B) Any Chrome_WidgetWin_1 on desktop that is smaller than a real browser
+             (standalone script mode — browser window found via omnibox, not PID)
+        """
         from pywinauto import Desktop
         desktop = Desktop(backend="uia")
         deadline = time.time() + timeout
         popup_classes = (
             "BubbleFrameView", "PageInfoBubbleView", "PageInfoView",
-            "BubbleContentsView", "BubbleContents", "Widget",
-            "Chrome_RenderWidgetHostHWND",
+            "BubbleContentsView", "BubbleContents",
         )
+
+        # Record main window size so we can exclude it from size-based search
+        try:
+            main_rect = win.rectangle()
+            main_w = main_rect.right - main_rect.left
+            main_h = main_rect.bottom - main_rect.top
+        except Exception:
+            main_w, main_h = 9999, 9999
+
         while time.time() < deadline:
-            # Search as child of browser window first
+            # ── Strategy A: child of browser window ──────────────────────────
             for cls in popup_classes:
                 try:
                     p = win.child_window(class_name=cls, found_index=0)
-                    if p.exists(timeout=0.2):
+                    if p.exists(timeout=0.25):
                         print(f"[native] Popup found as child: class='{cls}'")
                         return p
                 except Exception:
                     pass
-            # Search all top-level windows for something new
+
+            # ── Strategy B: new small Chrome window on desktop ────────────────
             try:
-                all_wins = desktop.windows(class_name="Chrome_WidgetWin_1")
-                for w in all_wins:
-                    title = w.window_text() or ""
-                    rect  = w.rectangle()
-                    # Popups are smaller than the main window and have no/short title
-                    width = rect.right - rect.left
-                    height = rect.bottom - rect.top
-                    if 100 < width < 700 and 100 < height < 900:
-                        print(f"[native] Popup found as small window: '{title[:40]}' {width}x{height}")
-                        return w
+                for w in desktop.windows(class_name="Chrome_WidgetWin_1"):
+                    try:
+                        rect  = w.rectangle()
+                        width  = rect.right  - rect.left
+                        height = rect.bottom - rect.top
+                        # Must be smaller than main window AND smaller than 750px wide
+                        # Chrome site-info popup: ~420×274, security: ~420×310
+                        if (width < main_w - 50 and height < main_h - 50
+                                and 80 < width < 800 and 80 < height < 1000):
+                            title = _safe_text(w)
+                            print(f"[native] Popup found as small window: "
+                                  f"'{title[:40]}' {width}×{height}")
+                            return w
+                    except Exception:
+                        continue
             except Exception:
                 pass
+
             time.sleep(0.15)
         return None
 
@@ -955,16 +973,16 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
 
     # ── Step 4: Click "Connection is/not secure" row → Panel 2 ───────────────
     sec_btn = None
-    for name in ("Connection is secure", "Connection not secure",
-                 "Not secure", "Secure", "Your connection to"):
-        try:
-            b = popup1.child_window(title_re=f".*{name}.*")
-            if b.exists(timeout=0.5):
-                sec_btn = b
+    try:
+        items = popup1.descendants(control_type="Button") + popup1.descendants(control_type="ListItem")
+        for item in items:
+            name = _safe_text(item).lower()
+            if any(kw in name for kw in ("connection is secure", "connection not secure", "not secure", "your connection to")):
+                sec_btn = item
                 print(f"[native] Security row found: '{name}'")
                 break
-        except Exception:
-            continue
+    except Exception as e:
+        print(f"[native] Security row scan failed: {e}")
 
     if sec_btn is None:
         # Try any clickable item that isn't the close button
@@ -973,7 +991,7 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
             if not items:
                 items = popup1.children(control_type="Button")
             for item in items:
-                if "close" not in (item.window_text() or "").lower():
+                if "close" not in _safe_text(item).lower():
                     sec_btn = item
                     break
         except Exception:
@@ -1001,16 +1019,16 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
 
             # ── Step 5: Click "Certificate is valid" → Panel 3 ───────────────
             cert_btn = None
-            for name in ("Certificate is valid", "Certificate is not valid",
-                         "Certificate", "cert"):
-                try:
-                    b = popup2.child_window(title_re=f".*{name}.*")
-                    if b.exists(timeout=0.5):
-                        cert_btn = b
+            try:
+                items = popup2.descendants(control_type="Button") + popup2.descendants(control_type="ListItem")
+                for item in items:
+                    name = _safe_text(item).lower()
+                    if "certificate" in name or "cert" in name:
+                        cert_btn = item
                         print(f"[native] Cert row found: '{name}'")
                         break
-                except Exception:
-                    continue
+            except Exception as e:
+                print(f"[native] Cert row scan failed: {e}")
 
             if cert_btn:
                 try:
@@ -1030,8 +1048,8 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                 while time.time() < deadline3:
                     try:
                         for w in desktop3.windows(class_name="Chrome_WidgetWin_1"):
-                            title = w.window_text() or ""
-                            if "cert" in title.lower():
+                            title = _safe_text(w).lower()
+                            if "cert" in title:
                                 popup3 = w
                                 print(f"[native] Panel 3 found: '{title[:50]}'")
                                 break
@@ -1572,8 +1590,15 @@ async def generate_report(
     status: bool,
     screenshot=None,
     output: str = None,
+    panels: dict = None,
 ) -> None:
-    """Print extracted data and save a .docx report in the script's directory."""
+    """Print extracted data and save a .docx report in the script's directory.
+
+    When `panels` dict is supplied (native capture mode), each panel is saved as
+    a separate PNG: certificate_panel1_<ts>.png, panel2, panel3.
+    When only `screenshot` is provided (HTML fallback), it is saved as a single PNG.
+    Both modes embed all images in the DOCX.
+    """
     from datetime import datetime
     from docx import Document
 
@@ -1592,12 +1617,6 @@ async def generate_report(
         script_dir = os.path.dirname(caller_script)
         report_path = os.path.join(script_dir, f"report_{timestamp}.docx")
 
-        # Save screenshot as standalone PNG so it's visible outside the docx
-        if screenshot:
-            png_path = os.path.join(script_dir, f"certificate_{timestamp}.png")
-            with open(png_path, "wb") as f:
-                f.write(screenshot)
-            print(f"[+] Certificate screenshot saved: {png_path}")
 
         doc = Document()
         doc.add_heading(f"Report: {scenario}", 0)
@@ -1605,8 +1624,32 @@ async def generate_report(
         doc.add_paragraph(f"Status: {'SUCCESS' if status else 'FAILED'}")
         if output:
             doc.add_paragraph(f"Output:\n{output}")
-        if screenshot:
+
+        # ── Native panels: save each as a separate PNG and embed in DOCX ────
+        if panels and any(panels.get(k) for k in ("panel1", "panel2", "panel3")):
+            panel_labels = {
+                "panel1": "Site Info",
+                "panel2": "Connection Security",
+                "panel3": "Certificate Viewer",
+            }
+            for key, label in panel_labels.items():
+                png_bytes = panels.get(key)
+                if not png_bytes:
+                    continue
+                png_path = os.path.join(script_dir, f"certificate_{key}_{timestamp}.png")
+                with open(png_path, "wb") as f:
+                    f.write(png_bytes)
+                print(f"[+] Panel '{label}' saved: {png_path}")
+                doc.add_heading(label, level=2)
+                doc.add_picture(io.BytesIO(png_bytes))
+        elif screenshot:
+            # HTML fallback: single composite PNG
+            png_path = os.path.join(script_dir, f"certificate_{timestamp}.png")
+            with open(png_path, "wb") as f:
+                f.write(screenshot)
+            print(f"[+] Certificate screenshot saved: {png_path}")
             doc.add_picture(io.BytesIO(screenshot))
+
         doc.save(report_path)
         print(f"[+] Report saved: {report_path}")
     except Exception as e:
