@@ -467,6 +467,6 @@ async def capture_dom_snapshot(page: Page, reason: str, action_params: Dict[str,
         with open(snapshot_path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, ensure_ascii=True, indent=2)
 
-        logger.info("DOM snapshot stored", extra={"snapshot_path": snapshot_path, "reason": reason, "step_index": step_index})
+        logger.debug("DOM snapshot stored", extra={"snapshot_path": snapshot_path, "reason": reason, "step_index": step_index})
     except Exception as exc:  # pragma: no cover
         logger.warning(f"Failed to capture DOM snapshot: {exc}")

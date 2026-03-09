@@ -15,6 +15,7 @@ import uuid
 import builtins
 from datetime import datetime
 from src.utils.utils import slugify
+from src.utils.chrome_frame import apply_chrome_frame, build_chrome_frame_html, get_page_metadata
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from browser_use.agent.views import AgentHistoryList, AgentOutput
@@ -219,11 +220,33 @@ async def _handle_new_step(
     step_tokens = current_tokens - webui_manager.bu_previous_tokens
     webui_manager.bu_previous_tokens = current_tokens
 
-    # Screenshot
+    # Screenshot — apply Chrome frame when headless
     screenshot_html = ""
     screenshot_data = getattr(state, "screenshot", None)
     if screenshot_data and isinstance(screenshot_data, str) and len(screenshot_data) > 100:
-        img_tag = f'<img src="data:image/jpeg;base64,{screenshot_data}" style="max-width:800px;max-height:600px;object-fit:contain;" />'
+        # Apply Chrome frame if headless
+        _headless = os.getenv("HEADLESS", "false").lower() == "true"
+        if _headless and webui_manager.bu_browser_context:
+            try:
+                _page = await webui_manager.bu_browser_context.get_current_page()
+                _url = _page.url or ""
+                # Skip framing if page is blank or internal
+                if _url and not _url.startswith("about:") and not _url.startswith("chrome:"):
+                    _title = await _page.title() or _url
+                    _vp = _page.viewport_size or {}
+                    _pw_ctx = webui_manager.bu_browser_context.session.context
+                    screenshot_data = await apply_chrome_frame(
+                        browser=_pw_ctx,
+                        screenshot_b64=screenshot_data,
+                        url=_url,
+                        title=_title,
+                        is_secure=_url.startswith("https://"),
+                        page_width=_vp.get("width", 1280),
+                        page_height=_vp.get("height", 900),
+                    )
+            except Exception as _e:
+                logger.debug(f"Chrome frame failed for step screenshot: {_e}")
+        img_tag = f'<img src="data:image/png;base64,{screenshot_data}" style="max-width:800px;max-height:600px;object-fit:contain;" />'
         screenshot_html = img_tag + "<br/>"
 
     # Format output
@@ -756,6 +779,18 @@ Step 2: validate_value(actual=text, expected=value, operator="equals")
 NEVER pass HTML to validate_value. Always retrieve first.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔄 ANTI-LOOPING RULE — CRITICAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+If you tried the SAME action and it FAILED in a previous step:
+  1. Do NOT retry the same action with the same parameters
+  2. Try a DIFFERENT approach (different index, different action)
+  3. If you've failed 2+ times on the same goal → call done() with
+     whatever information you have so far
+  
+NEVER repeat a failed action more than once. Move on or finish.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🚫 extract_content IS BANNED — DO NOT USE IT EVER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 extract_content is FORBIDDEN in ALL tasks. It dumps the entire page as
@@ -1064,7 +1099,26 @@ YOU MUST NOT:
                 try:
                     screenshot_b64 = await webui_manager.bu_browser_context.take_screenshot()
                     if screenshot_b64:
-                        html_content = f'<img src="data:image/jpeg;base64,{screenshot_b64}" style="width:{stream_vw}vw;height:{stream_vh}vh;border:1px solid #ccc;">'
+                        # Apply Chrome frame to live streaming view
+                        try:
+                            _page = await webui_manager.bu_browser_context.get_current_page()
+                            _url = _page.url or ""
+                            if _url and not _url.startswith("about:") and not _url.startswith("chrome:"):
+                                _title = await _page.title() or _url
+                                _vp = _page.viewport_size or {}
+                                _pw_ctx = webui_manager.bu_browser_context.session.context
+                                screenshot_b64 = await apply_chrome_frame(
+                                    browser=_pw_ctx,
+                                    screenshot_b64=screenshot_b64,
+                                    url=_url,
+                                    title=_title,
+                                    is_secure=_url.startswith("https://"),
+                                    page_width=_vp.get("width", 1280),
+                                    page_height=_vp.get("height", 900),
+                                )
+                        except Exception:
+                            pass  # fallback: show raw screenshot without frame
+                        html_content = f'<img src="data:image/png;base64,{screenshot_b64}" style="width:{stream_vw}vw;height:{stream_vh}vh;border:1px solid #ccc;">'
                         update_dict[browser_view_comp] = gr.update(value=html_content, visible=True)
                 except Exception:
                     pass

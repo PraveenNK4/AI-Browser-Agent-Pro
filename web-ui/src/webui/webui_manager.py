@@ -165,7 +165,10 @@ class WebuiManager:
 
     def check_hallucination(self, current_action: Optional[str]) -> bool:
         """
-        Detect hallucination: same action repeated 3+ times consecutively.
+        Detect hallucination: same core action repeated 3+ times consecutively.
+        
+        Normalizes actions by extracting the key action name + args,
+        ignoring padding actions like scroll_page, wait, etc.
         
         Args:
             current_action: The current action being taken
@@ -178,15 +181,23 @@ class WebuiManager:
             self.bu_repeated_action_count = 0
             return False
         
-        # Check if action is the same as last action
-        if current_action == self.bu_last_action:
+        # Normalize: extract core action signature for comparison
+        # This strips noise like scroll_page padding that makes actions look different
+        import re
+        _noise = r'(scroll_page|wait|sleep)\([^)]*\),?\s*'
+        normalized = re.sub(_noise, '', current_action).strip().rstrip(',')
+        if not normalized:
+            normalized = current_action  # fallback if all actions were noise
+        
+        # Check if core action is the same as last action
+        if normalized == self.bu_last_action:
             self.bu_repeated_action_count += 1
         else:
-            self.bu_last_action = current_action
+            self.bu_last_action = normalized
             self.bu_repeated_action_count = 1
         
-        # If same action repeated 5+ times, it's hallucination
-        if self.bu_repeated_action_count >= 5:
+        # If same action repeated 3+ times, it's hallucination
+        if self.bu_repeated_action_count >= 3:
             self.bu_hallucination_triggered = True
             return True
         

@@ -119,6 +119,19 @@ logger = logging.getLogger(__name__)
 
 class CustomBrowser(Browser):
 
+    _setup_lock = None
+
+    async def get_playwright_browser(self):
+        """Override to make browser initialization thread-safe"""
+        if self._setup_lock is None:
+            self._setup_lock = asyncio.Lock()
+            
+        async with self._setup_lock:
+            if self.playwright_browser is None:
+                self.playwright = await async_playwright().start()
+                self.playwright_browser = await self._setup_builtin_browser(self.playwright)
+            return self.playwright_browser
+
     async def new_context(self, config: BrowserContextConfig | None = None) -> CustomBrowserContext:
         """Create a browser context"""
         # Only pass the context config, not merged with browser config
@@ -140,7 +153,8 @@ class CustomBrowser(Browser):
                                 # Check if this is our browser by looking for remote debugging port
                                 cmdline = proc.info.get('cmdline', [])
                                 if cmdline and any('remote-debugging-port' in str(arg) for arg in cmdline):
-                                    logger.info(f"Force killing Chrome process: PID {proc.info['pid']}")
+                                    if 'pid' in proc.info:
+                                        logger.debug(f"Force killing Chrome process: PID {proc.info['pid']}")
                                     proc.kill()
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass

@@ -217,10 +217,11 @@ class CustomController(Controller):
                         value = svg_data.strip()
 
                 return ActionResult(
-                    extracted_content={"index": index, "value": value},
+                    extracted_content=value,
                     include_in_memory=True,
                 )
             except Exception as e:
+                logger.error(f"Error in retrieve_value_by_element (index {index}): {e}", exc_info=True)
                 return ActionResult(error=str(e))
 
         @self.registry.action(
@@ -1239,33 +1240,7 @@ class CustomController(Controller):
                 except Exception:
                     pass
 
-            # Credential substitution
-            def substitute_sensitive_data(params: dict, sensitive_data: Optional[Dict[str, str]]) -> dict:
-                if not sensitive_data:
-                    return params
-                
-                def substitute_in_value(value):
-                    """Recursively substitute sensitive data in nested structures"""
-                    if isinstance(value, str):
-                        # Replace all placeholders in string values
-                        for s_key, s_val in sensitive_data.items():
-                            if s_key in value:
-                                value = value.replace(s_key, s_val)
-                        return value
-                    elif isinstance(value, dict):
-                        # Recursively process nested dictionaries
-                        return {k: substitute_in_value(v) for k, v in value.items()}
-                    elif isinstance(value, list):
-                        # Recursively process lists
-                        return [substitute_in_value(v) for v in value]
-                    else:
-                        # Return non-string, non-container values as-is
-                        return value
-                
-                new_params = {}
-                for key, value in params.items():
-                    new_params[key] = substitute_in_value(value)
-                return new_params
+
 
             result_obj: ActionResult | None = None
             executed_action_name: str | None = None
@@ -1287,9 +1262,9 @@ class CustomController(Controller):
                     except Exception as snap_exc:  # pragma: no cover
                         logger.debug(f"DOM snapshot before action skipped: {snap_exc}")
 
+                # Sensitive data inside params (formatted as <secret>KEY</secret>)
+                # will be automatically resolved by self.registry.execute_action
                 data_to_use = sensitive_data or self.sensitive_data
-                if data_to_use:
-                    params = substitute_sensitive_data(params, data_to_use)
 
                 # Auto-convert click_element_by_index to safe_check_and_click for checkbox/radio
                 # Conversion triggers if EITHER (a) goal mentions checking status of radio/checkbox/toggle AND element is radio/checkbox

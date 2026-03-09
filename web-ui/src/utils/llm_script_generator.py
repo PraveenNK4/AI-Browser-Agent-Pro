@@ -490,7 +490,169 @@ def _extract_table_hints(cleaned_history_json: str):
     if best_selector or best_required:
         return best_selector, best_required, target_url
 
+    # ── Fallback: scan comprehensive element data files ──
+    elem_selector, elem_url = _scan_element_data_files(target_url)
+    if elem_selector:
+        logger.info(f"[TABLE HINTS] Using selector from element capture data: {elem_selector}")
+        return elem_selector, best_required, target_url or elem_url
+
     return None, None, target_url
+
+
+def _scan_element_data_files(target_url: str = None) -> tuple:
+    """Scan tmp/element_data/*.json for real selectors captured during the agent run.
+    
+    Looks for elements inside table structures (td/tr/tbody ancestors) and
+    builds a CSS selector from the nearest ancestor with an ID.
+    
+    Returns: (table_selector, page_url) or (None, None)
+    """
+    elem_dir = Path("tmp/element_data")
+    if not elem_dir.exists():
+        return None, None
+    
+    best_selector = None
+    best_url = None
+    best_stability = -1
+    
+    for fpath in sorted(elem_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                edata = json.load(f)
+        except Exception:
+            continue
+        
+        page_url = edata.get("metadata", {}).get("page_url", "")
+        
+        # If target_url is known, prefer elements from matching pages
+        if target_url and page_url:
+            from urllib.parse import urlparse
+            t_host = urlparse(target_url).hostname or ""
+            e_host = urlparse(page_url).hostname or ""
+            if t_host and e_host and t_host != e_host:
+                continue
+        
+        # Look for table-related ancestors in parentChain
+        parent_chain = edata.get("parentChain", [])
+        has_table_ancestor = any(
+            p.get("tag") in ("td", "tr", "tbody", "table", "thead")
+            for p in parent_chain
+        )
+        if not has_table_ancestor:
+            continue
+        
+        # Find nearest ancestor with an ID → build table selector
+        file_candidate = None
+        file_stability = -1
+
+        for parent in parent_chain:
+            pid = parent.get("id")
+            if pid:
+                # Skip login and layout-related containers
+                pid_lower = pid.lower()
+                ignore_kws = ("login", "signin", "sign-in", "otds", "auth", "password", "menu", "nav", "header", "sidebar", "footer", "toolbar")
+                if any(kw in pid_lower for kw in ignore_kws):
+                    continue
+                file_candidate = f"#{pid} table"
+                # Use stability of the element's recommended selector as tie-breaker
+                rec = edata.get("recommendedSelector", {})
+                file_stability = rec.get("stability", 50) if isinstance(rec, dict) else 50
+                break
+        
+        # Also check xpath for table container IDs if parent chain didn't yield a good candidate
+        if not file_candidate:
+            for sel_entry in edata.get("selectors", []):
+                if sel_entry.get("type") == "xpath":
+                    xpath = sel_entry.get("selector", "")
+                    # Extract @id from xpath like //*[@id="admin-servers"]/table[1]/...
+                    id_match = re.search(r'@id="([^"]+)"', xpath)
+                    if id_match:
+                        pid = id_match.group(1)
+                        pid_lower = pid.lower()
+                        ignore_kws = ("login", "signin", "sign-in", "otds", "auth", "password", "menu", "nav", "header", "sidebar", "footer", "toolbar")
+                        if not any(kw in pid_lower for kw in ignore_kws):
+                            file_candidate = f"#{pid} table"
+                            file_stability = 45  # Slightly lower confidence than a direct parent ID
+                        break
+
+        # Apply a massive stability boost if this element was captured during a data extraction action
+        # This prevents generic navigation menus (which the agent clicks) from outranking the actual data table
+        action_context = edata.get("metadata", {}).get("action_context", "").lower()
+        if "retrieve" in action_context or "extract" in action_context:
+            file_stability += 100
+            
+        # Penalize empty structural tables
+        if not edata.get("textContent", "").strip():
+            file_stability -= 50
+
+        # If this file yielded a candidate, compare it against the global best
+        if file_candidate and file_stability > best_stability:
+            best_selector = file_candidate
+            best_url = page_url
+            best_stability = file_stability
+    
+    return best_selector, best_url
+
+
+def _build_element_data_context() -> str:
+    """Build a concise summary of captured element data for the LLM prompt.
+    
+    Returns a formatted string summarizing real selectors, parent structure,
+    and page URLs from tmp/element_data/*.json files.
+    """
+    elem_dir = Path("tmp/element_data")
+    if not elem_dir.exists():
+        return ""
+    
+    summaries = []
+    seen_hashes = set()
+    
+    for fpath in sorted(elem_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                edata = json.load(f)
+        except Exception:
+            continue
+        
+        ehash = edata.get("elementHash", "")
+        if ehash in seen_hashes:
+            continue
+        seen_hashes.add(ehash)
+        
+        tag = edata.get("tagName", "?")
+        text = (edata.get("textContent") or "")[:60]
+        url = edata.get("metadata", {}).get("page_url", "")
+        action = edata.get("metadata", {}).get("action_context", "")
+        
+        # Get best selector
+        rec = edata.get("recommendedSelector", {})
+        sel = rec.get("selector", "") if isinstance(rec, dict) else ""
+        
+        # Get parent container with ID
+        container = ""
+        for parent in edata.get("parentChain", []):
+            pid = parent.get("id")
+            if pid:
+                container = f"#{pid}"
+                break
+        
+        parts = [f'- <{tag}> "{text}"']
+        if sel:
+            parts.append(f"  Selector: {sel}")
+        if container:
+            parts.append(f"  Container: {container} table")
+        if url:
+            parts.append(f"  Page: {url}")
+        if action:
+            parts.append(f"  Action: {action}")
+        
+        summaries.append("\n".join(parts))
+    
+    if not summaries:
+        return ""
+    
+    return "\n\nCAPTURED ELEMENT DATA (real selectors from the page — use these instead of guessing):\n" + "\n".join(summaries)
+
 
 def _is_login_selector(sel: str) -> bool:
     """Return True if a selector looks like a login-form field, not a data table."""
@@ -525,6 +687,7 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
      11. Strip redundant manual login steps that duplicate maybe_login.
     """
     selector, required, process_url = _extract_table_hints(cleaned_history_json)
+    elem_selector, _ = _scan_element_data_files(process_url)
 
     # ── 0: Merge duplicate run() blocks ──────────────────────────────────────
     # When mandatory + process scripts are concatenated, two full script blocks
@@ -736,26 +899,39 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
     # ── 3: Rewrite wrong/login-field table selectors ──────────────────────────
     def _should_replace(sel_str: str) -> bool:
         s = sel_str.strip().strip('"\'')
-        return s == "table" or _is_login_selector(s)
+        # Replace if it's explicitly bad (e.g., bare table or login)
+        if s == "table" or _is_login_selector(s):
+            return True
+        # If we have a great fallback elem_selector, and the LLM chose a selector that
+        # isn't a container (e.g. 'a:has-text(...)'), we should force the container selector.
+        if elem_selector and not any(tag in s.lower() for tag in ['table', 'tr', 'tbody', 'thead', '#']):
+            logger.info(f"[POST] LLM selector '{s}' lacks container context. Forcing '{elem_selector}'.")
+            return True
+        return False
 
-    if selector:
-        sel_literal = json.dumps(selector)
+    final_selector = elem_selector if (elem_selector and selector and _should_replace(selector)) else selector
+
+    if final_selector:
+        sel_literal = json.dumps(final_selector)
+
+        # Regex to match any Python string literal cleanly: (["'])(?:(?=(\\?))\2.)*?\1
+        _str_regex = r'(["\'])(?:(?=(\\?))\2.)*?\1'
 
         def _fix_wait(m):
             return f'page.wait_for_selector({sel_literal}' if _should_replace(m.group(1)) else m.group(0)
-        code = re.sub(r'page\.wait_for_selector\((["\'][^"\']+["\'])', _fix_wait, code)
+        code = re.sub(rf'page\.wait_for_selector\({_str_regex}', _fix_wait, code)
 
         def _fix_extract(m):
             return f'resilient_extract_table(page, {sel_literal}' if _should_replace(m.group(1)) else m.group(0)
-        code = re.sub(r'resilient_extract_table\(\s*page\s*,\s*(["\'][^"\']+["\'])', _fix_extract, code)
+        code = re.sub(rf'resilient_extract_table\(\s*page\s*,\s*{_str_regex}', _fix_extract, code)
 
         def _fix_table_var(m):
             return f'table_selector = {sel_literal}' if _should_replace(m.group(1)) else m.group(0)
-        code = re.sub(r'table_selector\s*=\s*(["\'][^"\']+["\'])', _fix_table_var, code)
+        code = re.sub(rf'table_selector\s*=\s*{_str_regex}', _fix_table_var, code)
 
         def _fix_locator(m):
             return f'page.locator({sel_literal}' if _should_replace(m.group(1)) else m.group(0)
-        code = re.sub(r'page\.locator\((["\'][^"\']+["\'])', _fix_locator, code)
+        code = re.sub(rf'page\.locator\({_str_regex}', _fix_locator, code)
 
     # ── 4: Inject required columns (with identity key) ────────────────────────
     if required:
@@ -971,8 +1147,16 @@ def _postprocess_generated_code(code: str, cleaned_history_json: str) -> str:
     # If history has a target URL (with query params, not a login page) and the
     # script never navigates there, inject a goto BEFORE the first table wait.
     if process_url and "await maybe_login(page)" in code:
-        # Check if the process URL is already in a goto call
-        if process_url not in code:
+        # Check if the process URL (or same host) is already in a goto call
+        from urllib.parse import urlparse as _urlparse
+        _proc_host = _urlparse(process_url).hostname or ""
+        # Check if any existing goto targets the same host
+        _existing_gotos = re.findall(r'page\.goto\(["\']([^"\']+)["\']', code)
+        _already_navigates = any(
+            _proc_host and _proc_host == (_urlparse(g).hostname or "")
+            for g in _existing_gotos
+        )
+        if not _already_navigates and process_url not in code:
             # Find the first wait_for_selector AFTER maybe_login and insert goto before it
             lines = code.splitlines(keepends=True)
             past_login, injected = False, False
@@ -1188,10 +1372,18 @@ def generate_script(history_path: str, output_path: str = None, model_name: str 
             num_ctx=SCRIPT_GEN_NUM_CTX,
         )
         
+        # Build element data context from captured elements
+        element_context = _build_element_data_context()
+        
         # Create Prompt
+        user_prompt = f"Task Objective: {objective or 'Complete the automation task'}\n\nGenerate a Playwright script for the following execution history (Run ID: {run_id}):\n\n{cleaned_history}"
+        if element_context:
+            user_prompt += element_context
+            logger.info(f"[PROMPT] Injected {element_context.count(chr(10))} lines of captured element data into LLM prompt")
+        
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"Task Objective: {objective or 'Complete the automation task'}\n\nGenerate a Playwright script for the following execution history (Run ID: {run_id}):\n\n{cleaned_history}")
+            HumanMessage(content=user_prompt)
         ]
         
         # Generate with OOM retry fallback (spec §3.G)
