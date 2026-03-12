@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 load_dotenv()
 import argparse
 from src.webui.interface import theme_map, create_ui
+import warnings
+warnings.filterwarnings("ignore", category=ResourceWarning)
 
 
 def main():

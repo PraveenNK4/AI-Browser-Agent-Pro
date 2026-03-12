@@ -21,9 +21,9 @@ SCRIPT_GEN_PROVIDER = os.getenv("SCRIPT_GEN_PROVIDER", os.getenv("LLM_PROVIDER",
 # Temperature used when generating Playwright scripts (lower = more deterministic)
 SCRIPT_GEN_TEMPERATURE = float(os.getenv("SCRIPT_GEN_TEMPERATURE", "0.1"))
 # Context window size (tokens) passed to the generation model
-SCRIPT_GEN_NUM_CTX = int(os.getenv("SCRIPT_GEN_NUM_CTX", "32000"))
+SCRIPT_GEN_NUM_CTX = int(os.getenv("SCRIPT_GEN_NUM_CTX", "8192"))
 # num_predict token limit for generation (-1 = unlimited)
-SCRIPT_GEN_NUM_PREDICT = int(os.getenv("SCRIPT_GEN_NUM_PREDICT", "-1"))
+SCRIPT_GEN_NUM_PREDICT = int(os.getenv("SCRIPT_GEN_NUM_PREDICT", "2000"))
 
 # ---------------------------------------------------------------------------
 # Script Generator – OOM fallback chain

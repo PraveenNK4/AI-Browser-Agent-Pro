@@ -16,6 +16,7 @@ src.utils.config so they can be changed via environment variables.
 """
 
 import io
+import json
 import os
 import re
 import sys
@@ -220,95 +221,302 @@ async def resilient_extract_table(
     header_keywords: list,
     skip_boilerplate: list = None,
 ) -> list:
-    """Extract structured rows from a scoped table element.
+    """Extract structured rows from the best-matching table on the page.
+
+    IMPLEMENTATION STRATEGY — single JS round-trip:
+    =================================================
+    All previous approaches made one Playwright call per row/cell (100+ async
+    round-trips for a 30-row table).  This version does everything in ONE
+    page.evaluate() call:
+
+      1. Collect candidate tables:
+         - If table_selector is a CSS selector that matches a specific element
+           (e.g. "#admin-servers table"), use that element + its descendants.
+         - If selector is bare "table", scan ALL tables on the page via
+           document.querySelectorAll('table') — finds the data table even when
+           it's a sibling of layout tables, not a descendant.
+
+      2. Score each candidate by header quality:
+         - Find the first row where ALL requested keywords land on distinct
+           columns (no two keywords share a column — that would be a blob row).
+         - Score = keywords_matched × (th_bonus=10 or 1) + 50 if all matched.
+         - Best-scoring table wins.
+
+      3. Extract data rows from the winning table:
+         - Read only :scope > td / :scope > th (direct children only) to avoid
+           inheriting text from nested tables.
+         - Images: use img[title] text.
+         - Skip the header row, blank rows, and rows that only repeat header text.
+
+      4. Identity column:
+         - Auto-detect a column whose header contains server/name/host/node/agent.
+         - If the identity keyword IS in header_keywords (e.g. "Name"), promote
+           that column — it was previously skipped because it was already in
+           col_map.values().
+         - Write both row["Server"] and row["Name"] so the report chain
+           `r.get('Server') or r.get('Name')` always finds a value.
 
     Args:
         page:             Playwright page object.
-        table_selector:   CSS/XPath selector pointing to the <table> (or container).
+        table_selector:   CSS selector for the table or its container.
         header_keywords:  Column names to extract (matched case-insensitively).
-        skip_boilerplate: Row text patterns to skip (nav rows, headers, etc.).
+        skip_boilerplate: Extra row text patterns to skip (pass [] to disable).
 
     Returns:
-        List of dicts, one per data row, keyed by header_keywords.
-
-    Raises:
-        RuntimeError: If table_selector is not found on page or in any iframe.
+        List of dicts keyed by header_keywords plus "Server" and "Name".
     """
-    table = await find_in_frames(page, table_selector)
-    if not table:
-        raise RuntimeError(f"Table selector not found: {table_selector!r}")
+    # ── Build the JS extraction script ─────────────────────────────────────
+    id_kws_js   = json.dumps(["server", "name", "host", "node", "entity", "admin", "agent"])
+    keywords_js = json.dumps([k.lower() for k in header_keywords])
+    skip_js     = json.dumps([s.lower() for s in (skip_boilerplate or [])])
+    orig_kws_js = json.dumps(header_keywords)   # original casing for output keys
 
-    rows = await table.locator("tr").all()
+    JS = f"""
+    (function() {{
+        const keywords    = {keywords_js};
+        const origKws     = {orig_kws_js};
+        const idKws       = {id_kws_js};
+        const skipPat     = {skip_js};
+        const selector    = {json.dumps(table_selector)};
 
-    # If too few rows in main page, search iframes
-    if len(rows) < 3:
-        for frame in page.frames:
-            try:
-                f_table = frame.locator(table_selector).first
-                if await f_table.count() > 0:
-                    f_rows = await f_table.locator("tr").all()
-                    if len(f_rows) > len(rows):
-                        rows = f_rows
-            except Exception:
-                continue
+        // ── 1. Collect candidate tables ───────────────────────────────────
+        let candidates = [];
+        if (selector === 'table') {{
+            candidates = Array.from(document.querySelectorAll('table'));
+        }} else {{
+            const root = document.querySelector(selector);
+            if (root) {{
+                const tables = Array.from(root.querySelectorAll('table'));
+                candidates = (root.tagName === 'TABLE') ? [root, ...tables] : tables;
+                if (candidates.length === 0) candidates = [root];
+            }}
+            
+            // Safety: if selector didn't find anything, or finds empty results later,
+            // we'll eventually allow a full-page retry. 
+            // For now, if root is null, start with all tables immediately.
+            if (!root) {{
+                candidates = Array.from(document.querySelectorAll('table'));
+            }}
+        }}
 
-    print(f"[*] Analysing {len(rows)} rows in {table_selector!r}...")
+        // ── Helper: direct-child cells only ──────────────────────────────
+        function cells(tr) {{
+            return Array.from(tr.querySelectorAll(':scope > td, :scope > th')).map(td => {{
+                const img = td.querySelector('img[title]');
+                return img ? img.getAttribute('title') : (td.innerText || '').trim();
+            }});
+        }}
 
-    # Resolve column indices from header row(s)
-    col_map = {kw: -1 for kw in header_keywords}
-    for i in range(min(20, len(rows))):
-        cells = await rows[i].locator("th, td").all()
-        if len(cells) < len(header_keywords):
+        // ── 2. Score each candidate and pick the best ─────────────────────
+        let bestScore = -1, bestTable = null, bestHdrIdx = -1, bestColMap = null;
+
+        for (const tbl of candidates) {{
+            const trs = Array.from(tbl.querySelectorAll(':scope > tbody > tr, :scope > tr'))
+                         .concat(Array.from(tbl.querySelectorAll(':scope > thead > tr')));
+            // deduplicate preserving order
+            const seen = new Set(); const rows = [];
+            for (const r of trs) {{ if (!seen.has(r)) {{ seen.add(r); rows.push(r); }} }}
+
+            for (let i = 0; i < Math.min(rows.length, 25); i++) {{
+                const txts = cells(rows[i]);
+                if (!txts.length) continue;
+
+                // Map each keyword to the first column whose text contains it
+                const cm = {{}};
+                for (const kw of keywords) {{
+                    const idx = txts.findIndex(t => t.toLowerCase().includes(kw));
+                    cm[kw] = idx;  // -1 if not found
+                }}
+                const resolved = Object.values(cm).filter(v => v >= 0);
+                // Reject blob rows (two keywords on same col)
+                if (new Set(resolved).size !== resolved.length) continue;
+
+                const hasTh = rows[i].querySelector(':scope > th') !== null;
+                let score = resolved.length * (hasTh ? 10 : 1);
+                
+                // Bonus for perfect match, penalty for missing keys
+                if (resolved.length === keywords.length) {{
+                    score += 500; // massive bonus so perfect matches always win
+                }} else {{
+                    score -= 50;  // penalty for partial matches
+                }}
+
+                if (score > bestScore) {{
+                    bestScore = score; bestTable = tbl;
+                    bestHdrIdx = i; bestColMap = cm;
+                }}
+            }}
+        }}
+
+        if (!bestTable || bestScore < 0) {{
+            return {{ error: 'no matching header found', candidates: candidates.length }};
+        }}
+
+        // ── 3. Re-collect rows from winning table (same order as above) ───
+        const allTrs = Array.from(bestTable.querySelectorAll(':scope > tbody > tr, :scope > tr'))
+                        .concat(Array.from(bestTable.querySelectorAll(':scope > thead > tr')));
+        const seenR = new Set(); const winRows = [];
+        for (const r of allTrs) {{ if (!seenR.has(r)) {{ seenR.add(r); winRows.push(r); }} }}
+
+        // ── 4. Determine identity column ──────────────────────────────────
+        const hdrCells = cells(winRows[bestHdrIdx]);
+        const usedCols = new Set(Object.values(bestColMap).filter(v => v >= 0));
+        let identIdx = -1, identName = '';
+
+        // First try: find an identity column not already claimed
+        for (let j = 0; j < hdrCells.length; j++) {{
+            const t = hdrCells[j].toLowerCase();
+            if (idKws.some(k => t.includes(k)) && !usedCols.has(j)) {{
+                identIdx = j; identName = hdrCells[j]; break;
+            }}
+        }}
+        // Fallback: promote a requested keyword that IS an identity key
+        if (identIdx < 0) {{
+            for (const kw of keywords) {{
+                if (idKws.some(k => kw.includes(k)) && bestColMap[kw] >= 0) {{
+                    identIdx = bestColMap[kw]; identName = kw; break;
+                }}
+            }}
+        }}
+
+        const hdrLower = new Set(hdrCells.map(t => t.toLowerCase()).filter(Boolean));
+        const maxCol = Math.max(...Object.values(bestColMap).filter(v => v >= 0),
+                                  identIdx >= 0 ? identIdx : 0);
+
+        // ── 5. Extract data rows ──────────────────────────────────────────
+        const results = [];
+        for (let ri = 0; ri < winRows.length; ri++) {{
+            if (ri === bestHdrIdx) continue;
+            const cv = cells(winRows[ri]);
+            if (cv.length <= maxCol) continue;  // too few cells
+
+            // Skip single-cell or all-same-value rows (dividers, section titles)
+            const nonempty = cv.filter(Boolean);
+            if (cv.length === 1 || (new Set(nonempty).size === 1 && nonempty.length > 1)) continue;
+
+            // Skip rows that just repeat header labels
+            const rowLower = new Set(cv.map(t => t.toLowerCase()).filter(Boolean));
+            if (rowLower.size && [...rowLower].every(t => hdrLower.has(t))) continue;
+
+            // Skip boilerplate
+            const allText = cv.join(' ').toLowerCase();
+            if (skipPat.some(p => allText.includes(p))) continue;
+
+            const row = {{}};
+
+            // Identity
+            if (identIdx >= 0 && identIdx < cv.length) {{
+                const idVal = cv[identIdx];
+                if (idVal && !hdrLower.has(idVal.toLowerCase())) {{
+                    row['Server'] = idVal;
+                    row['Name']   = idVal;
+                    if (identName) row[identName] = idVal;
+                }}
+            }}
+
+            // Requested columns
+            for (let ki = 0; ki < keywords.length; ki++) {{
+                const kw = keywords[ki];
+                const origKw = origKws[ki];
+                const cidx = bestColMap[kw];
+                row[origKw] = (cidx >= 0 && cidx < cv.length && cv[cidx] && cv[cidx] !== 'null')
+                               ? cv[cidx] : '';
+            }}
+
+            if (Object.values(row).some(Boolean)) results.push(row);
+        }}
+
+        return {{
+            rows: results,
+            debug: {{
+                tableCandidates: candidates.length,
+                winningSelector: bestTable.id ? '#' + bestTable.id : bestTable.className || '(table)',
+                headerRow: hdrCells,
+                colMap: bestColMap,
+                identityCol: identName + ' @ col ' + identIdx,
+                score: bestScore,
+            }}
+        }};
+    }})()
+    """
+
+    # ── Run the JS ─────────────────────────────────────────────────────────
+    # Try main frame first; fall back to each iframe if the element lives there.
+    result = None
+    frames_tried = [page]
+    for frame in page.frames:
+        if frame != page.main_frame:
+            frames_tried.append(frame)
+
+    for frame in frames_tried:
+        try:
+            result = await frame.evaluate(JS)
+        except Exception as e:
+            logger.debug(f"[extract] frame evaluate error: {e}")
             continue
-        h_texts = [(await c.inner_text() or "").strip() for c in cells]
-        for kw in header_keywords:
-            if col_map[kw] != -1:
-                continue
-            idx = next(
-                (j for j, txt in enumerate(h_texts) if kw.lower() in txt.lower()), -1
-            )
-            if idx != -1:
-                col_map[kw] = idx
-        if all(v != -1 for v in col_map.values()):
-            print(f"[*] Resolved columns: {col_map}")
+        if result and not result.get("error"):
             break
+        if result and result.get("error") == f"selector not found: {table_selector}":
+            continue  # try next frame
+        break
 
-    _boilerplate = skip_boilerplate or [
-        "Default", "Name", "Description", "Enterprise",
-        "Personal", "Tools", "Status", "Header",
-    ]
-    results = []
-    max_col = max(col_map.values()) if col_map else 0
+    if not result:
+        raise RuntimeError(f"[extract] JS evaluate returned nothing for selector {table_selector!r}")
+    if result.get("error"):
+        raise RuntimeError(f"[extract] {result['error']} (selector={table_selector!r})")
 
-    for row in rows:
-        cells = await row.locator("td").all()
-        if len(cells) <= max_col:
-            continue
-        all_text = " ".join([(await c.inner_text() or "").strip() for c in cells])
-        if any(b in all_text for b in _boilerplate):
-            continue
+async def resilient_menu_click(page, row_text: str) -> bool:
+    """Ultra-robust click on a row's function menu (hotspot/dropdown).
+    
+    Finds the element containing row_text, locates its parent row (tr or similar),
+    and triggers mousedown+click+mouseup on any hotspot/dropdown element.
+    """
+    found = await page.evaluate('''async (text) => {
+        const candidates = [...document.querySelectorAll("a, span, div, td")].filter(el => {
+            const t = el.textContent.trim();
+            return t === text || t.includes(text);
+        });
+        
+        for (const el of candidates) {
+            const row = el.closest("tr, [role='row'], .bin_container_row");
+            if (row) {
+                const sel = [
+                    "a[class*='hotspot']", "a[title*='Action']", "a[id*='hotspot']",
+                    ".ot-menu-hotspot", ".dropdown-toggle", "[aria-haspopup='true']",
+                    "button[class*='menu']", ".otcs-menu-launcher"
+                ].join(', ');
+                const h = row.querySelector(sel);
+                
+                if (h) {
+                    h.scrollIntoView({ block: 'center' });
+                    h.focus();
+                    h.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                    h.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    h.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    h.click();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }''', row_text)
+    
+    if not found:
+        print(f"[!] resilient_menu_click: No hotspot found for {row_text!r}")
+    else:
+        await page.wait_for_timeout(1500)
+    return found
 
-        row_data = {}
-        valid = True
-        for kw, idx in col_map.items():
-            cell = cells[idx]
-            # Prefer image title (status icons) over text
-            img = cell.locator("img[title]").first
-            text = (
-                await img.get_attribute("title")
-                if await img.count() > 0
-                else (await cell.inner_text() or "").strip()
-            )
-            if not text or text == "null":
-                valid = False
-                break
-            row_data[kw] = text
+    dbg = result.get("debug", {})
+    print(f"[*] Extracted {len(result['rows'])} rows from {table_selector!r} "
+          f"[table:{dbg.get('winningSelector','?')} "
+          f"score:{dbg.get('score','?')} "
+          f"identity:{dbg.get('identityCol','?')}]")
 
-        if valid:
-            results.append(row_data)
-
-    print(f"[*] Extracted {len(results)} data rows.")
-    return results
+    if skip_boilerplate is None:
+        # Filter rows with no meaningful values
+        return [r for r in result["rows"] if any(v for v in r.values())]
+    return result["rows"]
 
 
 # ---------------------------------------------------------------------------
@@ -1591,66 +1799,119 @@ async def generate_report(
     screenshot=None,
     output: str = None,
     panels: dict = None,
+    print_terminal: bool = True,
 ) -> None:
     """Print extracted data and save a .docx report in the script's directory.
 
-    When `panels` dict is supplied (native capture mode), each panel is saved as
-    a separate PNG: certificate_panel1_<ts>.png, panel2, panel3.
-    When only `screenshot` is provided (HTML fallback), it is saved as a single PNG.
-    Both modes embed all images in the DOCX.
+    This upgraded version renders Markdown-style content in `output`:
+    - # Heading -> Word Heading
+    - | col1 | col2 | -> Word Table
+    - ![alt](path.png) -> Embedded Word Image (resolves relative paths)
     """
     from datetime import datetime
     from docx import Document
+    from docx.shared import Inches
+    import re
+    import io
 
-    print("\n" + "=" * 60)
-    print(f"📋 EXTRACTED DATA: {scenario}")
-    print("=" * 60)
-    if output:
-        print(output)
-    print("=" * 60 + "\n")
+    if print_terminal:
+        print("\n" + "=" * 60)
+        print(f"📋 EXTRACTED DATA: {scenario}")
+        print("=" * 60)
+        if output:
+            print(output)
+        print("=" * 60 + "\n")
 
     try:
         import sys as _sys
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Save next to the calling script (e.g. agent_history folder), not src/utils/
         caller_script = os.path.abspath(_sys.argv[0]) if _sys.argv[0] else __file__
         script_dir = os.path.dirname(caller_script)
         report_path = os.path.join(script_dir, f"report_{timestamp}.docx")
 
-
         doc = Document()
-        doc.add_heading(f"Report: {scenario}", 0)
+        doc.add_heading(f"Automation Report: {scenario}", 0)
         doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         doc.add_paragraph(f"Status: {'SUCCESS' if status else 'FAILED'}")
-        if output:
-            doc.add_paragraph(f"Output:\n{output}")
 
-        # ── Native panels: save each as a separate PNG and embed in DOCX ────
-        if panels and any(panels.get(k) for k in ("panel1", "panel2", "panel3")):
-            panel_labels = {
-                "panel1": "Site Info",
-                "panel2": "Connection Security",
-                "panel3": "Certificate Viewer",
-            }
-            for key, label in panel_labels.items():
-                png_bytes = panels.get(key)
-                if not png_bytes:
+        if output:
+            lines = output.split('\n')
+            i = 0
+            while i < len(lines):
+                line = lines[i].strip()
+                if not line:
+                    i += 1
                     continue
-                png_path = os.path.join(script_dir, f"certificate_{key}_{timestamp}.png")
-                with open(png_path, "wb") as f:
-                    f.write(png_bytes)
-                print(f"[+] Panel '{label}' saved: {png_path}")
-                doc.add_heading(label, level=2)
-                doc.add_picture(io.BytesIO(png_bytes))
+                
+                # Headings: # Header, ## Subheader
+                if line.startswith('#'):
+                    level = line.count('#')
+                    content = line.lstrip('#').strip()
+                    doc.add_heading(content, level=min(level, 4))
+                    i += 1
+                    continue
+                
+                # Tables: | col | col |
+                if line.startswith('|'):
+                    table_data = []
+                    while i < len(lines) and line.startswith('|'):
+                        if not re.search(r'[a-zA-Z0-9]', line): # skip separator lines like |---|
+                            i += 1
+                            line = lines[i].strip() if i < len(lines) else ""
+                            continue
+                        # Split by | and filter out empty ends
+                        row = [c.strip() for c in line.split('|')[1:-1]]
+                        if row:
+                            table_data.append(row)
+                        i += 1
+                        line = lines[i].strip() if i < len(lines) else ""
+                    
+                    if table_data:
+                        try:
+                            table = doc.add_table(rows=len(table_data), cols=len(table_data[0]))
+                            table.style = 'Table Grid'
+                            for r_idx, row_values in enumerate(table_data):
+                                for c_idx, val in enumerate(row_values):
+                                    if c_idx < len(table.columns):
+                                        table.cell(r_idx, c_idx).text = str(val)
+                        except Exception as te:
+                            doc.add_paragraph(f"[Table Error: {te}]")
+                    continue
+
+                # Images: ![alt](path)
+                img_match = re.match(r'!\[.*?\]\((.*?)\)', line)
+                if img_match:
+                    img_path = img_match.group(1)
+                    if not os.path.isabs(img_path):
+                        img_path = os.path.join(script_dir, img_path)
+                    
+                    if os.path.exists(img_path):
+                        try:
+                            doc.add_picture(img_path, width=Inches(6.0))
+                        except Exception as ie:
+                            doc.add_paragraph(f"[Image Render Error: {ie}]")
+                    else:
+                        doc.add_paragraph(f"[File not found: {img_path}]")
+                    i += 1
+                    continue
+                
+                # Normal paragraph
+                doc.add_paragraph(line)
+                i += 1
+
+        # Legacy panels/single-screenshot support
+        if panels and any(panels.get(k) for k in ("panel1", "panel2", "panel3")):
+            for key, label in {"panel1": "Site Info", "panel2": "Identity", "panel3": "Details"}.items():
+                if panels.get(key):
+                    doc.add_heading(label, level=1)
+                    doc.add_picture(io.BytesIO(panels[key]), width=Inches(6.0))
         elif screenshot:
-            # HTML fallback: single composite PNG
-            png_path = os.path.join(script_dir, f"certificate_{timestamp}.png")
-            with open(png_path, "wb") as f:
-                f.write(screenshot)
-            print(f"[+] Certificate screenshot saved: {png_path}")
-            doc.add_picture(io.BytesIO(screenshot))
+            doc.add_heading("Capture", level=1)
+            doc.add_picture(io.BytesIO(screenshot), width=Inches(6.0))
 
         doc.save(report_path)
         print(f"[+] Report saved: {report_path}")
     except Exception as e:
         print(f"[-] Report generation failed: {e}")
+        import traceback
+        traceback.print_exc()
