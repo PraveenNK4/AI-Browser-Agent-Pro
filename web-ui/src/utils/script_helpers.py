@@ -22,6 +22,7 @@ import re
 import sys
 import asyncio
 from pathlib import Path
+from typing import Union, Optional, Type, Callable, Dict, Any, Awaitable, TypeVar
 
 # Ensure src is importable regardless of working directory
 _here = Path(__file__).resolve().parent
@@ -49,20 +50,38 @@ from src.utils.vault import vault
 # Credential helpers
 # ---------------------------------------------------------------------------
 
-async def get_secret(key: str):
+async def get_secret(key: str, vault_prefix: str = None):
     """Look up a credential from the vault by composite key.
 
-    Example: get_secret("OTCS_USERNAME") → vault.get_credentials("OTCS")["username"]
+    The key is either a full composite like "PREFIX_USERNAME" (vault key = "PREFIX",
+    field = "USERNAME") or a bare field name like "USERNAME" when vault_prefix is
+    supplied separately.
+
+    vault_prefix overrides the first component derived from key, allowing per-script
+    vault keys without changing the global VAULT_CREDENTIAL_PREFIX config.
+
+    Examples:
+        get_secret("PREFIX_USERNAME")            → vault.get_credentials("PREFIX")["username"]
+        get_secret("USERNAME", "PREFIX")         → vault.get_credentials("PREFIX")["username"]
+        get_secret("APP_USERNAME")               → vault.get_credentials("APP")["username"]
     """
-    parts = key.split("_")
-    v_key = parts[0] if len(parts) > 1 else key
+    if vault_prefix:
+        # Prefix supplied explicitly — key is just the field name (or full composite)
+        v_key = vault_prefix
+        field_key = key
+    else:
+        parts = key.split("_")
+        v_key = parts[0] if len(parts) > 1 else key
+        field_key = key
+
     creds = vault.get_credentials(v_key) or vault.get_credentials(v_key.lower())
     if not creds:
+        print(f"[-] get_secret: no vault entry for prefix '{v_key}' (key='{key}')")
         return None
-    if any(k in key.upper() for k in ("USERNAME", "USER")):
-        return creds.get("username")
-    if any(k in key.upper() for k in ("PASSWORD", "PWD")):
-        return creds.get("password")
+    if any(k in field_key.upper() for k in ("USERNAME", "USER")):
+        return creds.get("username") or creds.get("Username") or creds.get("user") or creds.get("User")
+    if any(k in field_key.upper() for k in ("PASSWORD", "PWD")):
+        return creds.get("password") or creds.get("Password") or creds.get("pwd") or creds.get("Pwd")
     return None
 
 
@@ -133,18 +152,47 @@ async def resilient_click(page, selectors, desc: str = "element") -> bool:
     return False
 
 
-async def click_and_upload_file(page, target_name: str, file_path: str) -> bool:
-    """Robustly trigger a file-chooser and upload *file_path*.
+async def click_and_upload_file(page, target_name: str, path: Union[str, list[str]]) -> bool:
+    """Robustly trigger a file-chooser and upload one or more files.
+
+    Supports:
+        - Single file path (str)
+        - List of file paths (list[str])
+        - Directory path (automatically expands to all files in directory)
 
     Tries three strategies in order:
       1. Click a button/link whose text matches *target_name* exactly.
       2. Set files directly on a hidden <input type="file">.
       3. Click any element with that text and intercept the chooser.
     """
-    print(f"[*] Starting robust upload for: {target_name}")
-    if not os.path.exists(file_path):
-        print(f"[-] File not found: {file_path}")
+    print(f"[*] Starting robust upload for: {target_name} (path={path})")
+    
+    # --- 1. Expand paths (handle strings, lists, and directories) ---
+    target_paths = []
+    raw_paths = [path] if isinstance(path, str) else path
+    
+    for p in raw_paths:
+        p_norm = os.path.normpath(p)
+        if os.path.isdir(p_norm):
+            print(f"[*] Expanding directory: {p_norm}")
+            for root, _, files in os.walk(p_norm):
+                for f in files:
+                    if not f.startswith('.'):
+                        target_paths.append(os.path.join(root, f))
+        else:
+            if os.path.exists(p_norm):
+                target_paths.append(p_norm)
+            else:
+                print(f"[-] File not found: {p_norm}")
+    
+    if not target_paths:
+        print(f"[-] No valid file paths found for upload.")
         return False
+
+    # Use a single string if only one file (some apps prefer this), else list
+    payload = target_paths[0] if len(target_paths) == 1 else target_paths
+    print(f"[*] Final payload ({len(target_paths)} files): {payload}")
+
     # Strategy 1: native chooser via strict label match
     try:
         target = page.locator("a, button, [role='button']").filter(
@@ -152,25 +200,28 @@ async def click_and_upload_file(page, target_name: str, file_path: str) -> bool:
         ).first
         async with page.expect_file_chooser(timeout=TIMEOUT_FILE_CHOOSER_MS) as fc_info:
             await target.click(timeout=TIMEOUT_UPLOAD_CLICK_MS)
-        (await fc_info.value).set_files(file_path)
+        (await fc_info.value).set_files(payload)
         return True
     except Exception:
         pass
+
     # Strategy 2: hidden file input
     try:
-        await page.locator('input[type="file"]').first.set_input_files(file_path)
+        await page.locator('input[type="file"]').first.set_input_files(payload)
         return True
     except Exception:
         pass
+
     # Strategy 3: global text search
     try:
         target = page.get_by_text(target_name, exact=True).first
         async with page.expect_file_chooser(timeout=TIMEOUT_UPLOAD_FALLBACK_MS) as fc_info:
             await target.click()
-        (await fc_info.value).set_files(file_path)
+        (await fc_info.value).set_files(payload)
         return True
     except Exception:
         pass
+
     print(f"[-] All upload strategies failed for: {target_name}")
     return False
 
@@ -179,16 +230,24 @@ async def click_and_upload_file(page, target_name: str, file_path: str) -> bool:
 # Login helper
 # ---------------------------------------------------------------------------
 
-async def maybe_login(page) -> None:
+async def maybe_login(page, vault_prefix: str = None) -> None:
     """Detect and fill a login form if one is present.
 
-    Uses LOGIN_*_SELECTORS and VAULT_CREDENTIAL_PREFIX from config —
-    no hardcoded credentials or selectors.
-    Does nothing if the page has no password field.
+    vault_prefix selects which vault entry to use for credentials.
+    When omitted, falls back to VAULT_CREDENTIAL_PREFIX from config.
+    This allows each generated script to specify its own vault key
+    without changing the global config.
+
+    Example:
+        await maybe_login(page, vault_prefix="PREFIX")   # uses prefix credentials
+        await maybe_login(page)                         # uses VAULT_CREDENTIAL_PREFIX
     """
-    username = await get_secret(f"{VAULT_CREDENTIAL_PREFIX}_USERNAME")
-    password = await get_secret(f"{VAULT_CREDENTIAL_PREFIX}_PASSWORD")
+    prefix = vault_prefix or VAULT_CREDENTIAL_PREFIX
+    username = await get_secret(f"{prefix}_USERNAME", vault_prefix=vault_prefix)
+    password = await get_secret(f"{prefix}_PASSWORD", vault_prefix=vault_prefix)
     if not username or not password:
+        print(f"[-] maybe_login: no credentials found for vault prefix '{prefix}'. "
+              "Check vault key matches the prefix used in the task (e.g. @vault.prefix).")
         return
 
     # Only proceed if a password field is actually visible
@@ -200,6 +259,11 @@ async def maybe_login(page) -> None:
     if not pass_el:
         return
 
+    print(f"[+] maybe_login: logging in with vault prefix '{prefix}' (user={username[:3]}***)")
+    
+    # Ensure the fields are visible before filling
+    await page.wait_for_selector(LOGIN_USER_SELECTORS[0], timeout=TIMEOUT_FILL_MS)
+    
     await resilient_fill(page, LOGIN_USER_SELECTORS, username)
     await resilient_fill(page, LOGIN_PASS_SELECTORS, password)
     await resilient_click(page, LOGIN_SUBMIT_SELECTORS, desc="login submit")
@@ -465,6 +529,18 @@ async def resilient_extract_table(
     if result.get("error"):
         raise RuntimeError(f"[extract] {result['error']} (selector={table_selector!r})")
 
+    dbg = result.get("debug", {})
+    print(f"[*] Extracted {len(result['rows'])} rows from {table_selector!r} "
+          f"[table:{dbg.get('winningSelector','?')} "
+          f"score:{dbg.get('score','?')} "
+          f"identity:{dbg.get('identityCol','?')}]")
+
+    if skip_boilerplate is None:
+        # Filter rows with no meaningful values
+        return [r for r in result["rows"] if any(v for v in r.values())]
+    return result["rows"]
+
+
 async def resilient_menu_click(page, row_text: str) -> bool:
     """Ultra-robust click on a row's function menu (hotspot/dropdown).
     
@@ -506,17 +582,6 @@ async def resilient_menu_click(page, row_text: str) -> bool:
     else:
         await page.wait_for_timeout(1500)
     return found
-
-    dbg = result.get("debug", {})
-    print(f"[*] Extracted {len(result['rows'])} rows from {table_selector!r} "
-          f"[table:{dbg.get('winningSelector','?')} "
-          f"score:{dbg.get('score','?')} "
-          f"identity:{dbg.get('identityCol','?')}]")
-
-    if skip_boilerplate is None:
-        # Filter rows with no meaningful values
-        return [r for r in result["rows"] if any(v for v in r.values())]
-    return result["rows"]
 
 
 # ---------------------------------------------------------------------------
@@ -662,9 +727,9 @@ async def check_certificate(page) -> dict:
                 "fingerprint_sha256": fp_sha256,
                 "pubkey_fingerprint": pubkey_fp,
             }
-            print(f"[cert] ✅ {hostname} — valid for {days_left} more days")
+            print(f"[cert] [OK] {hostname} - valid for {days_left} more days")
         except _ssl.SSLCertVerificationError as e:
-            print(f"[cert] ⚠️  Certificate verification FAILED: {e}")
+            print(f"[cert] [WARN] Certificate verification FAILED: {e}")
             cert_info = {"hostname": hostname, "error": str(e),
                          "days_remaining": 0, "is_expired": True}
         except Exception as e:
@@ -833,37 +898,31 @@ async def check_certificate(page) -> dict:
             None, _native_browser_screenshot_sync, page.url, browser_pid
         )
         if native_shots.get("panel1"):
-            print(f"[cert] ✅ Native screenshots captured (PID={browser_pid})")
+            print(f"[cert] [OK] Native screenshots captured (PID={browser_pid})")
         else:
-            print(f"[cert] ⚠️  Native capture returned empty")
+            print(f"[cert] [WARN] Native capture returned empty")
     except Exception as e:
         print(f"[cert] Native capture error: {e}")
 
-    # ── 6. HTML panels — only used when native fails (headless / Linux) ────────
+    # ── 6. Return results (Native only, no fallback) ────────────────────────
     native_ok = bool(native_shots.get("panel1"))
     if native_ok:
         p1 = native_shots["panel1"]
         p2 = native_shots.get("panel2", b"")
         p3 = native_shots.get("panel3", b"")
         composite = native_shots.get("composite") or await _stitch_native(p1, p2, p3, hostname)
-        panel1_html = panel2_html = panel3_html = b""
     else:
-        # Fallback: HTML-rendered panels (headless, Linux, or missing dependencies)
-        panel1_html = await _render_site_info_panel(page, cert_info, is_valid, is_secure,
-                                                    hostname, site_data)
-        panel2_html = await _render_cert_panel(page, cert_info, is_valid, is_secure, hostname)
-        panel3_html = await _render_cert_detail_panel(page, cert_info, is_valid, hostname)
-        p1, p2, p3 = panel1_html, panel2_html, panel3_html
-        composite   = await _composite_panels(page, p1, p2, p3, hostname, native=False)
+        # User requested NO fallback. If native fails, return empty screenshots.
+        p1 = p2 = p3 = composite = b""
 
     return {
         "screenshot":               composite,
         "screenshot_site_info":     p1,
         "screenshot_security":      p2,
         "screenshot_cert":          p3,
-        "screenshot_site_info_html": panel1_html,
-        "screenshot_security_html":  panel2_html,
-        "screenshot_cert_html":      panel3_html,
+        "screenshot_site_info_html": b"", # disabled
+        "screenshot_security_html":  b"", # disabled
+        "screenshot_cert_html":      b"", # disabled
         "cert_info":                cert_info,
         "site_data":                site_data,
         "is_valid":                 is_valid,
@@ -1004,7 +1063,7 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                     print(f"[native] Omnibox '{(w.window_text() or '')[:30]}': {omnibox_url[:60]}")
                     if url_hostname in omnibox_url:
                         best_win = w
-                        print(f"[native] ✅ URL matched in omnibox")
+                        print(f"[native] [OK] URL matched in omnibox")
                         break
 
                 # ── Method B: title match ─────────────────────────────────────
@@ -1022,7 +1081,7 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                               key=lambda w: len(list(w.descendants())) if hasattr(w, 'descendants') else 0)
                 except Exception:
                     win = all_wins[0]
-                print(f"[native] ⚠️ No match — using largest window: "
+                print(f"[native] [WARN] No match — using largest window: "
                       f"'{_safe_text(win)[:50]}'")
 
         except Exception as e:
@@ -1030,12 +1089,14 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
             return {}
 
     if win is None:
-        print("[native] ❌ No Chrome window found")
+        print("[native] [ERROR] No Chrome window found")
         return {}
 
     try:
+        print(f"[native] Attempting to set focus to window: '{_safe_text(win)[:50]}'")
         win.set_focus()
         time.sleep(0.5)
+        print("[native] Focus set.")
     except Exception as e:
         print(f"[native] Could not focus window: {e}")
 
@@ -1062,24 +1123,29 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
         try:
             print("[native] Scanning Button descendants for lock icon...")
             for btn in win.descendants(control_type="Button"):
-                name = _safe_text(btn).lower()
-                aid  = _safe_aid(btn).lower()
-                
-                if any(kw in name for kw in ("view site information", "connection is secure", 
-                                             "connection not secure", "not secure", "certificate")):
-                    lock_btn = btn
-                    print(f"[native] Lock button found by Name: '{name}'")
-                    break
-                if any(kw in aid for kw in ("security", "site-info", "location-icon", 
-                                            "page-info", "lock", "omnibox-icon")):
-                    lock_btn = btn
-                    print(f"[native] Lock button found by AutomationId: '{aid}'")
-                    break
+                try:
+                    name = _safe_text(btn).lower()
+                    aid  = _safe_aid(btn).lower()
+                    # Log every button found during scan to see what's available
+                    # print(f"  [scan] Found Button: name='{name}' auto_id='{aid}'")
+                    
+                    if any(kw in name for kw in ("view site information", "connection is secure", 
+                                                 "connection not secure", "not secure", "certificate")):
+                        lock_btn = btn
+                        print(f"[native] Lock button found by Name: '{name}'")
+                        break
+                    if any(kw in aid for kw in ("security", "site-info", "location-icon", 
+                                                "page-info", "lock", "omnibox-icon")):
+                        lock_btn = btn
+                        print(f"[native] Lock button found by AutomationId: '{aid}'")
+                        break
+                except Exception:
+                    continue
         except Exception as e:
             print(f"[native] Button descendant scan failed: {e}")
 
     if lock_btn is None:
-        print("[native] ❌ Lock icon not found after 3 passes — dumping toolbar buttons:")
+        print("[native] [ERROR] Lock icon not found after 3 passes — dumping toolbar buttons:")
         try:
             for ctrl in win.descendants():
                 try:
@@ -1097,17 +1163,18 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
 
     # ── Step 3: Click lock → Panel 1 (Site info popup) ───────────────────────
     try:
-        lock_btn.invoke()           # UIA InvokePattern — no mouse coordinates
-        print("[native] Lock button invoked via UIA InvokePattern")
+        # click_input is often MORE reliable for triggering UI popups than invoke()
+        lock_btn.click_input()
+        print("[native] Lock button clicked via click_input()")
     except Exception:
         try:
-            lock_btn.click_input()  # Fallback: click at UIA-reported center
-            print("[native] Lock button clicked via click_input()")
+            lock_btn.invoke()
+            print("[native] Lock button invoked via UIA InvokePattern")
         except Exception as e:
             print(f"[native] Could not click lock button: {e}")
             return {}
 
-    time.sleep(0.9)  # wait for popup animation to complete
+    time.sleep(1.2)  # wait for popup animation to complete
 
     # ── Helper: find a popup that appeared after a click ─────────────────────
     def _find_popup(timeout=4.5):
@@ -1135,15 +1202,19 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
             main_w, main_h = 9999, 9999
 
         while time.time() < deadline:
-            # ── Strategy A: child of browser window ──────────────────────────
-            for cls in popup_classes:
-                try:
-                    p = win.child_window(class_name=cls, found_index=0)
-                    if p.exists(timeout=0.25):
-                        print(f"[native] Popup found as child: class='{cls}'")
-                        return p
-                except Exception:
-                    pass
+            # ── Strategy A: descendant of browser window (more robust) ───────
+            try:
+                # Use descendants() to find it anywhere in the tree
+                for d in win.descendants():
+                    try:
+                        cls = d.element_info.class_name
+                        if cls in popup_classes:
+                            print(f"[native] Popup found as descendant: class='{cls}'")
+                            return d
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
             # ── Strategy B: new small Chrome window on desktop ────────────────
             try:
@@ -1171,13 +1242,13 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
     # Find Panel 1 popup
     popup1 = _find_popup(timeout=4.0)
     if popup1 is None:
-        print("[native] ❌ Panel 1 popup did not appear")
+        print("[native] [ERROR] Panel 1 popup did not appear")
         send_keys("{ESC}")
         return {}
 
     r1 = popup1.rectangle()
     results["panel1"] = _shot_rect(r1)
-    print(f"[native] ✅ Panel 1: {r1.right-r1.left}×{r1.bottom-r1.top}px")
+    print(f"[native] [OK] Panel 1: {r1.right-r1.left}×{r1.bottom-r1.top}px")
 
     # ── Step 4: Click "Connection is/not secure" row → Panel 2 ───────────────
     sec_btn = None
@@ -1223,7 +1294,7 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
         if popup2:
             r2 = popup2.rectangle()
             results["panel2"] = _shot_rect(r2)
-            print(f"[native] ✅ Panel 2: {r2.right-r2.left}×{r2.bottom-r2.top}px")
+            print(f"[native] [OK] Panel 2: {r2.right-r2.left}×{r2.bottom-r2.top}px")
 
             # ── Step 5: Click "Certificate is valid" → Panel 3 ───────────────
             cert_btn = None
@@ -1275,13 +1346,13 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                 if popup3:
                     r3 = popup3.rectangle()
                     results["panel3"] = _shot_rect(r3)
-                    print(f"[native] ✅ Panel 3: {r3.right-r3.left}×{r3.bottom-r3.top}px")
+                    print(f"[native] [OK] Panel 3: {r3.right-r3.left}×{r3.bottom-r3.top}px")
                 else:
-                    print("[native] ⚠️  Panel 3 (cert viewer) not found")
+                    print("[native] [WARN] Panel 3 (cert viewer) not found")
         else:
-            print("[native] ⚠️  Panel 2 popup not found")
+            print("[native] [WARN] Panel 2 popup not found")
     else:
-        print("[native] ⚠️  Security row not found in Panel 1")
+        print("[native] [WARN] Security row not found in Panel 1")
 
     # ── Step 6: Close all popups ──────────────────────────────────────────────
     try:
@@ -1310,7 +1381,7 @@ def _native_browser_screenshot_sync(page_url: str, browser_pid: int = None) -> d
                 buf = io.BytesIO()
                 composite.save(buf, "PNG")
                 results["composite"] = buf.getvalue()
-                print(f"[native] ✅ Composite built: {total_w}×{max_h}px")
+                print(f"[native] [OK] Composite built: {total_w}×{max_h}px")
         except Exception as e:
             print(f"[native] Composite build failed: {e}")
 
@@ -1816,7 +1887,7 @@ async def generate_report(
 
     if print_terminal:
         print("\n" + "=" * 60)
-        print(f"📋 EXTRACTED DATA: {scenario}")
+        print(f"EXTRACTED DATA: {scenario}")
         print("=" * 60)
         if output:
             print(output)
@@ -1911,7 +1982,9 @@ async def generate_report(
 
         doc.save(report_path)
         print(f"[+] Report saved: {report_path}")
+        return report_path
     except Exception as e:
-        print(f"[-] Report generation failed: {e}")
+        print(f"[-] Error generating report: {e}")
+        return None
         import traceback
         traceback.print_exc()

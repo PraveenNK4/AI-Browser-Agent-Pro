@@ -1,3278 +1,1251 @@
 """
-LLM Script Generator for Browser Agent
-Uses an LLM (via llm_provider) to generate robust Playwright scripts from agent history.
-Key Features:
-- Redundancy Elimination (Smart Login)
-- Context-Aware Code Generation
-- Professional Report Integration
+llm_script_generator.py  (v5)
+==============================
+Generated scripts are fully standalone and read credentials
+directly from the vault — no env vars, no helper imports.
+
+A tiny vault-reader snippet is injected into every prompt so
+the LLM knows exactly how to access credentials. The LLM then
+writes 100% of the script using raw Playwright + python-docx.
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import json
 import logging
-import argparse
+import os
 import re
+import argparse
 from pathlib import Path
-from typing import Dict, Any
 
-# Ensure we can import from src
-sys.path.append(str(Path(__file__).parent.parent.parent))
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.utils.llm_provider import get_llm_model
 from src.utils.config import (
-    SCRIPT_GEN_TEMPERATURE, SCRIPT_GEN_NUM_CTX, SCRIPT_GEN_NUM_PREDICT,
-    OOM_FALLBACK_MODELS, OOM_FALLBACK_CTX, OOM_RETRY_NUM_PREDICT,
+    SCRIPT_GEN_MODEL,
+    SCRIPT_GEN_PROVIDER,
+    SCRIPT_GEN_TEMPERATURE,
+    SCRIPT_GEN_NUM_CTX,
     VAULT_CREDENTIAL_PREFIX,
-    LOGIN_USER_SELECTORS, LOGIN_PASS_SELECTORS, LOGIN_SUBMIT_SELECTORS,
-    TIMEOUT_FIND_IN_FRAMES_MS, TIMEOUT_ELEMENT_VISIBLE_MS,
-    TIMEOUT_FILL_MS, TIMEOUT_CLICK_MS,
-    TIMEOUT_FILE_CHOOSER_MS, TIMEOUT_UPLOAD_CLICK_MS, TIMEOUT_UPLOAD_FALLBACK_MS,
-    TIMEOUT_TABLE_WAIT_MS,
 )
-from langchain_core.messages import SystemMessage, HumanMessage
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def _build_system_prompt() -> str:
-    """Build the LLM system prompt. All runtime helpers live in script_helpers.py —
-    the LLM must only write the async def run() body."""
 
-    pw_sel          = LOGIN_PASS_SELECTORS[0] if LOGIN_PASS_SELECTORS else "input[type='password']"
-    vault_prefix    = VAULT_CREDENTIAL_PREFIX
-    table_wait_ms   = TIMEOUT_TABLE_WAIT_MS
-    file_chooser_ms = TIMEOUT_FILE_CHOOSER_MS
+# The canonical Chrome frame – injected as a verbatim Python helper into every generated script.
+# This is the approved, reference-quality implementation.
+_CAPTURE_STEP_CODE = '''\
+    import base64 as _b64
+    from urllib.parse import urlparse as _urlparse
 
-    # Minimal script header the LLM should reproduce verbatim
-    script_header = '''\
-import asyncio
-import sys
-import os
-from playwright.async_api import async_playwright
-
-# Path bootstrap — keeps the script runnable from any working directory
-current_dir = os.getcwd()
-if "web-ui" not in current_dir and os.path.exists(os.path.join(current_dir, "web-ui")):
-    sys.path.append(os.path.join(current_dir, "web-ui"))
-else:
-    sys.path.append(current_dir)
-
-from src.utils.script_helpers import (
-    get_secret, find_in_frames,
-    resilient_fill, resilient_click, click_and_upload_file,
-    maybe_login, resilient_extract_table, generate_report,
-    check_certificate,
-)
-from src.utils.config import TIMEOUT_TABLE_WAIT_MS, TIMEOUT_FILL_MS
-
-# Reporting state
-steps = []
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-async def run():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
-        context = await browser.new_context(no_viewport=True)
-        page = await context.new_page()
-
-        async def capture_step(action, output):
-            idx = len(steps) + 1
-            shot_path = os.path.join(script_dir, f"shot_{idx}.png")
-            await page.screenshot(path=shot_path)
-            steps.append({"action": action, "output": output, "shot": f"shot_{idx}.png"})
-
-        # [START OF YOUR LOGIC]
-        pass
-
-if __name__ == "__main__":
-    asyncio.run(run())
-'''
-
-    return f'''You are an expert Playwright automation engineer. Generate a MINIMAL, CORRECT Python script from the execution history below.
-
-### ✅ WHAT TO GENERATE
-Only write `async def run()` and the standard header shown in the STRUCTURE section.
-Do NOT redefine any helper functions — they all come pre-built from `src.utils.script_helpers`.
-
-### 🛡️ GOLDEN RULES
-1.  **Helpers are pre-built** — NEVER redefine `get_secret`, `find_in_frames`, `resilient_fill`,
-    `resilient_click`, `click_and_upload_file`, `maybe_login`, `resilient_extract_table`,
-    `generate_report`, or `check_certificate`. Import and call them; do not copy their implementation.
-2.  **Vault** — Use `await get_secret("KEY_USERNAME")` / `"KEY_PASSWORD"`. Never hardcode credentials.
-    The vault prefix is currently `"{vault_prefix}"`.
-3.  **Login hook** — Call `await maybe_login(page)` once, right after the FIRST `page.goto(...)`.
-    Do NOT repeat it after subsequent navigations — the session persists.
-4.  **Table extraction per page**:
-    - Use `await resilient_extract_table(page, table_selector, required_columns)`.
-    - `table_selector` MUST come from the NAVIGATION PLAN for THAT specific page.
-    - If no selector is known for a page, use `await page.wait_for_load_state("networkidle")`
-      and pass `"table"` to `resilient_extract_table` — it will auto-discover the best table.
-    - `required_columns` MUST be EXACTLY the columns listed in the NAVIGATION PLAN for THAT table.
-      NEVER add, remove, or rename columns. NEVER add "Server". NEVER blend columns from two tables.
-5.  **One selector per page, one call per table** — Every `page.goto(url)` takes you to a
-    DIFFERENT page with its own DOM. NEVER reuse the same selector across pages.
-    If a page has MULTIPLE tables (listed in the NAVIGATION PLAN), call `resilient_extract_table`
-    ONCE per table, each with its own selector and EXACT column list from the plan:
-    ```python
-    # Page B has two tables — each uses ONLY ITS OWN columns from the NAVIGATION PLAN
-    table_a = await resilient_extract_table(page, "#summary table",  ["ID","Status"])
-    table_b = await resilient_extract_table(page, "#details table",  ["Metric","Value"])
-    # WRONG — never add "Server" or copy columns from another table:
-    # table_b = await resilient_extract_table(page, "#details table", ["ID","Status","Server"])
-    ```
-6.  **Selectors** — Use ONLY selectors from the NAVIGATION PLAN or SELECTOR REFERENCE TABLE.
-    NEVER invent IDs like `"#view_1011"`. NEVER use `nth-child` or `html > body > table`.
-    If no selector is listed for a wait, use `await page.wait_for_load_state("networkidle")`.
-7.  **Action/Menu hotspots** — NEVER use `"#x1"`, `"#x2"` etc. (row-position IDs that change).
-    Always use `page.evaluate()` to find a hotspot next to the named row:
-    ```python
-    await page.evaluate(\'\'\'(text) => {{
-        const link = [...document.querySelectorAll("a")].find(a => a.textContent.trim() === text);
-        if (link) {{
-            const td = link.closest("td");
-            const hotspot = td && td.querySelector("a[class*=\'hotspot\'], a[title*=\'Action\']");
-            if (hotspot) hotspot.click();
-        }}
-    }}\'\'\', "ItemNameHere")
-    ```
-8.  **Configure / action pages** — When the task says "configure" or "save settings", click the
-    named link then look for `input[value="Save"]` or `button:has-text("Save")`.
-    NEVER click login-field selectors like `input[name="username"]` during a configure flow.
-9.  **Uploads** — Use `await click_and_upload_file(page, label, path)` with `TIMEOUT_FILE_CHOOSER_MS`
-    (currently {file_chooser_ms}ms).
-10. **Loops** — ALWAYS `elements = await locator.all()` then `for el in elements:`. Never `async for`.
-11. **Comprehensive Reporting** — ALWAYS `print()` extracted data to the terminal.
-    Call `await capture_step(action, output)` after every key interaction.
-    Combine ALL steps and ALL extracted tables into a SINGLE `generate_report` call at the end.
-    The report renders Markdown natively:
-    - `# Heading` → Word Heading
-    - `| col | col |` → Word Table
-    - `![alt](path.png)` → Embedded Word Image
-    NEVER use a bare loop variable in the report — always iterate over the collected list.
-12. **No noise** — Skip failed/retried actions. Only generate the successful path.
-13. **Imports** — Only import what `run()` actually uses beyond the standard header.
-14. **Never invent element IDs** — If an ID is not in the NAVIGATION PLAN, don't use it.
-    Use `wait_for_load_state("networkidle")` as the wait instead.
-15. **Certificate / security checks** — NEVER click the browser lock icon.
-    Instead call `await check_certificate(page)`.
-16. **Indentation** — Use 4 spaces. NEVER misalign triple-quote closings.
-17. **Identity & Status Logic** — In reports, use
-    `ident = r.get("Name") or r.get("Identity") or next(iter(r.values()), "Unknown")`.
-    For status: `stat = r.get("Status") or r.get("Running") or r.get("State") or "N/A"`.
-18. **Triple Quotes for Reports** — ALWAYS use `f\'\'\'...\'\'\'` for multi-line report blocks.
-19. **Multi-Table Reporting** — Each extracted table MUST have its own dedicated Markdown
-    section (`### Table Name`) and Markdown table in the final report. Do NOT merge them.
-20. **Robust Interactions** — For hotspots/dropdowns use broad selectors:
-    `"a[class*=\'hotspot\'], a[title*=\'Action\'], .dropdown-toggle, [aria-haspopup]"`.
-21. **Loop Reporting** — Capture a screenshot inside interaction loops for the first few rows.
-22. **Selector Resilience** — For OTCS browse views, prefer `#browseViewCoreTable` or specific
-    table IDs found in the NAVIGATION PLAN.
-
-### 📝 STRUCTURE
-Reproduce this header exactly, then write only `async def run()`.
-
-For tasks that navigate to **multiple pages** (the common case), follow this exact pattern:
-
-```python
-{script_header}
-```
-
-#### Multi-page / Multi-table example (READ THIS CAREFULLY):
-```python
-async def run():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
-        context = await browser.new_context(no_viewport=True)
-        page = await context.new_page()
-
-        async def capture_step(action, output):
-            idx = len(steps) + 1
-            shot_path = os.path.join(script_dir, f"shot_{{idx}}.png")
-            await page.screenshot(path=shot_path)
-            steps.append({{"action": action, "output": output, "shot": f"shot_{{idx}}.png"}})
-
-        # ── Step 1: Login ──────────────────────────────────────────────────
-        await page.goto("http://host/login", timeout=60000)
-        await maybe_login(page)
-        await capture_step("Login", "Logged in successfully")
-
-        # ── Step 2: Page A — may have TWO tables ───────────────────────────
-        await page.goto("http://host/page-a", timeout=60000)
-        await page.wait_for_load_state("networkidle")
-        # Table 1 on this page (use exact selector from NAVIGATION PLAN)
-        node_rows = await resilient_extract_table(page, "table", ["NodeID", "Name", "Status"])
-        print(f"[*] Page A / Table 1: {{len(node_rows)}} rows")
-        for r in node_rows: print(f"  {{r}}")
-        await capture_step("Extract Node Table", f"{{len(node_rows)}} nodes found")
-
-        # Table 2 on the same page (different selector from NAVIGATION PLAN)
-        metric_rows = await resilient_extract_table(page, "#metrics-panel table", ["Metric","Value"])
-        print(f"[*] Page A / Table 2: {{len(metric_rows)}} rows")
-        await capture_step("Extract Metrics", f"{{len(metric_rows)}} metrics found")
-
-        not_healthy = [r for r in node_rows if r.get("Status","").lower() != "healthy"]
-        if not_healthy:
-            await resilient_click(page, "a:has-text(\'Batch Heal\')")
-            await page.wait_for_load_state("networkidle")
-            await capture_step("Heal Nodes", f"Applied fixes to {{len(not_healthy)}} nodes")
-
-        # ── Step 3: Page B — known selector from NAVIGATION PLAN ───────────
-        await page.goto("http://host/page-b", timeout=60000)
-        await page.wait_for_selector("#admin-servers table", timeout=TIMEOUT_TABLE_WAIT_MS)
-        admin_rows = await resilient_extract_table(page, "#admin-servers table", ["Name","Status","Errors"])
-        print(f"[*] Page B: {{len(admin_rows)}} admin servers")
-        for r in admin_rows: print(f"  {{r}}")
-        await capture_step("Admin Servers", f"{{len(admin_rows)}} servers found")
-
-        # Open function menu for a named row — NEVER use #x1/#x2
-        for r in admin_rows:
-            sname = r.get("Server") or r.get("Name") or ""
-            if sname:
-                await page.evaluate(\'\'\'(text) => {{
-                    const link = [...document.querySelectorAll("a")].find(a => a.textContent.trim() === text);
-                    if (link) {{
-                        const td = link.closest("td");
-                        const h = td && td.querySelector("a[class*=\'hotspot\']");
-                        if(h) h.click();
-                    }}
-                }}\'\'\', sname)
-                await page.wait_for_timeout(500)
-                await capture_step(f"Menu: {{sname}}", f"Opened function menu for {{sname}}")
-
-        # ── Step 4: Single consolidated report ─────────────────────────────
-        summary = \'\'\'### Execution Summary
-| Step | Action | Output |
-| :--- | :--- | :--- |
-\'\'\'
-        for i, s in enumerate(steps, 1):
-            summary += f\'\'\'| {{i}} | {{s[\'action\']}} | {{s[\'output\']}} |\\n\'\'\'
-
-        node_section = \'\'\'### Node Status (Page A — Table 1)
-| Identity | Status |
-| :--- | :--- |
-\'\'\'
-        for r in node_rows:
-            ident = r.get("NodeID") or r.get("Name") or next(iter(r.values()), "Unknown")
-            stat  = r.get("Status") or r.get("State") or "N/A"
-            node_section += f\'\'\'| {{ident}} | {{stat}} |\\n\'\'\'
-
-        metric_section = \'\'\'### Metrics (Page A — Table 2)
-| Metric | Value |
-| :--- | :--- |
-\'\'\'
-        for r in metric_rows:
-            m = r.get("Metric") or next(iter(r.values()), "—")
-            v = r.get("Value") or "N/A"
-            metric_section += f\'\'\'| {{m}} | {{v}} |\\n\'\'\'
-
-        admin_section = \'\'\'### Admin Servers (Page B)
-| Server | Status | Errors |
-| :--- | :--- | :--- |
-\'\'\'
-        for r in admin_rows:
-            ident = r.get("Server") or r.get("Name") or next(iter(r.values()), "Unknown")
-            stat  = r.get("Status") or "N/A"
-            errs  = r.get("Errors") or "0"
-            admin_section += f\'\'\'| {{ident}} | {{stat}} | {{errs}} |\\n\'\'\'
-
-        details = \'\'\'## Step Screenshots\\n\'\'\'
-        for i, s in enumerate(steps, 1):
-            details += f\'\'\'### Step {{i}}: {{s[\'action\']}}\\n![Step {{i}}]({{s[\'shot\']}})\\n\'\'\'
-
-        full_report = f\'\'\'# Automation Report\\n\\n{{summary}}\\n{{node_section}}\\n{{metric_section}}\\n{{admin_section}}\\n{{details}}\'\'\'
-        await generate_report("Consolidated Report", True, output=full_report, print_terminal=False)
-        await browser.close()
-```
-
-The header imports EVERYTHING from `script_helpers`. Only add extra imports if `run()` needs them.
-'''
-
-SYSTEM_PROMPT = _build_system_prompt()
-
-
-# ── Known OTCS page selectors & columns ─────────────────────────────────────
-# Maps URL query-string fragment → { selector, columns }.
-# Used in three places:
-#   1. _build_page_table_registry() — fallback when agent didn't capture tables_on_page
-#   2. _postprocess_generated_code() Rule 16 — replace wrong/bare selectors per page
-#   3. Navigation plan builder — inject exact selector+columns into LLM prompt
-#
-# Format: { "url_fragment": {"selector": "<css>", "columns": ["Col1", ...]} }
-# The fragment is matched with `fragment in url` so partial matches work.
-_KNOWN_PAGE_SELECTORS: dict[str, dict] = {
-    # Note: AgentStatus and other pages are now 100% dynamic via Source 2b/2c (registry).
-    # No hardcoded selectors here to ensure system works for any website.
-}
-
-
-def _known_page_info(url: str) -> dict | None:
-    """Return {"selector": ..., "columns": ...} for a well-known OTCS page, or None."""
-    if not url:
-        return None
-    for frag, info in _KNOWN_PAGE_SELECTORS.items():
-        if frag in url:
-            return info
-    return None
-
-
-def _derive_table_selector(selectors: dict, attrs: dict, comp: dict, comp_selectors: dict) -> str | None:
-    """Derive a stable CSS table-container selector from dom_context captured by the agent.
-
-    Strategy (in priority order):
-    1. XPath contains @id="something" → CSS = #something table
-       e.g. //*[@id="admin-servers"]/tbody/tr[2]/td[2]/a  → "#admin-servers table"
-    2. preferred/css selector already contains a table ref → use as-is
-    3. Ancestor ID from comprehensive capture → #id table
-    4. None — caller should fall back to bare "table" with page-wide search
-
-    This uses data the browser agent ACTUALLY captured during the live run,
-    so it's always specific to the real page structure, never hardcoded.
-    """
-    _ignore_ids = {"otds_username", "otds_password", "username", "password",
-                   "loginbutton", "login", "header", "nav", "sidebar", "footer",
-                   "toolbar", "menu", "topnav"}
-
-    # 1. XPath — extract @id from path like //*[@id="admin-servers"]/...
-    xpath = selectors.get('xpath') or comp_selectors.get('xpath', '')
-    if xpath:
-        import re as _re
-        m = _re.search(r'/\*\[@id=["\']([^"\']+)["\']\]', xpath)
-        if m:
-            container_id = m.group(1)
-            if container_id.lower() not in _ignore_ids:
-                return f'#{container_id} table'
-
-    # 2. preferred/css selector that already scopes a table
-    for key in ('preferred', 'css'):
-        val = selectors.get(key) or comp_selectors.get(key, '')
-        if val and isinstance(val, str):
-            v = val.strip()
-            if 'table' in v.lower() and v.lower() not in ('table',):
-                return v
-            # e.g. "#admin-servers" → "#admin-servers table"
-            if v.startswith('#') and ' ' not in v:
-                if v.lower().lstrip('#') not in _ignore_ids:
-                    return f'{v} table'
-
-    # 3. Ancestor IDs from comprehensive capture (parentChain)
-    comp_data = comp if isinstance(comp, dict) else {}
-    for parent in comp_data.get('parentChain', []):
-        pid = parent.get('id') if isinstance(parent, dict) else None
-        if pid and pid.lower() not in _ignore_ids:
-            return f'#{pid} table'
-
-    # 4. attributes.id of the element itself (only useful if it's a table/container)
-    el_id = attrs.get('id') or ''
-    if el_id and el_id.lower() not in _ignore_ids:
-        tag = selectors.get('tag', '').lower()
-        if tag in ('table', 'tbody', 'div', 'section', 'article', ''):
-            return f'#{el_id} table'
-
-    return None
-
-
-def clean_history_json(history_data: Dict[str, Any], objective: str = None) -> str:
-    """Optimize JSON payload by pruning redundant actions, failed attempts, and duplicate navigations."""
-    def columns_from_results(results):
-        """Parse leaf-row keys from extracted_content fenced JSON in agent results.
-        
-        Strategy (per spec §3.A):
-          1. Parse fenced ```json``` blocks from extracted_content.
-          2. Walk nested objects/lists and collect all leaf-dict keys (dict where all
-             values are scalars – i.e. an actual data row).
-          3. Return deduplicated ordered list of column names found.
-        """
-        if not results:
-            return []
-        for res in results:
-            if not isinstance(res, dict):
-                continue
-            content = res.get("extracted_content") or ""
-            # Accept both fenced and raw JSON blobs
-            json_candidates = []
-            m = re.search(r'```(?:json)?\s*([\[\{].*?)\s*```', content, re.DOTALL)
-            if m:
-                json_candidates.append(m.group(1))
-            else:
-                # Try the entire content as JSON
-                stripped = content.strip()
-                if stripped.startswith(('[', '{')):
-                    json_candidates.append(stripped)
-
-            for candidate in json_candidates:
-                try:
-                    data = json.loads(candidate)
-                except Exception:
-                    continue
-                cols = []
-                seen_cols = set()
-
-                def walk(obj, depth=0):
-                    if depth > 10:
-                        return
-                    if isinstance(obj, dict):
-                        # Leaf row: dict where ALL values are scalars
-                        if obj and all(not isinstance(v, (dict, list)) for v in obj.values()):
-                            for k in obj.keys():
-                                if k not in seen_cols:
-                                    seen_cols.add(k)
-                                    cols.append(k)
-                        else:
-                            for v in obj.values():
-                                walk(v, depth + 1)
-                    elif isinstance(obj, list):
-                        for v in obj:
-                            walk(v, depth + 1)
-
-                walk(data)
-                if cols:
-                    return cols
-        return []
-    simplified = []
-    seen_urls = []
-
-    def infer_required_columns(text: str) -> list[str]:
-        """
-        Infer required columns from the user's objective/goal without hardcoded domain terms.
-        Strategy:
-          1) Extract quoted phrases (single or double quotes).
-          2) Extract list after keywords like "columns", "fields", "extract".
-          3) Extract Title Case multi-word phrases as a fallback.
-        """
-        if not text:
-            return []
-
-        candidates = []
-
-        # 1) Quoted phrases: "Status", 'Errors', etc.
-        candidates += re.findall(r'"([^"]{2,})"', text)
-        candidates += re.findall(r"'([^']{2,})'", text)
-
-    # 2) List after delimiters (colon or dash), derived from the text itself
-        for line in re.split(r'[\r\n]+', text):
-            if ":" in line or " - " in line:
-                tail = re.split(r'[:\-]\s*', line, maxsplit=1)[-1]
-                parts = re.split(r',| and ', tail, flags=re.IGNORECASE)
-                candidates += [p.strip() for p in parts if p.strip()]
-
-        # 3) Title Case phrases (e.g., "Enterprise Update Distributor")
-        candidates += re.findall(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', text)
-
-        # Normalize and filter noise using dynamic stopwords from the text
-        tokens = re.findall(r'[A-Za-z]+', text.lower())
-        freq = {}
-        for t in tokens:
-            freq[t] = freq.get(t, 0) + 1
-        common = sorted(freq, key=freq.get, reverse=True)[:15]
-        stopwords = set(common)
-        cleaned = []
-        seen = set()
-        for c in candidates:
-            c = c.strip().strip(".:")
-            if not c or c in stopwords:
-                continue
-            if len(c) < 2:
-                continue
-            if c not in seen:
-                seen.add(c)
-                cleaned.append(c)
-
-        return cleaned
-    
-    for item in history_data.get('history', []):
-        state = item.get('state', {})
-        model_out = item.get('model_output', {})
-        action = model_out.get('action', [])
-        evaluation = model_out.get('current_state', {}).get('evaluation_previous_goal', '')
-        
-        current_url = state.get('url', '')
-        if current_url:
-            # Simple URL deduplication: if the URL is logically the same as the last one, mark as redundant
-            # (ignoring minor query param diffs or typos that redirect)
-            # FIX: compare full URLs (including query string), not just base.
-            # OTCS pages all share the same base (cs.exe) but are DIFFERENT pages
-            # when the query string differs (func=distributedagent vs func=ll&objtype=148).
-            # Using split('?')[0] made every OTCS page look like a retry of the first.
-            if seen_urls and seen_urls[-1] == current_url:
-                is_redundant_nav = True
-            else:
-                is_redundant_nav = False
-                seen_urls.append(current_url)
+    def _build_chrome_frame_html(page_png_b64, url, title, favicon_data_uri="", page_width=1280, page_height=900):
+        is_secure = url.startswith("https://")
+        hostname  = _urlparse(url).hostname or url
+        path_part = _urlparse(url).path or "/"
+        lock_col  = "#188038" if is_secure else "#c5221f"
+        tab_title = title[:30] + "\u2026" if len(title) > 32 else title
+        import time as _t
+        _tzn = _t.tzname[_t.daylight] if _t.daylight else _t.tzname[0]
+        _tz  = "".join(w[0] for w in _tzn.split()) if len(_tzn) > 5 else _tzn
+        ts_label = datetime.now().strftime(f"%Y-%m-%d %H:%M:%S {_tz}")
+        if is_secure:
+            lock_svg = f\'<svg viewBox="0 0 16 16" width="14" height="14" fill="{lock_col}" style="flex-shrink:0"><path d="M8 1a3.5 3.5 0 0 0-3.5 3.5V6H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-.5V4.5A3.5 3.5 0 0 0 8 1zm2 5H6V4.5a2 2 0 1 1 4 0V6z"/></svg>\'
+            secure_label = f\'<span style="font-size:11px;color:{lock_col};font-weight:600;white-space:nowrap">Secure</span>\'
         else:
-            is_redundant_nav = False
-
-        step_info = {
-            "url": current_url,
-            "title": state.get('title'),
-            "evaluation": evaluation,
-            "goal": model_out.get('current_state', {}).get('next_goal'),
-            "actions": [],
-            "dom_elements": []
-        }
-        
-        # Extract actions and their context
-        for act_idx, act in enumerate(action):
-            # PRUNING: Only skip if there was an actual error AND it wasn't a core interaction
-            # Sometimes 'timeouts' happen but the action actually worked (SPA redirects)
-            # We keep 'click', 'input', 'upload' unless they are followed by a successful retry
-            results = item.get('result', [])
-            if act_idx < len(results):
-                res = results[act_idx]
-                if isinstance(res, dict) and res.get('error'):
-                    error_msg = res.get('error', '').lower()
-                    action_type = next(iter(act.keys())) if act else "unknown"
-                    
-                    # If it's a timeout for a core action, keep it - the LLM can decide
-                    if "timeout" in error_msg and action_type in ['click_element', 'input_text', 'upload_file', 'click_element_by_text']:
-                        logger.info(f"Keeping core action {action_type} despite timeout: {error_msg}")
-                    else:
-                        logger.info(f"Pruning action {act_idx} due to error: {res.get('error')}")
-                        continue
-
-            # Skip redundant navigations if they were just retries of the same URL
-            if is_redundant_nav and "go_to_url" in act:
-                continue
-
-            # Create a shallow copy of action to exclude dom_context from the 'actions' list
-            act_copy = {k: v for k, v in act.items() if k != 'dom_context'}
-            step_info['actions'].append(act_copy)
-            
-            if 'dom_context' in act:
-                ctx = act['dom_context']
-                selectors = ctx.get('selectors', {})
-                attrs = ctx.get('attributes', {})
-                comp = ctx.get('comprehensive', {})
-                
-                # ENRICHED ELEMENT DATA: Pass all critical selectors to the LLM
-                comp_attrs = comp.get('all_attributes', {})
-                comp_selectors = {s['type']: s['selector'] for s in comp.get('all_selectors', [])}
-                
-                element_data = {
-                    "tag": ctx.get('tagName') or comp.get('tag'),
-                    "text": selectors.get('text', '') or attrs.get('textContent', '') or comp_attrs.get('title', '') or comp_attrs.get('textContent', ''),
-                    "title": attrs.get('title', '') or comp_attrs.get('title', ''),
-                    "id": attrs.get('id', '') or comp_attrs.get('id', ''),
-                    "name": attrs.get('name', '') or comp_attrs.get('name', ''),
-                    "type": attrs.get('type', '') or comp_attrs.get('type', ''),
-                    "role": attrs.get('role', '') or comp_attrs.get('role', ''),
-                    "aria-label": attrs.get('aria-label', '') or comp_attrs.get('aria-label', ''),
-                    "selectors": {**selectors, **comp_selectors},
-                }
-                element_data["selectors"] = {k: v for k, v in element_data["selectors"].items() if v}
-
-                rec_sel = comp.get('recommended_selector', {}).get('selector', '')
-                if rec_sel:
-                    element_data["recommended_selector"] = rec_sel
-                    
-                step_info['dom_elements'].append(element_data)
-
-                # ── Derive table container selector from captured XPath/CSS ──────
-                # The agent captures the XPath of every element it interacts with.
-                # XPaths rooted at an ancestor with an id look like:
-                #   //*[@id="admin-servers"]/tbody/tr[2]/td[2]/a
-                # From this we can derive the stable CSS selector: #admin-servers table
-                # We store this as table_selector_hint on the step so the postprocessor
-                # and NAVIGATION PLAN can use the REAL selector from the live run,
-                # not a hardcoded guess or a fragile scoring heuristic.
-                if 'table_selector_hint' not in step_info:
-                    _derived = _derive_table_selector(selectors, attrs, comp, comp_selectors)
-                    if _derived:
-                        step_info['table_selector_hint'] = _derived
-                        logger.debug(f"[TABLE-HINT] Derived table selector: {_derived!r} from dom_context")
-
-            if isinstance(act, dict) and "extract_content" in act:
-                goal = act.get("extract_content", {}).get("goal", "") if isinstance(act.get("extract_content", {}), dict) else ""
-                goal_text = f"{objective or ''} {goal}".lower()
-
-                # ── GROUND-TRUTH TABLE REGISTRY ────────────────────────────────────
-                # extract_page_content stores tables_on_page in extracted_content:
-                #   [{selector: "#admin-servers table", headers: [...], row_count: N}, ...]
-                #
-                # MULTI-TABLE SUPPORT: We keep ALL tables found on this page (not just
-                # the best one). Each table gets its own entry in tables_registry with
-                # its exact selector, headers, and derived required columns.
-                #
-                # The navigation plan then lists every table per page so the LLM
-                # generates one resilient_extract_table call per table — never merging
-                # tables from different containers or missing a secondary table.
-                _tables_on_page = []
-                for res in results:
-                    if not isinstance(res, dict):
-                        continue
-                    ec = res.get("extracted_content")
-                    if isinstance(ec, dict):
-                        tops = ec.get("tables_on_page")
-                        if isinstance(tops, list) and tops:
-                            _tables_on_page.extend(tops)
-                        break  # only one extract_content result per step
-
-                if _tables_on_page:
-                    # Score each table by header overlap with goal + objective
-                    def _tbl_score(tbl_entry):
-                        hdrs = [h.lower() for h in (tbl_entry.get("headers") or [])]
-                        score = sum(1 for h in hdrs if h in goal_text or
-                                    any(h in w or w in h for w in goal_text.split()))
-                        # Bonus for tables with more data rows (prefer data over layout)
-                        score += min(tbl_entry.get("row_count", 0), 5) * 0.1
-                        return score
-
-                    # Sort all tables: best match first
-                    scored_tables = sorted(_tables_on_page,
-                                           key=_tbl_score, reverse=True)
-
-                    # Build per-table registry entries
-                    registry = []
-                    for tbl in scored_tables:
-                        tbl_sel  = tbl.get("selector", "")
-                        tbl_hdrs = [h for h in (tbl.get("headers") or []) if h and h.strip()]
-                        if not tbl_sel or not tbl_hdrs:
-                            continue
-
-                        # Derive required columns for this specific table
-                        relevant = [h for h in tbl_hdrs
-                                    if h.lower() in goal_text or
-                                       any(w in h.lower() or h.lower() in w
-                                           for w in goal_text.split())]
-                        tbl_required = relevant if relevant else tbl_hdrs
-
-                        registry.append({
-                            "selector":  tbl_sel,
-                            "headers":   tbl_hdrs,
-                            "required":  tbl_required,
-                            "row_count": tbl.get("row_count", 0),
-                        })
-
-                    if registry:
-                        step_info["tables_registry"] = registry
-                        # Backward-compat single-table fields (primary = highest score)
-                        primary = registry[0]
-                        step_info["table_selector_hint"] = primary["selector"]
-                        step_info["exact_headers"]       = primary["headers"]
-                        step_info["required_columns_hint"] = primary["required"]
-                        logger.info(
-                            f"[TABLE-REGISTRY] {len(registry)} table(s) captured: "
-                            + ", ".join(
-                                f"{t['selector']!r}({len(t['headers'])} cols,"
-                                f"{t['row_count']} rows)"
-                                for t in registry
-                            )
-                        )
-                    else:
-                        # tables_on_page was present but no usable entries
-                        step_info["required_columns_hint"] = (
-                            infer_required_columns(goal_text) or []
-                        )
-
-                else:
-                    # ── Legacy path: no tables_on_page in history ─────────────────
-                    # Fall back to parsing extracted_content JSON for column names
-                    # and deriving the selector from dom_context XPath/CSS.
-                    cols = columns_from_results(results)
-                    if cols:
-                        def _goal_match(col_name):
-                            c_l = col_name.lower()
-                            c_singular = c_l[:-1] if c_l.endswith("s") else c_l
-                            c_plural   = c_l + "s" if not c_l.endswith("s") else c_l
-                            return (c_l in goal_text or c_singular in goal_text
-                                    or c_plural in goal_text)
-                        filtered = [c for c in cols if _goal_match(c)]
-                        required = filtered if filtered else cols
-
-                    else:
-                        required = infer_required_columns(f"{objective or ''} {goal}")
-                    if required:
-                        step_info["required_columns_hint"] = required
-
-
-                 
-        # Final Pruning: Skip steps that contain no successful actions unless it's a Terminal step
-        if not step_info['actions'] and "done" not in str(step_info['goal']).lower():
-            continue
-                
-        simplified.append(step_info)
-    
-    result_data = simplified
-    if objective:
-        result_data = {"objective": objective, "steps": simplified}
-        
-    return json.dumps(result_data, indent=2)
-
-def _extract_table_hints(cleaned_history_json: str):
-    """Extract the best table selector, required columns, and target URL from cleaned history.
-
-    Priority order (highest → lowest):
-      1. table_selector_hint + exact_headers  — ground-truth from tables_on_page capture
-      2. table_selector_hint + required_columns_hint  — derived from XPath / dom_context
-      3. best dom_element selector + required_columns_hint  — legacy heuristic
-      4. _scan_element_data_files()  — element capture fallback
-
-    Returns: (selector, required_columns, target_url)
-    """
-    try:
-        data = json.loads(cleaned_history_json)
-    except Exception:
-        return None, None, None
-
-    steps = data.get("steps") if isinstance(data, dict) else data
-    if not isinstance(steps, list):
-        return None, None, None
-
-    SELECTOR_PRIORITY = ["preferred", "css", "recommended_selector", "xpath", "aria", "text"]
-
-    def _best_selector_from_element(el: dict) -> str | None:
-        if not isinstance(el, dict):
-            return None
-        selectors = el.get("selectors") or {}
-        rec = el.get("recommended_selector", "")
-        if isinstance(rec, dict):
-            rec = rec.get("selector", "")
-        for key in SELECTOR_PRIORITY:
-            val = rec if key == "recommended_selector" else selectors.get(key)
-            if val and isinstance(val, str) and val.strip() and val.strip().lower() != "table":
-                return val.strip()
-        return None
-
-    best_selector = None
-    best_required = None
-    target_url = None
-
-    # Extract target URL
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        url = step.get("url", "")
-        if url and "?" in url and not any(
-            kw in url.lower() for kw in ("login", "otdsws", "signin", "auth/login")
-        ):
-            target_url = url
-            break
-    if not target_url:
-        for step in steps:
-            if isinstance(step, dict):
-                url = step.get("url", "")
-                if url and not any(kw in url.lower() for kw in ("login", "otdsws", "signin")):
-                    target_url = url
-                    break
-
-    # Pass 1A: ground-truth tables_registry (multi-table, highest priority)
-    # Find the best single table across all pages — prefer ground-truth registry
-    # If caller needs all tables per page, use _build_page_table_registry() instead.
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        tbls = step.get("tables_registry")
-        if tbls and isinstance(tbls, list):
-            # Pick the table most relevant to the objective/task
-            # (first entry is already scored as best match by clean_history_json)
-            primary = tbls[0]
-            sel  = primary.get("selector", "")
-            hdrs = primary.get("headers") or []
-            req  = primary.get("required") or hdrs
-            if sel and hdrs:
-                logger.info(
-                    f"[TABLE-HINTS] Ground-truth registry (primary): "
-                    f"selector={sel!r} headers={hdrs} "
-                    f"({len(tbls)} total tables on this page)"
-                )
-                return sel, req, target_url
-
-    # Pass 1B: single-table ground-truth fingerprint (table_selector_hint + exact_headers)
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        sel  = step.get("table_selector_hint")
-        hdrs = step.get("exact_headers")
-        req  = step.get("required_columns_hint")
-        if sel and hdrs:
-            logger.info(
-                f"[TABLE-HINTS] Ground-truth fingerprint: selector={sel!r} headers={hdrs}"
-            )
-            return sel, req or hdrs, target_url
-
-    # Pass 2: table_selector_hint + required_columns_hint (derived path)
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        required = step.get("required_columns_hint")
-        selector = step.get("table_selector_hint")
-        if not selector:
-            for el in step.get("dom_elements", []) or []:
-                sel = _best_selector_from_element(el)
-                if sel:
-                    selector = sel
-                    break
-        if required and selector:
-            return selector, required, target_url
-        if required and best_required is None:
-            best_required = required
-        if selector and best_selector is None:
-            best_selector = selector
-
-    # Pass 3: any step with at least a selector
-    if best_selector or best_required:
-        return best_selector, best_required, target_url
-
-    # Pass 4: element capture data files
-    elem_selector, elem_url = _scan_element_data_files(target_url)
-    if elem_selector:
-        logger.info(f"[TABLE HINTS] Using selector from element capture data: {elem_selector}")
-        return elem_selector, best_required, target_url or elem_url
-
-    return None, None, target_url
-
-
-def _build_page_table_registry(cleaned_history_json: str, run_id: str = None) -> dict:
-    """Build a full URL → [table_entry, ...] registry from cleaned history.
-
-    This is the authoritative multi-table, multi-page data structure.
-    It is consumed by the navigation plan builder to tell the LLM exactly
-    which tables exist on each page, what their CSS selectors are, and what
-    columns to extract — so generated scripts never have to guess.
-
-    Data sources in priority order per page:
-      1. tables_registry  — ground-truth list from tables_on_page JS capture
-         (set by clean_history_json when extract_page_content fires)
-      2. table_selector_hint + exact_headers / required_columns_hint
-         — derived from XPath / dom_context (single-table fallback)
-      3. Legacy required_columns_hint alone (no selector)
-
-    Returns:
-        dict mapping full URL → list of:
-          {
-            "selector":  str,   # CSS selector, e.g. "#admin-servers table"
-            "headers":   list,  # exact live headers, e.g. ["Name","Status","Errors"]
-            "required":  list,  # columns to pass to resilient_extract_table
-            "row_count": int,   # data row count (from live DOM, 0 if unknown)
-          }
-
-        Pages with no tables at all are omitted.
-    """
-    try:
-        data = json.loads(cleaned_history_json)
-    except Exception:
-        return {}
-
-    steps = data.get("steps") if isinstance(data, dict) else data
-    if not isinstance(steps, list):
-        return {}
-
-    # Skip login/auth pages — they never carry data tables we care about
-    _LOGIN_KWS = ("login", "otdsws", "signin", "auth/login", "about:blank")
-
-    registry: dict = {}   # url → [table_entry, ...]
-    seen_selectors_per_url: dict = {}  # url → set of selectors already added
-    all_step_urls: list = []  # every non-login URL seen (for Source 3 fallback)
-
-    # Pre-scan snapshots once if run_id is provided
-    snap_map: dict = {}   # url → path
-    snap_cache: dict = {} # path → json_data
-    if run_id:
-        import time as _time
-        _t0 = _time.time()
-        snap_dir = Path(f"tmp/dom_snapshots/{run_id}")
-        if snap_dir.exists():
-            _files = list(snap_dir.glob("*.json"))
-            logger.info(f"[PERF] Found {len(_files)} snapshots in {snap_dir}")
-            # Assume filename order (timestamp/index) is roughly chronological
-            # to avoid expensive stat() calls on 700+ files
-            for _sp in sorted(_files, reverse=True): 
-                try:
-                    with open(_sp, "r", encoding="utf-8") as _sf:
-                        _meta = _sf.read(3000) # Read enough for URL
-                        _um = re.search(r'"url":\s*"([^"]+)"', _meta)
-                        if _um:
-                            _u = _um.group(1)
-                            if _u not in snap_map:
-                                snap_map[_u] = _sp
-                except Exception:
-                    pass
-        logger.info(f"[PERF] Pre-scan took {_time.time() - _t0:.2f}s (mapped {len(snap_map)} URLs)")
-
-    # Pre-scan element_data once
-    elem_map: dict = {} # url → [table_entry, ...]
-    _ed_dir = Path("tmp/element_data")
-    if _ed_dir.exists():
-        _ed_files = list(_ed_dir.glob("*.json"))
-        for _ef in _ed_files:
+            lock_svg = f\'<svg viewBox="0 0 20 20" width="14" height="14" fill="{lock_col}" style="flex-shrink:0"><path d="M3.7 3.7a.75.75 0 0 0-1.1 1.1l2.2 2.2H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h8a1 1 0 0 1 .6.2l1.7 1.7a.75.75 0 1 0 1.1-1.1L3.7 3.7z"/></svg>\'
+            secure_label = f\'<span style="font-size:11px;color:{lock_col};font-weight:600;white-space:nowrap">Not secure</span>\'
+        if favicon_data_uri:
+            fav_html = f\'<img src="{favicon_data_uri}" width="16" height="16" style="flex-shrink:0;border-radius:2px" onerror="this.style.display=\\\'none\\\'">\' 
+        else:
+            fav_html = \'<svg viewBox="0 0 16 16" width="16" height="16" fill="#5f6368" style="flex-shrink:0"><circle cx="8" cy="8" r="7" fill="none" stroke="#5f6368" stroke-width="1.2"/><ellipse cx="8" cy="8" rx="3" ry="7" fill="none" stroke="#5f6368" stroke-width="1.2"/><line x1="1" y1="8" x2="15" y2="8" stroke="#5f6368" stroke-width="1.2"/></svg>\'
+        css = f"""html,body{{overflow:hidden;}} *{{box-sizing:border-box;margin:0;padding:0;font-family:\'Segoe UI\',-apple-system,sans-serif;}} body{{background:#e8eaed;display:inline-flex;flex-direction:column;}} .window{{display:flex;flex-direction:column;width:{page_width+2}px;box-shadow:0 2px 16px rgba(0,0,0,.25);border-radius:8px 8px 0 0;overflow:hidden;border:1px solid #b0b0b0;}} .tabbar{{background:#dee1e6;display:flex;align-items:flex-end;height:40px;padding-left:10px;flex-shrink:0;}} .tab{{background:#fff;height:34px;padding:0 12px;min-width:180px;max-width:240px;display:flex;align-items:center;gap:8px;border-radius:8px 8px 0 0;font-size:12px;color:#202124;flex-shrink:0;position:relative;}} .tab::before{{content:\'\';position:absolute;bottom:0;left:-8px;width:8px;height:8px;background:transparent;border-bottom-right-radius:8px;box-shadow:2px 2px 0 2px #fff;}} .tab::after{{content:\'\';position:absolute;bottom:0;right:-8px;width:8px;height:8px;background:transparent;border-bottom-left-radius:8px;box-shadow:-2px 2px 0 2px #fff;}} .tab-title{{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:12px;}} .tab-x{{color:#5f6368;font-size:16px;flex-shrink:0;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:50%;line-height:1;}} .newtab{{background:none;border:none;width:28px;height:28px;margin:0 2px;align-self:center;display:flex;align-items:center;justify-content:center;}} .wc{{margin-left:auto;display:flex;height:40px;align-self:flex-start;flex-shrink:0;}} .wb{{width:46px;height:32px;border:none;background:none;display:flex;align-items:center;justify-content:center;}} .wb svg{{fill:#3c4043;width:10px;height:10px;}} .toolbar{{background:#fff;height:40px;display:flex;align-items:center;padding:0 8px;gap:4px;border-bottom:1px solid #dadce0;flex-shrink:0;}} .nb{{width:30px;height:30px;border-radius:50%;border:none;background:none;display:flex;align-items:center;justify-content:center;}} .nb svg{{fill:#c4c7c5;width:16px;height:16px;}} .reload svg{{fill:#5f6368;}} .omni{{flex:1;height:32px;background:#f1f3f4;border-radius:24px;display:flex;align-items:center;gap:6px;padding:0 12px;margin:0 4px;}} .addr{{font-size:14px;color:#202124;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}} .addr-host{{color:#202124;}} .addr-rest{{color:#5f6368;}} .tbb{{width:30px;height:30px;border-radius:50%;border:none;background:none;display:flex;align-items:center;justify-content:center;}} .tbb svg{{fill:#5f6368;width:18px;height:18px;}} .page img{{display:block;}} .status{{background:#f8f9fa;height:22px;display:flex;align-items:center;padding:0 10px;font-size:11px;color:#80868b;border-top:1px solid #e8eaed;flex-shrink:0;justify-content:space-between;}}"""
+        return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>{css}</style></head><body><div class="window">
+  <div class="tabbar"><div class="tab">{fav_html}<span class="tab-title">{tab_title}</span><span class="tab-x">&times;</span></div>
+    <button class="newtab"><svg viewBox="0 0 16 16" width="16" height="16"><path d="M8 1v14M1 8h14" stroke="#5f6368" stroke-width="1.5" fill="none" stroke-linecap="round"/></svg></button>
+    <div class="wc"><button class="wb"><svg viewBox="0 0 10 1"><rect width="10" height="1" fill="#3c4043"/></svg></button><button class="wb"><svg viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" fill="none" stroke="#3c4043" stroke-width="1"/></svg></button><button class="wb"><svg viewBox="0 0 10 10"><path d="M0 0L10 10M10 0L0 10" stroke="#3c4043" stroke-width="1.2"/></svg></button></div></div>
+  <div class="toolbar">
+    <button class="nb"><svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></button>
+    <button class="nb"><svg viewBox="0 0 24 24"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z"/></svg></button>
+    <button class="nb reload"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button>
+    <div class="omni"><span style="flex-shrink:0;display:flex;align-items:center">{lock_svg}</span>{secure_label}<div class="addr"><span class="addr-host">{hostname}</span><span class="addr-rest">{path_part}</span></div></div>
+    <button class="tbb"><svg viewBox="0 0 24 24"><path d="M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2zm0 15l-5-2.18L7 18V5h10v13z"/></svg></button>
+    <button class="tbb"><svg viewBox="0 0 24 24"><path d="M20.5 11H19V7c0-1.1-.9-2-2-2h-4V3.5a2.5 2.5 0 00-5 0V5H4c-1.1 0-2 .9-2 2v3.8h1.5c1.5 0 2.7 1.2 2.7 2.7s-1.2 2.7-2.7 2.7H2V20c0 1.1.9 2 2 2h3.8v-1.5c0-1.5 1.2-2.7 2.7-2.7s2.7 1.2 2.7 2.7V22H17c1.1 0 2-.9 2-2v-4h1.5a2.5 2.5 0 000-5z"/></svg></button>
+    <button class="tbb"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg></button></div>
+  <div class="page"><img src="data:image/png;base64,{page_png_b64}" width="{page_width}" height="{page_height}"></div>
+  <div class="status"><span>{url}</span><span>Captured {ts_label}</span></div>
+</div></body></html>"""
+    steps = []
+    async def capture_step(page, action_name, result_text):
+        # Inline favicon fetcher — do NOT extract this to a separate function
+        async def _get_fav():
             try:
-                with open(_ef, "r", encoding="utf-8") as _f:
-                    _ed = json.load(_f)
-                _u = _ed.get("metadata", {}).get("page_url", "")
-                if not _u: continue
-                # Check if this element data belongs to a table
-                _chain = _ed.get("parentChain", [])
-                _tbl_p = next((p for p in _chain if p.get("tag") == "table"), None)
-                if _tbl_p:
-                    _sel = f"#{_tbl_p.get('id')} table" if _tbl_p.get("id") else "table"
-                    # Try to get headers from textContent or context if possible
-                    # (Usually element_data is for a specific cell, but we can infer headers)
-                    _hdrs = [] # Fallback to empty
-                    _entry = {"selector": _sel, "headers": _hdrs, "required": _hdrs, "row_count": 0}
-                    if _u not in elem_map: elem_map[_u] = []
-                    # Avoid duplicates
-                    if not any(e["selector"] == _sel for e in elem_map[_u]):
-                        elem_map[_u].append(_entry)
+                r = await page.evaluate("""async () => {
+                    const el = document.querySelector("link[rel='icon'],link[rel='shortcut icon'],link[rel='apple-touch-icon']");
+                    const url = el ? el.href : location.origin + '/favicon.ico';
+                    try {
+                        const res = await fetch(url);
+                        if (!res.ok) return '';
+                        const buf = await res.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        let b = ''; bytes.forEach(x => b += String.fromCharCode(x));
+                        return 'data:image/png;base64,' + btoa(b);
+                    } catch { return ''; }
+                }""")
+                return r or ""
             except Exception:
-                pass
-
-    _t_loop = _time.time()
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        url = step.get("url", "")
-        if not url or any(kw in url.lower() for kw in _LOGIN_KWS):
-            continue
-
-        # Track every URL for the Source-3 fallback (even if this step has no table data)
-        if url not in all_step_urls:
-            all_step_urls.append(url)
-
-        # ── Source 2b: Background DOM snapshot extraction ─────────────────────
-        # When a step has no tables_registry AND no selector hint, scan the
-        # saved dom_snapshot for this URL to extract all table headers.
-        if "tables_registry" not in step and not step.get("table_selector_hint"):
-            snap_path = snap_map.get(url)
-            if not snap_path:
-                # Fuzzy URL match
-                for _uk, _up in snap_map.items():
-                    if _uk in url or url in _uk:
-                        snap_path = _up
-                        break
-
-            if snap_path:
-                try:
-                    # Use cache if already loaded
-                    if snap_path in snap_cache:
-                        _snap = snap_cache[snap_path]
-                    else:
-                        with open(snap_path, "r", encoding="utf-8") as _f:
-                            _snap = json.load(_f)
-                        snap_cache[snap_path] = _snap
-
-                    _bg_tables = []
-                    for _el in _snap.get("elements", []):
-                        if (_el.get("identity", {}).get("tagName") or "").lower() == "table":
-                            _html = _el.get("integrity", {}).get("outerHTML", "")
-                            _sel  = _el.get("selector_provenance", {}).get("preferred", "")
-                            _th_matches = re.findall(r'<th[^>]*>(.*?)</th>', _html, re.IGNORECASE | re.DOTALL)
-                            _headers = []
-                            import html as _pyhtml # redundant but safe
-                            for _th in _th_matches:
-                                _txt = re.sub(r'<[^>]+>', '', _th).strip()
-                                _txt = _pyhtml.unescape(_txt)
-                                _txt = re.sub(r'\s+', ' ', _txt).strip()
-                                if _txt:
-                                    _headers.append(_txt)
-                            if _headers and _sel:
-                                _bg_tables.append({
-                                    "selector": _sel,
-                                    "headers":  _headers,
-                                    "required": _headers,
-                                    "row_count": max(0, _html.lower().count("<tr") - 1),
-                                })
-                    if _bg_tables:
-                        logger.info(
-                            f"[TABLE-BG] {url}: Extracted {len(_bg_tables)} tables from {snap_path.name}"
-                        )
-                        _seen_this_run = set()
-                        for _bt in _bg_tables:
-                            _bsel = _bt["selector"]
-                            # If selector is duplicate on this URL, we must differentiate or we lose data.
-                            # We'll use the headers as part of the "seen" check to allow multi-table pages.
-                            # BUT the generated script needs a unique selector.
-                            _header_key = "|".join(_bt["headers"])
-                            _full_key = f"{_bsel}::{_header_key}"
-                            
-                            _seen = seen_selectors_per_url.setdefault(url, set())
-                            if _full_key not in _seen:
-                                _seen.add(_full_key)
-                                # If the selector itself was seen, but with different headers, 
-                                # we have a duplicate-selector issue. Fall back to n-th table?
-                                # For now, we'll just allow it in the registry; Rule 16/17 will handle fixing.
-                                registry.setdefault(url, []).append(_bt)
-                                logger.debug(f"  - Registered table: selector={_bsel!r}, headers={len(_bt['headers'])}")
-                            else:
-                                logger.debug(f"  - Skipped duplicate table (same selector+headers)")
-                except Exception as _bg_err:
-                    logger.warning(f"[TABLE-BG] Failed for {url}: {_bg_err}")
-
-        # ── Source 2c: Element Data extraction ────────────────────────────────
-        # If we have any tables for this URL from element_data (Source 2c),
-        # especially if Source 1/2b missed them.
-        _etbls = elem_map.get(url, [])
-        if _etbls:
-            _added = 0
-            _seen = seen_selectors_per_url.setdefault(url, set())
-            for _et in _etbls:
-                if _et["selector"] not in _seen:
-                    _seen.add(_et["selector"])
-                    registry.setdefault(url, []).append(_et)
-                    _added += 1
-            if _added > 0:
-                logger.debug(f"[TABLE-ELEM] {url}: added {_added} tables from element_data")
-
-        tbls = step.get("tables_registry")  # ground-truth multi-table list
-        if tbls and isinstance(tbls, list):
-            # Source 1: ground-truth tables_registry
-            for tbl in tbls:
-                sel  = tbl.get("selector", "")
-                hdrs = [h for h in (tbl.get("headers") or []) if h and h.strip()]
-                req  = [h for h in (tbl.get("required") or hdrs) if h and h.strip()]
-                if not sel or not hdrs:
-                    continue
-                seen = seen_selectors_per_url.setdefault(url, set())
-                if sel in seen:
-                    continue
-                seen.add(sel)
-                registry.setdefault(url, []).append({
-                    "selector":  sel,
-                    "headers":   hdrs,
-                    "required":  req or hdrs,
-                    "row_count": tbl.get("row_count", 0),
-                })
-            logger.debug(
-                f"[TABLE-REGISTRY] {url}: {len(tbls)} tables from ground-truth capture"
-            )
-
-        elif step.get("table_selector_hint") or step.get("required_columns_hint"):
-            # Source 2: single-table hint (XPath-derived or legacy)
-            sel  = step.get("table_selector_hint", "")
-            hdrs = step.get("exact_headers") or []
-            req  = step.get("required_columns_hint") or hdrs
-            if sel:
-                seen = seen_selectors_per_url.setdefault(url, set())
-                if sel not in seen:
-                    seen.add(sel)
-                    registry.setdefault(url, []).append({
-                        "selector":  sel,
-                        "headers":   hdrs,
-                        "required":  req or hdrs,
-                        "row_count": 0,
-                    })
-            elif req:
-                # No selector known — surface page so nav plan uses networkidle + auto-discover
-                registry.setdefault(url, []).append({
-                    "selector":  "",
-                    "headers":   req,
-                    "required":  req,
-                    "row_count": 0,
-                })
-
-    # ── Source 3: _KNOWN_PAGE_SELECTORS fallback ─────────────────────────────
-    # For pages where the agent either:
-    #   a) Never called extract_content (agent took a different path), OR
-    #   b) Called extract_content but the history predates tables_on_page capture,
-    # inject the verified static selector + columns so the navigation plan always
-    # has something definitive to show the LLM.
-    #
-    # This iterates ALL URLs seen in the steps (not just registry.keys()) so that
-    # pages with no history data at all also get covered.
-    for url in all_step_urls:
-        kp = _known_page_info(url)
-        if not kp:
-            continue
-        known_sel  = kp["selector"]
-        known_cols = kp.get("columns") or []
-
-        if url not in registry:
-            # Page produced no history data at all → inject from known pages
-            registry[url] = [{
-                "selector":  known_sel,
-                "headers":   known_cols,
-                "required":  known_cols,
-                "row_count": 0,
-            }]
-            logger.info(
-                f"[TABLE-REGISTRY] {url}: "
-                f"added from _KNOWN_PAGE_SELECTORS: {known_sel!r}"
-            )
-        else:
-            # Page IS in registry but may have empty/wrong selector entries
-            entries = registry[url]
-            has_good_selector = any(
-                e.get("selector") and e["selector"] != ""
-                for e in entries
-            )
-            if not has_good_selector and known_sel:
-                registry[url] = [{
-                    "selector":  known_sel,
-                    "headers":   known_cols,
-                    "required":  known_cols,
-                    "row_count": 0,
-                }]
-                logger.info(
-                    f"[TABLE-REGISTRY] {url}: "
-                    f"upgraded empty entry → {known_sel!r}"
-                )
-
-    logger.info(f"[PERF] Registry loop took {_time.time() - _t_loop:.2f}s")
-    return registry
-
-
-def _scan_element_data_files(target_url: str = None) -> tuple:
-    """Scan tmp/element_data/*.json for real selectors captured during the agent run.
-    
-    Looks for elements inside table structures (td/tr/tbody ancestors) and
-    builds a CSS selector from the nearest ancestor with an ID.
-    
-    Returns: (table_selector, page_url) or (None, None)
-    """
-    elem_dir = Path("tmp/element_data")
-    if not elem_dir.exists():
-        return None, None
-    
-    best_selector = None
-    best_url = None
-    best_stability = -1
-    
-    for fpath in sorted(elem_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                return ""
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                edata = json.load(f)
-        except Exception:
-            continue
+            screenshot_bytes = await page.screenshot(timeout=5000)
+            cur_url   = page.url
+            cur_title = (await page.title() or _urlparse(cur_url).hostname or "Page")[:60]
+            fav       = await _get_fav()
+            page_b64  = _b64.b64encode(screenshot_bytes).decode()
+            frame_html = _build_chrome_frame_html(page_b64, cur_url, cur_title, fav)
+            tmp = await page.context.new_page()
+            try:
+                await tmp.goto("data:text/html;base64," + _b64.b64encode(frame_html.encode()).decode())
+                await tmp.set_viewport_size({"width": 1325, "height": 2000})
+                fh = await tmp.evaluate("() => { const el=document.querySelector('.window'); return el ? Math.ceil(el.getBoundingClientRect().height)+4 : document.body.scrollHeight; }")
+                await tmp.set_viewport_size({"width": 1284, "height": int(fh)+4})
+                framed = await tmp.locator(".window").screenshot(timeout=8000)
+            finally:
+                await tmp.close()
+            steps.append({"name": action_name, "result": result_text, "image": framed})
+            doc.add_heading(f"Step: {action_name}", level=2)
+            doc.add_paragraph(f"Result: {result_text}")
+            doc.add_picture(io.BytesIO(framed), width=Inches(6))
+            doc.add_page_break()
+'''
+
+# Robust Standalone Helpers - injected into every prompt
+_RESILIENT_HELPERS_CODE = '''\
+    async def find_resilient(page, selector, text=None, timeout=10000):
+        deadline = asyncio.get_event_loop().time() + (timeout / 1000.0)
+        search_target = re.compile(re.escape(text.strip()), re.I) if text else None
         
-        page_url = edata.get("metadata", {}).get("page_url", "")
+        # Support for comma-separated multiple candidate selectors
+        selectors = [s.strip() for s in selector.split(",")]
         
-        # If target_url is known, prefer elements from matching pages
-        if target_url and page_url:
-            from urllib.parse import urlparse
-            t_host = urlparse(target_url).hostname or ""
-            e_host = urlparse(page_url).hostname or ""
-            if t_host and e_host and t_host != e_host:
-                continue
-        
-        # Look for table-related ancestors in parentChain
-        parent_chain = edata.get("parentChain", [])
-        has_table_ancestor = any(
-            p.get("tag") in ("td", "tr", "tbody", "table", "thead")
-            for p in parent_chain
-        )
-        if not has_table_ancestor:
-            continue
-        
-        # Find nearest ancestor with an ID → build table selector
-        file_candidate = None
-        file_stability = -1
+        while asyncio.get_event_loop().time() < deadline:
+            for target in [page] + page.frames:
+                for sel in selectors:
+                    try:
+                        locs = target.locator(sel)
+                        if search_target: locs = locs.filter(has_text=search_target)
+                        if await locs.count() > 0:
+                            for i in range(await locs.count()):
+                                l = locs.nth(i)
+                                if await l.is_visible(): return l
+                    except: continue
+            await asyncio.sleep(0.5)
+        raise TimeoutError(f"Element '{selector}' (text='{text}') not found.")
 
-        for parent in parent_chain:
-            pid = parent.get("id")
-            if pid:
-                # Skip login and layout-related containers
-                pid_lower = pid.lower()
-                ignore_kws = ("login", "signin", "sign-in", "otds", "auth", "password", "menu", "nav", "header", "sidebar", "footer", "toolbar")
-                if any(kw in pid_lower for kw in ignore_kws):
-                    continue
-                file_candidate = f"#{pid} table"
-                # Use stability of the element's recommended selector as tie-breaker
-                rec = edata.get("recommendedSelector", {})
-                file_stability = rec.get("stability", 50) if isinstance(rec, dict) else 50
-                break
-        
-        # Also check xpath for table container IDs if parent chain didn't yield a good candidate
-        if not file_candidate:
-            for sel_entry in edata.get("selectors", []):
-                if sel_entry.get("type") == "xpath":
-                    xpath = sel_entry.get("selector", "")
-                    # Extract @id from xpath like //*[@id="admin-servers"]/table[1]/...
-                    id_match = re.search(r'@id="([^"]+)"', xpath)
-                    if id_match:
-                        pid = id_match.group(1)
-                        pid_lower = pid.lower()
-                        ignore_kws = ("login", "signin", "sign-in", "otds", "auth", "password", "menu", "nav", "header", "sidebar", "footer", "toolbar")
-                        if not any(kw in pid_lower for kw in ignore_kws):
-                            file_candidate = f"#{pid} table"
-                            file_stability = 45  # Slightly lower confidence than a direct parent ID
-                        break
+    async def resilient_click(page, selector, text=None):
+        el = await find_resilient(page, selector, text)
+        await el.click()
 
-        # Apply a massive stability boost if this element was captured during a data extraction action
-        # This prevents generic navigation menus (which the agent clicks) from outranking the actual data table
-        action_context = edata.get("metadata", {}).get("action_context", "").lower()
-        if "retrieve" in action_context or "extract" in action_context:
-            file_stability += 100
-            
-        # Penalize empty structural tables
-        if not edata.get("textContent", "").strip():
-            file_stability -= 50
+    async def resilient_fill(page, selector, value):
+        el = await find_resilient(page, selector)
+        await el.fill(value)
 
-        # If this file yielded a candidate, compare it against the global best
-        if file_candidate and file_stability > best_stability:
-            best_selector = file_candidate
-            best_url = page_url
-            best_stability = file_stability
-    
-    return best_selector, best_url
+    async def resilient_upload(page, target_name, local_path):
+        """Standalone bulk upload with directory expansion."""
+        paths = []
+        if os.path.isdir(local_path):
+            paths = [os.path.join(local_path, f) for f in os.listdir(local_path) if os.path.isfile(os.path.join(local_path, f))]
+        elif os.path.isfile(local_path):
+            paths = [local_path]
+        if not paths: raise FileNotFoundError(f"No files found at {local_path}")
+        async with page.expect_file_chooser() as fc_info:
+            await resilient_click(page, "li[data-binf-action='add-document'], button:visible", text=target_name)
+        await (await fc_info.value).set_files(paths)
+        await page.wait_for_load_state("networkidle")
+        return len(paths)
+'''
 
 
-def _build_action_selector_map(cleaned_history_json: str) -> str:
-    """Build a compact action→selector reference table from cleaned history.
 
-    The LLM is instructed to use ONLY these selectors, which prevents hallucination
-    far more reliably than prose rules alone.
 
-    Returns a formatted string like:
-        STEP 1 | URL: https://...
-          [click_element]   selector: #real-btn  | text: "Submit" | aria-label: "Submit"
-          [input_text]      selector: input[name='q'] | type: "text"
-    """
+_VAULT_SNIPPET = '''\
+# ── Vault credential reader ───────────────────────────────────────────────────
+import sys as _sys
+from pathlib import Path as _Path
+
+def vault_creds(prefix: str) -> dict:
+    """Return {'username': ..., 'password': ...} from the encrypted vault."""
+    # Walk up from this script to find the web-ui root
+    base = _Path(__file__).resolve()
+    for _ in range(8):
+        base = base.parent
+        candidate = base / "web-ui"
+        if candidate.exists():
+            _sys.path.insert(0, str(candidate))
+            break
     try:
-        data = json.loads(cleaned_history_json)
-    except Exception:
+        from src.utils.vault import vault
+        creds = vault.get_credentials(prefix) or vault.get_credentials(prefix.lower())
+        if not creds:
+            raise RuntimeError(f"No vault entry found for prefix '{prefix}'")
+        lower = {k.lower(): v for k, v in creds.items()}
+        def _pick(cs):
+            for c in cs:
+                if c in lower: return lower[c]
+            return list(lower.values())[0] if lower else ""
+        return {
+            "username": _pick(("username","user","login","email")),
+            "password": _pick(("password","passwd","pwd","pass")),
+        }
+    except Exception as e:
+        raise RuntimeError(f"Vault error for '{prefix}': {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+'''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Selector reference
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_selector_map(history_data: dict) -> str:
+    steps = history_data.get("history") or history_data.get("steps") or []
+    if not steps:
         return ""
 
-    steps = data.get("steps") if isinstance(data, dict) else data
-    if not isinstance(steps, list) or not steps:
-        return ""
+    PRIORITY = ["preferred", "id", "css", "recommended_selector", "xpath"]
+    SKIP = {"go_to_url", "done", "scroll", "wait", "extract_content",
+            "check_ssl_certificate", "retrieve_value_by_element"}
 
-    SELECTOR_PRIORITY = ["preferred", "css", "recommended_selector", "xpath", "aria", "text"]
-
-    def _best_sel(el: dict) -> str:
+    def best_sel(el: dict) -> str:
         if not isinstance(el, dict):
             return ""
+        # Handle both dom_context and interacted_element formats
+        el_id = el.get("id") or el.get("attributes", {}).get("id")
+        if el_id and str(el_id).strip():
+            return f"#{el_id}"
+            
+        # Try selectors field (dom_context format)
         sels = el.get("selectors") or {}
-        rec = el.get("recommended_selector", "")
+        rec  = el.get("recommended_selector")
         if isinstance(rec, dict):
             rec = rec.get("selector", "")
-        for key in SELECTOR_PRIORITY:
+            
+        for key in PRIORITY:
             val = rec if key == "recommended_selector" else sels.get(key, "")
-            if val and str(val).strip() and str(val).strip().lower() not in ("table", ""):
-                return str(val).strip()
+            if val and str(val).strip() not in ("", "table"):
+                if "nth-child" not in str(val):
+                    return str(val).strip()
+        
+        # Try attributes (interacted_element format)
+        attrs = el.get("attributes") or {}
+        if attrs.get("data-otname"):
+            return f'[data-otname="{attrs["data-otname"]}"]'
+        if attrs.get("title"):
+             # For a.functionMenuHotspot, title is better than nothing
+            return f'[title="{attrs["title"]}"]'
+            
         return ""
 
-    lines = ["=== SELECTOR REFERENCE TABLE (use ONLY these selectors) ==="]
-    has_any = False
+    lines = ["## SELECTOR REFERENCE (real selectors from the live agent run)"]
+    found_any = False
 
-    for step_idx, step in enumerate(steps):
+    for idx, step in enumerate(steps):
         if not isinstance(step, dict):
             continue
-        actions = step.get("actions", []) or []
-        dom_els = step.get("dom_elements", []) or []
-        url     = step.get("url", "")
+        model_out   = step.get("model_output") or {}
+        raw_actions = model_out.get("action") or []
+        state       = step.get("state") or {}
+        raw_dom     = state.get("interacted_element") or []
+        url         = state.get("url") or step.get("url", "")
+        
+        actions = raw_actions
+        dom_els = raw_dom
+        if not isinstance(dom_els, list):
+            dom_els = [dom_els]
 
-        step_hdr  = f"\nSTEP {step_idx + 1}"
-        if url:
-            step_hdr += f" | URL: {url}"
         step_lines = []
-
-        for act_idx, act in enumerate(actions):
+        for ai, act in enumerate(actions):
             if not isinstance(act, dict):
                 continue
-            action_type = next(iter(act.keys()), "unknown")
-            if action_type in ("go_to_url", "done", "check_ssl_certificate",
-                               "scroll", "wait", "extract_content"):
+            atype = next(iter(act.keys()), "")
+            if atype in SKIP:
                 continue
+            
+            # Match action to dom element
+            el = dom_els[ai] if ai < len(dom_els) else (dom_els[-1] if dom_els else {})
+            if not el and atype == "smart_login":
+                el = act.get("dom_context")
 
-            el   = dom_els[act_idx] if act_idx < len(dom_els) else (dom_els[-1] if dom_els else {})
-            sel  = _best_sel(el)
-            text = str(el.get("text", "") or "")[:60]
-            aria = str(el.get("aria-label", "") or "")[:60]
-            el_type = str(el.get("type", "") or "")
-            tag  = str(el.get("tag", "") or "")
-
-            parts = [f"[{action_type}]  selector: {sel or '(none — use aria/text)'}"]
-            if text:
-                parts.append(f'text: "{text}"')
-            if aria:
-                parts.append(f'aria-label: "{aria}"')
-            if el_type:
-                parts.append(f'type: "{el_type}"')
-            if tag:
-                parts.append(f'tag: <{tag}>')
+            sel   = best_sel(el) if isinstance(el, dict) else ""
+            
+            # Extract text/aria/etc with dual format support
+            if not isinstance(el, dict): el = {}
+            attrs = el.get("attributes") or {}
+            
+            text = str(el.get("text") or attrs.get("text") or el.get("tag_name") or "")[:60].strip()
+            aria = str(el.get("aria-label") or attrs.get("aria-label") or attrs.get("title") or "")[:40].strip()
+            etype = str(el.get("type") or attrs.get("type") or "")
+            
+            parts = [f"  [{atype}]  selector: {sel or '(none)'}"]
+            if text:   parts.append(f'label: "{text}"')
+            if aria:   parts.append(f'description: "{aria}"')
+            if etype:  parts.append(f'type: "{etype}"')
+            
+            # Context for smart_login or menu buttons
+            comp = el.get("comprehensive", {})
+            siblings = comp.get("siblings")
+            row_ctx = comp.get("row_context")
+            
+            if (atype == "smart_login" or "menu" in str(sel).lower() or row_ctx) and "outerHTML" in el:
+                html_context = el["outerHTML"].replace("\n", " ")[:1000]
+                parts.append(f'context: "{html_context}..."')
+                
+                if row_ctx and row_ctx.get("allCellText"):
+                    cells = ", ".join([f"'{t}'" for t in row_ctx["allCellText"]])
+                    parts.append(f'row_context: [ {cells} ]')
+                
+                if siblings:
+                    prev = siblings.get("prev")
+                    next_sib = siblings.get("next")
+                    if prev: parts.append(f"prev_sibling: <{prev['tag']}> \"{prev['text']}\"")
+                    if next_sib: parts.append(f"next_sibling: <{next_sib['tag']}> \"{next_sib['text']}\"")
 
             step_lines.append("  " + " | ".join(parts))
-            has_any = True
+            found_any = True
 
         if step_lines:
-            lines.append(step_hdr)
+            hdr = f"\nSTEP {idx + 1}"
+            if url:
+                hdr += f" | {url}"
+            lines.append(hdr)
             lines.extend(step_lines)
 
-    if not has_any:
+    if not found_any:
         return ""
-
-    lines.append("\n=== END SELECTOR REFERENCE TABLE ===")
+    lines.append("")
     return "\n".join(lines)
 
+def _compact_history(history_data: dict) -> str:
+    steps = history_data.get("history") or history_data.get("steps") or []
+    out = []
+    seen_urls: set = set()
 
-def _build_element_data_context() -> str:
-    """Build a concise summary of captured element data for the LLM prompt.
-    
-    Returns a formatted string summarizing real selectors, parent structure,
-    and page URLs from tmp/element_data/*.json files.
-    """
-    elem_dir = Path("tmp/element_data")
-    if not elem_dir.exists():
-        return ""
-    
-    summaries = []
-    seen_hashes = set()
-    
-    for fpath in sorted(elem_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                edata = json.load(f)
-        except Exception:
+    for step in steps:
+        if not isinstance(step, dict):
             continue
-        
-        ehash = edata.get("elementHash", "")
-        if ehash in seen_hashes:
-            continue
-        seen_hashes.add(ehash)
-        
-        tag = edata.get("tagName", "?")
-        text = (edata.get("textContent") or "")[:60]
-        url = edata.get("metadata", {}).get("page_url", "")
-        action = edata.get("metadata", {}).get("action_context", "")
-        
-        # Get best selector
-        rec = edata.get("recommendedSelector", {})
-        sel = rec.get("selector", "") if isinstance(rec, dict) else ""
-        
-        # Get parent container with ID
-        container = ""
-        for parent in edata.get("parentChain", []):
-            pid = parent.get("id")
-            if pid:
-                container = f"#{pid}"
-                break
-        
-        parts = [f'- <{tag}> "{text}"']
-        if sel:
-            parts.append(f"  Selector: {sel}")
-        if container:
-            parts.append(f"  Container: {container} table")
-        if url:
-            parts.append(f"  Page: {url}")
-        if action:
-            parts.append(f"  Action: {action}")
-        
-        summaries.append("\n".join(parts))
-    
-    if not summaries:
-        return ""
-    
-    return "\n\nCAPTURED ELEMENT DATA (real selectors from the page — use these instead of guessing):\n" + "\n".join(summaries)
+        state     = step.get("state") or {}
+        model_out = step.get("model_output") or {}
+        results   = step.get("result") or []
+        url       = state.get("url") or step.get("url", "")
+        raw_actions   = model_out.get("action") or []
+        clean_actions = step.get("actions") or []
+        step_actions  = raw_actions if raw_actions else clean_actions
+
+        for ai, act in enumerate(step_actions):
+            if not isinstance(act, dict):
+                continue
+            atype  = next(iter(act.keys()), "")
+            params = act.get(atype) or {}
+            res = results[ai] if ai < len(results) else {}
+            if isinstance(res, dict) and res.get("error"):
+                continue
+
+            entry: dict = {"action": atype}
+            if url and url not in seen_urls:
+                entry["url"] = url
+                seen_urls.add(url)
+            if isinstance(params, dict):
+                safe = {k: v for k, v in params.items()
+                        if k not in ("dom_context", "element_info")
+                        and not (isinstance(v, str) and len(v) > 500)}
+                if safe:
+                    entry["params"] = safe
+            if isinstance(res, dict):
+                content = res.get("extracted_content", "")
+                if content and isinstance(content, str):
+                    entry["result"] = content[:300]
+
+            out.append(entry)
+
+    return json.dumps(out, indent=2, ensure_ascii=False)
 
 
-def _is_login_selector(sel: str) -> bool:
-    """Return True if a selector looks like a login-form field, not a data table."""
-    login_patterns = [
-        r'#otds_username', r'#otds_password', r'#username', r'#password',
-        r'input\[name=["\']?(?:username|password|user|otds_username|otds_password)',  # detection patterns — intentional
-        r'input\[type=["\']?(?:password|text)',
-        r'input#(?:username|password)',
-    ]
-    sel_lower = sel.lower()
-    return any(re.search(p, sel_lower) for p in login_patterns)
+# ─────────────────────────────────────────────────────────────────────────────
+# DOM Context Extraction
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def _postprocess_generated_code(code: str, cleaned_history_json: str, tbl_registry: dict | None = None) -> str:
-    """Enforce correct structure in LLM-generated scripts.
-
-    The LLM is instructed to only write async def run(), importing all helpers
-    from src.utils.script_helpers. This function enforces that contract:
-
-      0. Merge duplicate run() blocks (mandatory + process concatenated).
-      1. Inject 'from src.utils.script_helpers import ...' if missing.
-      2. Strip any helper function bodies the LLM hallucinated (get_secret,
-         find_in_frames, resilient_*, maybe_login, generate_report, etc.).
-      3. Rewrite wrong/login-field table selectors to the resolved DOM selector.
-      4. Inject required columns (with identity key) into extraction calls.
-      5. Ensure maybe_login(page) is called after page.goto.
-      6. Fix post-login wait_for_selector if it targets a login field.
-      7. Normalise row identity access to safe .get() fallback chain.
-      8. Strip unused 'import re' and 'from docx import Document'.
-      9. Replace bare 'except:' with 'except Exception as _e:'.
-     10. Normalise hardcoded vault key names to use VAULT_CREDENTIAL_PREFIX.
-     11. Strip redundant manual login steps that duplicate maybe_login.
-    """
-    selector, required, process_url = _extract_table_hints(cleaned_history_json)
-    elem_selector, _ = _scan_element_data_files(process_url)
-    # _KNOWN_PAGE_SELECTORS and _known_page_info() are defined at module level
-    # (above SYSTEM_PROMPT) so Rule 16 and other postprocessor rules reference them directly.
-
-    # ── -1: Repair garbled string literals before any other processing ────────
-    # LLM occasionally emits broken strings like:
-    #   table_selector = "some/selector"ExtraGarbage\")"
-    # This is a syntax error. Fix by truncating at the closing quote.
-    def _repair_broken_strings(src: str) -> str:
-        """Fix lines where a Python string literal has trailing garbage after its closing quote."""
-        fixed_lines = []
-        changed = False
-        for line in src.splitlines(keepends=True):
-            # Pattern: variable = "..." followed by non-whitespace/non-comment junk
-            m = re.match(
-                r'^(\s*\w+\s*=\s*)(")([^"\\]*(?:\\.[^"\\]*)*)"(.+)$',
-                line.rstrip('\n\r')
-            )
-            if m:
-                pre, q, content, junk = m.group(1), m.group(2), m.group(3), m.group(4)
-                # Only repair if junk looks wrong (not a comment, not a comma/paren)
-                junk_stripped = junk.strip()
-                if junk_stripped and not junk_stripped.startswith(('#', ',', ')', ']', '+')):
-                    fixed = f'{pre}"{content}"\n'
-                    logger.warning(f"[POST] Repaired garbled string literal. Removed: {junk_stripped!r}")
-                    fixed_lines.append(fixed)
-                    changed = True
-                    continue
-            fixed_lines.append(line)
-        return "".join(fixed_lines) if changed else src
-
-    def _repair_broken_join(src: str) -> str:
-        """Repair the common LLM mistake of dropping '.join([' from the output line.
-
-        The LLM emits:
-            output = "\\n"
-                    f"Identity: ..."
-                    for row in rows
-                    ])
-
-        But should emit:
-            output = "\\n".join([
-                f"Identity: ..."
-                for row in rows
-            ])
-        """
-        # Match: output = "\\n" (newline, no .join) followed by an f-string continuation
-        broken = re.compile(
-            r'(\s*)(output\s*=\s*"\\n")\s*\n'   # output = "\n"  ← missing .join([
-            r'(\s+)(f["\'].+?["\'])\s*\n'         # f"..." line
-            r'(\s+for\s+\w+\s+in\s+\w+)\s*\n'    # for row in rows
-            r'(\s*\]\))',                           # ])
-            re.DOTALL
-        )
-        def _fix_join(m):
-            indent  = m.group(1)
-            inner   = m.group(3)
-            fstring = m.group(4)
-            for_clause = m.group(5).strip()
-            logger.warning("[POST] Repaired broken output=\\n join expression")
-            return (
-                f'{indent}output = "\\n".join([\n'
-                f'{inner}{fstring}\n'
-                f'{inner}{for_clause}\n'
-                f'{indent}])'
-            )
-        fixed = broken.sub(_fix_join, src)
-
-        # Second pattern: output = "\n" on its own line, f-string body, for clause, no bracket
-        # output = "\n"
-        # f"Identity..."
-        # for row in rows
-        # ← missing the wrapping entirely
-        broken2 = re.compile(
-            r'(\s*)(output\s*=\s*"\\n")\n'
-            r'(\s+)(f["\'].+?["\'])\n'
-            r'(\s+)(for\s+\w+\s+in\s+\w+)\n'
-            r'(?!\s*\]\))',   # NOT followed by ])
-        )
-        def _fix_join2(m):
-            indent     = m.group(1)
-            inner      = m.group(3)
-            fstring    = m.group(4)
-            for_kw     = m.group(5)
-            for_clause = m.group(6)
-            logger.warning("[POST] Repaired broken output join (no brackets)")
-            return (
-                f'{indent}output = "\\n".join([\n'
-                f'{inner}{fstring}\n'
-                f'{for_kw}{for_clause}\n'
-                f'{indent}])\n'
-            )
-        fixed = broken2.sub(_fix_join2, fixed)
-        return fixed
-
-    code = _repair_broken_strings(code)
-    code = _repair_broken_join(code)
-
-    # ── -0: Validate Python syntax — warn loudly if broken ────────────────────
-    import ast as _ast
+def _get_dom_context(history_path: str, step_index: int, target_index: int = None) -> str:
+    """Find and summarize the DOM snapshot for a specific step."""
     try:
-        _ast.parse(code)
-    except SyntaxError as _syn:
-        logger.error(f"[POST] Generated code has syntax error at line {_syn.lineno}: {_syn.msg}")
-        # Inject a visible comment so the file doesn't silently fail
-        code = f"# ❌ SYNTAX ERROR (line {_syn.lineno}): {_syn.msg}\n# Fix this before running.\n\n" + code
+        hist_p = Path(history_path)
+        run_id = hist_p.stem
+        snapshot_dir = hist_p.parent.parent.parent / "dom_snapshots" / run_id
+        snapshot_file = snapshot_dir / f"{step_index}.json"
+        
+        if not snapshot_file.exists():
+            return ""
 
-    # ── 0: Merge duplicate run() blocks ──────────────────────────────────────
-    # When mandatory + process scripts are concatenated, two full script blocks
-    # appear separated by 'if __name__ == "__main__": asyncio.run(run())'.
-    # Strategy: split on entrypoint boundaries, extract each run() body,
-    # deduplicate browser setup, merge task steps, reconstruct one clean script.
-    _entrypoint_pat = re.compile(
-        r'if __name__\s*==\s*["\']__main__["\']\s*:\s*\n\s*asyncio\.run\(run\(\)\)'
-    )
-    entrypoint_positions = [m.start() for m in _entrypoint_pat.finditer(code)]
+        with open(snapshot_file, "r", encoding="utf-8") as f:
+            dom_data = json.load(f)
+        
+        context_parts = []
+        elements = dom_data.get("elements", [])
 
-    if len(entrypoint_positions) > 1:
-        logger.info(f"[POST] Merging {len(entrypoint_positions)} script blocks into one")
+        # 1. Target Element
+        if target_index is not None:
+            target = next((el for el in elements if el.get("identity", {}).get("order") == target_index), None)
+            if target:
+                context_parts.append(f"TARGET ELEMENT (Idx {target_index}):\n{_summarize_node(target)}")
 
-        # Split code into segments at each entrypoint
-        segments = []
-        prev = 0
-        for pos in entrypoint_positions:
-            end = _entrypoint_pat.search(code, pos).end()
-            segments.append(code[prev:end])
-            prev = end
-        if prev < len(code):
-            segments.append(code[prev:])
+        # 2. Extract Tables (High-Value Landmarks)
+        table_count = 0
+        for el in elements:
+            if el.get("identity", {}).get("tagName") == "table":
+                # For flat JSON, the "text" property in provenance contains the flattened table content
+                summary = el.get("selector_provenance", {}).get("text", "")[:1200]
+                if summary.strip():
+                    t_id = el.get("attribute_fingerprint", {}).get("id", "none")
+                    frame = el.get("identity", {}).get("frame_path", [])
+                    context_parts.append(f"Table(id='{t_id}', frame={frame}):\n  {summary}")
+                    table_count += 1
+                if table_count >= 5: break
 
-        # Extract the header (imports + bootstrap) from the LAST segment
-        # (it has the most complete imports after postprocessing merges)
-        def _split_header_body(seg):
-            """Return (header_str, run_body_str) for a segment."""
-            run_start = seg.find("async def run():\n")
-            if run_start == -1:
-                return seg, ""
-            header = seg[:run_start]
-            after_def = seg[run_start + len("async def run():\n"):]
-            # Body = everything from first indented line up to (not including) if __name__
-            ep = _entrypoint_pat.search(after_def)
-            body = after_def[:ep.start()].rstrip("\n") + "\n" if ep else after_def
-            return header, body
+        # 3. Structure Summary (Fallback)
+        if not context_parts:
+            struct = "\n".join([f"<{e.get('identity',{}).get('tagName')}> {e.get('selector_provenance',{}).get('text','')[:50]}" 
+                              for e in elements[:20]])
+            context_parts.append(f"PAGE STRUCTURE:\n{struct}")
 
-        # Use last segment's header (most up to date imports)
-        best_header, _ = _split_header_body(segments[-1])
+        return "\n\n".join(context_parts)
+    except Exception as e:
+        logger.warning(f"[_get_dom_context] Failed: {e}")
+        return ""
 
-        # Collect all run() bodies in order
-        all_bodies = []
-        for seg in segments:
-            _, body = _split_header_body(seg)
-            if body.strip():
-                all_bodies.append(body)
+def _summarize_node(node: dict) -> str:
+    """Compact summary of an element node from flat structure."""
+    meta = node.get("identity", {})
+    attrs = node.get("attribute_fingerprint", {})
+    prov = node.get("selector_provenance", {})
+    
+    parts = [
+        f"Tag: <{meta.get('tagName')}>",
+        f"ID: {attrs.get('id') or 'none'}",
+        f"Frame: {meta.get('frame_path') or 'Main'}",
+        f"Text Sample: {prov.get('text', '')[:150].strip()}",
+        f"OuterHTML: {node.get('integrity', {}).get('outerHTML', '')[:400]}..."
+    ]
+    return "\n  ".join(parts)
+    return parts
 
-        # Merge bodies: keep browser setup from first body only
-        _browser_setup_kws = (
-            "async with async_playwright",
-            "p.chromium.launch",
-            "browser.new_context",
-            "context.new_page",
-        )
-        merged_lines = []
-        browser_setup_seen = False
-        close_line = None
+def _get_text_recursive(node: dict) -> str:
+    """Legacy helper for tree structures."""
+    return ""
+    if not isinstance(node, dict): return icons
+    if node.get("tagName") in ("img", "svg"):
+        attrs = node.get("attributes", {})
+        label = attrs.get("title") or attrs.get("alt") or attrs.get("aria-label") or ""
+        if label: icons.append(label)
+        elif node.get("tagName") == "svg":
+            # Check class list for status-like names
+            cls = " ".join(node.get("classList", []))
+            if any(s in cls.lower() for s in ("success", "running", "error", "failed", "check", "warn")):
+                icons.append(f"svg-icon({cls})")
+    
+    for child in node.get("children", []):
+        icons.extend(_find_icons_recursive(child))
+    return list(set(icons))
 
-        for body_idx, body in enumerate(all_bodies):
-            body_lines = body.splitlines(keepends=True)
-            in_browser_block = False
-            for line in body_lines:
-                stripped = line.strip()
 
-                # Defer browser.close() to very end
-                if "await browser.close()" in line:
-                    close_line = line
+# ─────────────────────────────────────────────────────────────────────────────
+# DOM Digest — scans ALL snapshots for a run, builds a compact DOM Intelligence
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_dom_digest(history_path: str) -> str:
+    """Scan ALL DOM snapshots for this run and return a compact DOM Intelligence block.
+    
+    Extracts:
+    - Every table#id with its header row (column names)
+    - Duplicate ID detection: flags when the SAME id appears >1 time in a single snapshot
+    - key input/form element IDs
+    - Elements with data-otname or significant aria-label attributes
+    """
+    try:
+        hist_p = Path(history_path)
+        run_id = hist_p.stem
+        snapshot_dir = hist_p.parent.parent.parent / "dom_snapshots" / run_id
+        if not snapshot_dir.exists():
+            return ""
+
+        # tables[el_id] -> list of occurrences (one per unique table content seen)
+        # Each occurrence: {frame, selector, headers, sample_rows, snap_file, count_in_snap}
+        tables: dict = {}
+        inputs: dict = {}
+        buttons: list = []
+
+        for snap_file in sorted(snapshot_dir.glob("*.json"), key=lambda p: int(p.stem) if p.stem.isdigit() else 0):
+            try:
+                with open(snap_file, "r", encoding="utf-8") as f:
+                    dom_data = json.load(f)
+                elements = dom_data.get("elements", [])
+                if not isinstance(elements, list):
                     continue
 
-                # Track/skip duplicate browser setup lines
-                is_setup = any(kw in stripped for kw in _browser_setup_kws)
-                if is_setup:
-                    if browser_setup_seen:
-                        in_browser_block = True
+                # Count how many times each table ID appears IN THIS SINGLE SNAPSHOT
+                id_counts_in_snap: dict = {}
+                for el in elements:
+                    if not isinstance(el, dict): continue
+                    meta  = el.get("identity", {})
+                    attrs = el.get("attribute_fingerprint", {})
+                    if meta.get("tagName", "").lower() == "table" and attrs.get("id"):
+                        tid = attrs["id"]
+                        id_counts_in_snap[tid] = id_counts_in_snap.get(tid, 0) + 1
+
+                for el in elements:
+                    if not isinstance(el, dict):
                         continue
-                    else:
-                        in_browser_block = False  # first occurrence: keep
-                elif in_browser_block and stripped and not stripped.startswith("#"):
-                    # Once we exit setup keywords, we're back in task logic
-                    in_browser_block = False
-
-                # Collapse excessive blank lines between merged blocks
-                if not stripped and merged_lines and not merged_lines[-1].strip():
-                    continue
-
-                merged_lines.append(line)
-
-            browser_setup_seen = True
-            # Add a blank line separator between merged sections
-            if merged_lines and merged_lines[-1].strip() and body_idx < len(all_bodies) - 1:
-                merged_lines.append("\n")
-
-        if close_line:
-            if merged_lines and merged_lines[-1].strip():
-                merged_lines.append("\n")
-            merged_lines.append(close_line)
-
-        merged_body = "".join(merged_lines)
-
-        # Deduplicate maybe_login: only the FIRST call is needed (session persists)
-        first_login_seen = False
-        deduped = []
-        for line in merged_body.splitlines(keepends=True):
-            if "await maybe_login(page)" in line:
-                if first_login_seen:
-                    logger.info("[POST] Removed duplicate maybe_login(page) call")
-                    continue
-                first_login_seen = True
-            deduped.append(line)
-        merged_body = "".join(deduped)
-
-        # Build best header: use imports/bootstrap from last segment
-        # Find everything before 'async def run():' in the last segment
-        last_seg = segments[-1]
-        run_def_idx = last_seg.find("async def run():\n")
-        best_header = last_seg[:run_def_idx] if run_def_idx != -1 else ""
-
-        # If header is empty/short (bootstrap missing), fall back to first segment
-        if best_header.count("\n") < 5:
-            first_seg = segments[0]
-            run_def_idx0 = first_seg.find("async def run():\n")
-            if run_def_idx0 != -1:
-                best_header = first_seg[:run_def_idx0]
-
-        code = (
-            best_header.rstrip("\n") + "\n"
-            + "async def run():\n"
-            + merged_body
-            + '\nif __name__ == "__main__":\n'
-            + "    asyncio.run(run())\n"
-        )
-
-
-    # ── 1: Ensure script_helpers import is present ────────────────────────────
-    helpers_import = (
-        "from src.utils.script_helpers import (\n"
-        "    get_secret, find_in_frames,\n"
-        "    resilient_fill, resilient_click, click_and_upload_file,\n"
-        "    maybe_login, resilient_extract_table, generate_report,\n"
-        "    check_certificate,\n"
-        ")"
-    )
-    if "from src.utils.script_helpers import" not in code:
-        # Insert AFTER the entire if/else bootstrap block, not inside it.
-        # The bootstrap always ends with the else-branch sys.path.append line.
-        # Pattern: else:\n    sys.path.append(...)\n
-        inserted = False
-        if "sys.path.append" in code:
-            # Match the full bootstrap block: if ...:\n    sys.path.append\nelse:\n    sys.path.append
-            new_code = re.sub(
-                r'((?:if[^\n]+\n[ \t]+sys\.path\.append\([^\n]+\)\n'   # if branch
-                r'else:\n[ \t]+sys\.path\.append\([^\n]+\)\n))',         # else branch
-                r'\1\n' + helpers_import + '\n',
-                code, count=1,
-            )
-            if new_code != code:
-                code = new_code
-                inserted = True
-            else:
-                # Fallback: after the last sys.path.append line in the file header
-                new_code = re.sub(
-                    r'(sys\.path\.append\([^\n]+\)\n)(?!\n*sys\.path\.append)',
-                    r'\1\n' + helpers_import + '\n',
-                    code, count=1,
-                )
-                if new_code != code:
-                    code = new_code
-                    inserted = True
-
-        if not inserted:
-            code = re.sub(
-                r'(from playwright\.async_api import async_playwright\n)',
-                r'\1' + helpers_import + '\n',
-                code, count=1,
-            )
-        if "from src.utils.script_helpers import" not in code:
-            code = helpers_import + "\n" + code
-
-    # Strip now-redundant imports that script_helpers already handles internally
-    code = re.sub(r'^from docx import Document\s*\n', '', code, flags=re.MULTILINE)
-    code = re.sub(r'^from src\.utils\.vault import vault\s*\n', '', code, flags=re.MULTILINE)
-    # Strip old monolithic config import (script_helpers + generated header cover these)
-    code = re.sub(
-        r'^from src\.utils\.config import \([^)]+\)\n', '', code, flags=re.MULTILINE | re.DOTALL
-    )
-
-    # ── 2: Strip hallucinated helper function definitions ─────────────────────
-    # Names that must NOT be redefined — they live in script_helpers.py
-    _HELPER_NAMES = (
-        "get_secret", "find_in_frames", "resilient_fill", "resilient_click",
-        "click_and_upload_file", "maybe_login", "resilient_extract_table",
-        "generate_report",
-    )
-
-    def _strip_async_def(src: str, fn_name: str) -> str:
-        """Remove an async def block for fn_name from src."""
-        pattern = rf'(?m)^async def {re.escape(fn_name)}\b.*?(?=\n(?:async def |def |class |\Z))'
-        match = re.search(pattern, src, re.DOTALL)
-        if match:
-            logger.info(f"[POST] Stripped hallucinated helper: async def {fn_name}")
-            src = src[:match.start()] + src[match.end():]
-        return src
-
-    for name in _HELPER_NAMES:
-        if re.search(rf'^async def {re.escape(name)}\b', code, re.MULTILINE):
-            code = _strip_async_def(code, name)
-
-    # ── 3: Rewrite wrong/login-field table selectors ──────────────────────────
-    # IMPORTANT: rewrites are URL-scoped.  A script that visits multiple pages
-    # (e.g. a Distributed-Agent page AND an Admin-Servers page) has different
-    # correct selectors per page.  Applying a single global regex replacement
-    # would stamp "#admin-servers table" onto the wrong page's wait_for_selector
-    # call and cause a timeout.
-    #
-    # Strategy: walk line-by-line, track the most recent page.goto() URL, and
-    # only rewrite a selector call when we are "on" the target page (i.e. the
-    # most recent goto URL matches or contains process_url).
-
-    def _is_fragile_selector(s: str) -> bool:
-        """Return True if the selector is positional/brittle and should be replaced."""
-        if re.search(r':nth-(?:child|of-type)\(', s):
-            return True
-        if re.match(r'^(?:html\s*>?\s*)?body\s*(?:>?\s*\w+)*\s*>?\s*table\b', s.strip()):
-            return True
-        return False
-
-    def _should_replace(sel_str: str, on_target_page: bool = True) -> bool:
-        s = sel_str.strip().strip('"\'')
-        # Always replace login selectors and bare "table" regardless of page
-        if s == "table" or _is_login_selector(s):
-            return True
-        if _is_fragile_selector(s):
-            logger.info(f"[POST] Replacing fragile positional selector: '{s}'")
-            return True
-        # Only replace container-less selectors when we are on the correct page
-        if not on_target_page:
-            return False
-        if elem_selector and not any(tag in s.lower() for tag in ['table', 'tr', 'tbody', 'thead', '#']):
-            logger.info(f"[POST] LLM selector '{s}' lacks container context. Forcing '{elem_selector}'.")
-            return True
-        return False
-
-    final_selector = elem_selector if (elem_selector and selector and _should_replace(selector)) else selector
-
-    if final_selector:
-        from urllib.parse import urlparse as _up
-
-        # Derive a URL "fingerprint" for the target page so we can match gotos.
-        # Use the query-string portion of process_url (e.g. "func=ll&objtype=148")
-        # which is stable regardless of host/port.
-        _proc_qs = ""
-        if process_url:
-            _parsed = _up(process_url)
-            _proc_qs = _parsed.query or _parsed.path  # fallback to path if no query
-
-        def _url_is_target(url: str) -> bool:
-            """Return True if url looks like the page where final_selector lives."""
-            if not _proc_qs:
-                return True   # no process URL known — allow rewrite everywhere
-            return _proc_qs in url
-
-        sel_literal = json.dumps(final_selector)
-        _str_pat = r'(["\'])(?:(?=(\\?))\2.)*?\1'   # any Python string literal
-
-        # Line-by-line rewrite with URL tracking
-        new_lines = []
-        current_url = ""   # most recent page.goto() target seen so far
-        on_target   = not bool(_proc_qs)  # True from the start if we have no URL hint
-
-        for line in code.splitlines(keepends=True):
-            # Track page.goto(URL) to know which page we are on
-            goto_m = re.search(r'page\.goto\(\s*(["\'][^"\']+["\'])', line)
-            if goto_m:
-                current_url = goto_m.group(1).strip("'\"")
-                on_target   = _url_is_target(current_url)
-
-            # wait_for_selector
-            def _fix_wait(m, _on=on_target):
-                return f'page.wait_for_selector({sel_literal}' if _should_replace(m.group(1), _on) else m.group(0)
-            line = re.sub(rf'page\.wait_for_selector\({_str_pat}', _fix_wait, line)
-
-            # resilient_extract_table
-            def _fix_extract(m, _on=on_target):
-                return f'resilient_extract_table(page, {sel_literal}' if _should_replace(m.group(1), _on) else m.group(0)
-            line = re.sub(rf'resilient_extract_table\(\s*page\s*,\s*{_str_pat}', _fix_extract, line)
-
-            # table_selector = "..."
-            def _fix_table_var(m, _on=on_target):
-                return f'table_selector = {sel_literal}' if _should_replace(m.group(1), _on) else m.group(0)
-            line = re.sub(rf'table_selector\s*=\s*{_str_pat}', _fix_table_var, line)
-
-            # page.locator("...")
-            def _fix_locator(m, _on=on_target):
-                return f'page.locator({sel_literal}' if _should_replace(m.group(1), _on) else m.group(0)
-            line = re.sub(rf'page\.locator\({_str_pat}', _fix_locator, line)
-
-            new_lines.append(line)
-
-        code = "".join(new_lines)
-
-    # ── 4: Inject required columns (with identity key) ────────────────────────
-    if required:
-        if not any(c.lower() in ('server', 'name') for c in required):
-            required = list(required) + ['Server']
-        req_literal = json.dumps(required)
-        code = re.sub(
-            r'(resilient_extract_table\(\s*page\s*,\s*[^,]+,\s*)(\[[^\]]*\])',
-            rf'\1{req_literal}', code,
-        )
-
-    # ── 5: Ensure maybe_login(page) is called after first page.goto ──────────
-    if "maybe_login(page)" not in code:
-        code = re.sub(
-            r'(await page\.goto\([^\n]+\)\n)',
-            r'\1        await maybe_login(page)\n',
-            code, count=1,
-        )
-
-    # ── 6: Fix post-login wait if it targets a login-field selector ──────────
-    if selector and "await maybe_login(page)" in code:
-        sel_literal = json.dumps(selector)
-        lines = code.splitlines(keepends=True)
-        past_login, fixed_lines = False, []
-        for line in lines:
-            if "await maybe_login(page)" in line:
-                past_login = True
-            if past_login and "wait_for_selector" in line:
-                m = re.search(r'wait_for_selector\((["\'][^"\']+["\'])', line)
-                if m and _is_login_selector(m.group(1).strip("'\"")):
-                    line = re.sub(
-                        r'wait_for_selector\(["\'][^"\']+["\']',
-                        f'wait_for_selector({sel_literal}', line,
-                    )
-                    logger.info(f"[POST] Fixed post-login wait → {selector}")
-            fixed_lines.append(line)
-        code = "".join(fixed_lines)
-
-    # ── 7: Normalise row identity access ─────────────────────────────────────
-    _id = "(row.get('Server') or row.get('Name') or 'Unknown')"
-    _core = re.escape("row.get('Server') or row.get('Name') or 'Unknown'")
-
-    def _collapse_redundant(src):
-        # Matches the full outer expression including any extra wrapping parens:
-        #   ((row.get('Server') or ... or 'Unknown') or row.get('Name') or 'Unknown')
-        # The outer \(? and \)? handle the optional extra paren that wraps the whole thing.
-        return re.sub(
-            r'\(?'    # optional outer open paren
-            r'\(+'    # one or more inner open parens
-            + _core +
-            r'\)+'    # one or more inner close parens
-            r'\s*or\s*row\.get\([\'"]Name[\'"]\)\s*or\s*[\'"]Unknown[\'"]'
-            r'\)?',   # optional outer close paren
-            _id, src,
-        )
-
-    code = _collapse_redundant(code)           # pre-existing redundant chains
-    code = re.sub(r"row\[['\"]Server['\"]\]", _id, code)
-    code = re.sub(r"row\.get\(['\"]Server['\"](?:,\s*['\"][^'\"]*['\"])?\)", _id, code)
-    code = re.sub(r"row\[['\"]Status['\"]\]", "row.get('Status', '')", code)
-    code = re.sub(r"row\[['\"]Errors['\"]\]", "row.get('Errors', '')", code)
-    code = re.sub(r"row\[['\"]Name['\"]\]",   "row.get('Name', '')",   code)
-    code = _collapse_redundant(code)           # collapse again after substitutions
-
-    # ── 8: Strip unused 'import re' ───────────────────────────────────────────
-    if re.search(r'^import re\s*$', code, re.MULTILINE):
-        without = re.sub(r'^import re\s*$', '', code, flags=re.MULTILINE)
-        if not re.search(r'\bre\.', without):
-            code = re.sub(r'^import re\s*\n', '', code, flags=re.MULTILINE)
-            logger.info("[POST] Removed unused 'import re'")
-
-    # ── 9: Replace bare 'except:' ────────────────────────────────────────────
-    code = re.sub(
-        r'(?m)^(\s+)except:\s*$',
-        r'\1except Exception as _e:\n\1    print(f"[-] Error: {_e}")',
-        code,
-    )
-    code = re.sub(
-        r'(?m)^(\s+)except:\s*(pass|continue)\s*$',
-        r'\1except Exception as _e:\n\1    \2',
-        code,
-    )
-
-    # ── +2: Strip unused 're' import when re is not referenced in script body ─
-    # Run AFTER all other transforms so we don't strip re that's actually needed.
-    if re.search(r'^import re\s*$', code, re.MULTILINE):
-        body_without_import = re.sub(r'^import re\s*$', '', code, flags=re.MULTILINE)
-        if not re.search(r'\bre\.', body_without_import):
-            code = re.sub(r'^import re\s*\n', '', code, flags=re.MULTILINE)
-            logger.info("[POST] Removed unused 'import re'")
-
-    # ── +5: Remove _timeout unused variable from find_in_frames copies ────────
-    code = re.sub(
-        r'[ \t]+_timeout\s*=\s*timeout\s+or\s+\w+\s*\n',
-        '',
-        code,
-    )
-
-    # ── 10: Normalise hardcoded vault key names → VAULT_CREDENTIAL_PREFIX ─────
-    # LLM sometimes emits get_secret("OTCS_USERNAME") with a literal prefix.
-    # Replace with get_secret(f"{VAULT_CREDENTIAL_PREFIX}_USERNAME") so the
-    # script works for any system without env-var credentials.
-    # Also handles PASSWORD, USER, PWD variants.
-    _vault_key_pat = re.compile(
-        r'get_secret\(\s*["\']([A-Z][A-Z0-9]*)_(USERNAME|PASSWORD|USER|PWD)["\']'
-        r'\s*\)'
-    )
-    def _normalize_vault_key(m):
-        suffix = m.group(2)  # USERNAME / PASSWORD / USER / PWD
-        return f'get_secret(f"{{VAULT_CREDENTIAL_PREFIX}}_{suffix}")'
-
-    if _vault_key_pat.search(code):
-        # Only replace if the prefix is not already VAULT_CREDENTIAL_PREFIX
-        def _maybe_replace(m):
-            full_key = m.group(1) + "_" + m.group(2)
-            # Already uses config: skip
-            if "VAULT_CREDENTIAL_PREFIX" in m.group(0):
-                return m.group(0)
-            logger.info(f"[POST] Normalised vault key: {full_key!r} → VAULT_CREDENTIAL_PREFIX_{m.group(2)}")
-            return _normalize_vault_key(m)
-        code = _vault_key_pat.sub(_maybe_replace, code)
-        # Ensure VAULT_CREDENTIAL_PREFIX is imported
-        if "VAULT_CREDENTIAL_PREFIX" in code and "VAULT_CREDENTIAL_PREFIX" not in code.split("async def run")[0]:
-            # Only touch the import line, not occurrences inside run()
-            code = re.sub(
-                r'(from src\.utils\.config import[^\n]*TIMEOUT[^\n]*)',
-                lambda m: m.group(0) + ', VAULT_CREDENTIAL_PREFIX'
-                    if 'VAULT_CREDENTIAL_PREFIX' not in m.group(0) else m.group(0),
-                code, count=1,
-            )
-            # Ensure newline after the modified import line
-            code = re.sub(
-                r'(from src\.utils\.config import[^\n]*VAULT_CREDENTIAL_PREFIX)([^\n])',
-                r'\1\n\2',
-                code, count=1,
-            )
-
-    # ── 11: Strip redundant manual login steps after maybe_login ─────────────
-    # If the script calls maybe_login(page) AND then also manually does
-    # resilient_fill(page, <login_sel>, ...) + resilient_click(page, <login_sel>),
-    # the manual steps are redundant and must be removed.
-    if "await maybe_login(page)" in code:
-        lines = code.splitlines(keepends=True)
-        past_login, out_lines = False, []
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-            if "await maybe_login(page)" in line:
-                past_login = True
-                out_lines.append(line)
-                i += 1
-                continue
-            if past_login:
-                stripped = line.strip()
-                # Detect manual login: resilient_fill/click/page.fill/page.click
-                # targeting a login-field selector
-                is_login_fill = bool(re.search(
-                    r'(?:resilient_fill|page\.fill)\s*\(\s*page\s*,\s*(["\'][^"\']+["\'])',
-                    stripped
-                )) and bool(re.search(
-                    r'(?:resilient_fill|page\.fill)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])',
-                    stripped
-                ) and _is_login_selector(
-                    re.search(r'(?:resilient_fill|page\.fill)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])', stripped).group(1).strip("'\"")
-                ))
-                is_login_click = bool(re.search(
-                    r'(?:resilient_click|page\.click)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])',
-                    stripped
-                )) and _is_login_selector(
-                    re.search(r'(?:resilient_click|page\.click)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])', stripped).group(1).strip("'\"")
-                    if re.search(r'(?:resilient_click|page\.click)\s*\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])', stripped)
-                    else ""
-                )
-                # Also catch: await resilient_click(page, "#loginbutton")
-                # and login button patterns
-                is_login_submit = bool(re.search(
-                    r'(?:resilient_click|page\.click)\s*\(\s*(?:page\s*,\s*)?["\']'
-                    r'(?:#login(?:button|btn|submit)|button\[type=["\']submit["\']|input\[type=["\']submit["\'])',
-                    stripped
-                ))
-                if is_login_fill or is_login_click or is_login_submit:
-                    logger.info(f"[POST] Stripped redundant manual login step: {stripped[:80]}")
-                    i += 1
-                    continue
-            out_lines.append(line)
-            i += 1
-        code = "".join(out_lines)
-
-    # ── 12: Replace hardcoded integer timeouts ───────────────────────────────
-    # LLM sometimes emits wait_for_selector(..., timeout=30000) instead of
-    # using TIMEOUT_TABLE_WAIT_MS. Replace all such raw integers.
-    def _fix_timeout(m):
-        val = int(m.group(1))
-        # Map to the right config constant by magnitude
-        if val >= 20000:
-            return f'timeout=TIMEOUT_TABLE_WAIT_MS'
-        elif val >= 5000:
-            return f'timeout=TIMEOUT_FILL_MS'
-        else:
-            return m.group(0)  # leave small timeouts alone
-    code = re.sub(r'\btimeout=(\d{4,})\b', _fix_timeout, code)
-    # Ensure the constants are imported if we just introduced them
-    for const in ("TIMEOUT_TABLE_WAIT_MS", "TIMEOUT_FILL_MS"):
-        if const in code and const not in code.split("async def run")[0]:
-            code = re.sub(
-                r'(from src\.utils\.config import[^\n]*)',
-                lambda m, c=const: m.group(0) + f', {c}'
-                    if c not in m.group(0) else m.group(0),
-                code, count=1,
-            )
-
-    # ── 13: Inject missing process URL navigation ─────────────────────────────
-    # If history has a target URL (with query params, not a login page) and the
-    # script never navigates there, inject a goto BEFORE the first table wait.
-    if process_url and "await maybe_login(page)" in code:
-        # Check if the process URL (or same host) is already in a goto call
-        from urllib.parse import urlparse as _urlparse
-        _proc_host = _urlparse(process_url).hostname or ""
-        # Check if any existing goto targets the same host
-        _existing_gotos = re.findall(r'page\.goto\(["\']([^"\']+)["\']', code)
-        _already_navigates = any(
-            _proc_host and _proc_host == (_urlparse(g).hostname or "")
-            for g in _existing_gotos
-        )
-        if not _already_navigates and process_url not in code:
-            # Find the first wait_for_selector AFTER maybe_login and insert goto before it
-            lines = code.splitlines(keepends=True)
-            past_login, injected = False, False
-            new_lines = []
-            for line in lines:
-                if "await maybe_login(page)" in line:
-                    past_login = True
-                if (past_login and not injected
-                        and "wait_for_selector" in line
-                        and "await page.wait_for_selector" in line):
-                    indent = re.match(r'^(\s*)', line).group(1)
-                    new_lines.append(f'\n{indent}# Navigate to process target URL\n')
-                    new_lines.append(f'{indent}await page.goto({json.dumps(process_url)})\n')
-                    logger.info(f"[POST] Injected missing process URL navigation: {process_url}")
-                    injected = True
-                new_lines.append(line)
-            if injected:
-                code = "".join(new_lines)
-
-    # ── 14: Replace hallucinated #view_<N> selectors in wait_for_selector ───────
-    # LLM sometimes invents IDs like "#view_1011" that don't exist on the page.
-    # Detection: any wait_for_selector using "#view_<digits>" that is NOT in the
-    # known selector from history → replace with networkidle wait or the real selector.
-    def _is_invented_view_id(sel: str) -> bool:
-        s = sel.strip().strip("'\"")
-        if not re.match(r'^#view_\d+$', s):
-            return False
-        # If it matches the known good selector from history, it's fine
-        if selector and s == selector.strip():
-            return False
-        return True
-
-    def _fix_invented_view_id(m):
-        sel_str = m.group(1)
-        if _is_invented_view_id(sel_str):
-            # Replace with real selector if we have one, else networkidle approach
-            replacement = selector if selector else None
-            if replacement:
-                logger.warning(f"[POST] Replaced hallucinated selector {sel_str!r} → {replacement!r}")
-                return f'page.wait_for_selector({json.dumps(replacement)}'
-            else:
-                logger.warning(f"[POST] Removed hallucinated wait_for_selector({sel_str}) — using networkidle")
-                return f'page.wait_for_load_state("networkidle"  # was: wait_for_selector({sel_str}'
-        return m.group(0)
-
-    code = re.sub(
-        r'page\.wait_for_selector\((["\']#view_\d+["\'])',
-        _fix_invented_view_id,
-        code,
-    )
-    # Also fix resilient_extract_table using an invented #view_* selector
-    def _fix_invented_extract(m):
-        sel_str = m.group(1)
-        if _is_invented_view_id(sel_str):
-            replacement = selector if selector else '"#admin-servers table"'
-            logger.warning(f"[POST] Replaced hallucinated extract selector {sel_str!r} → {replacement!r}")
-            return f'resilient_extract_table(page, {json.dumps(replacement) if isinstance(replacement, str) else replacement}'
-        return m.group(0)
-
-    code = re.sub(
-        r'resilient_extract_table\(\s*page\s*,\s*(["\']#view_\d+["\'])',
-        _fix_invented_extract,
-        code,
-    )
-
-    # ── 15: Replace hardcoded OTCS row function-menu IDs (#x1, #x2 …) ───────────
-    # OTCS renders function menu hotspots as <a id="x1" class="functionMenuHotspot">
-    # where the number is the row's position — it changes when rows are reordered.
-    # Any resilient_click / page.click targeting "#x<digits>" is therefore fragile.
-    # Replace with a page.evaluate() block that finds the hotspot relative to the
-    # named link text. We extract the server name from the nearest string literal
-    # in the same expression or fall back to a generic nearest-hotspot approach.
-    _xN_pat = re.compile(
-        r'([ \t]*)await\s+resilient_click\s*\(\s*page\s*,\s*["\']#x(\d+)["\'][^)]*\)'
-        r'(?:\s*#[^\n]*)?'
-    )
-    def _replace_xN_click(m):
-        indent = m.group(1)
-        logger.warning(f"[POST] Replaced hardcoded function menu ID #x{m.group(2)} with JS hotspot click")
-        return (
-            f'{indent}# Click function menu hotspot — resolved dynamically (never use #x<N>)\n'
-            f'{indent}_hotspot_clicked = await page.evaluate(\'\'\'\n'
-            f'{indent}    () => {{\n'
-            f'{indent}        for (const a of document.querySelectorAll("a.functionMenuHotspot")) {{\n'
-            f'{indent}            const td = a.closest("td");\n'
-            f'{indent}            if (td) {{ a.click(); return {{ clicked: true, id: a.id }}; }}\n'
-            f'{indent}        }}\n'
-            f'{indent}        return {{ clicked: false }};\n'
-            f'{indent}    }}\n'
-            f"{indent}''')\n"
-            f'{indent}print(f"[*] Function menu clicked: {{_hotspot_clicked}}")'
-        )
-
-    code = _xN_pat.sub(_replace_xN_click, code)
-
-    # Also catch page.locator("#x<N>") and page.click("#x<N>") patterns
-    code = re.sub(
-        r'await\s+page\.click\s*\(\s*["\']#x\d+["\']\s*\)',
-        lambda m: (
-            logger.warning("[POST] Replaced hardcoded page.click(#x<N>)") or
-            'await page.evaluate(\'() => { const a = document.querySelector("a.functionMenuHotspot"); if(a) a.click(); }\')'
-        ),
-        code,
-    )
-    # Catch wait_for_selector("#x1") — just remove it, it's not a real wait target
-    code = re.sub(
-        r'await\s+page\.wait_for_selector\s*\(\s*["\']#x\d+["\'][^)]*\)\s*\n',
-        '',
-        code,
-    )
-
-
-    # ── 17: Deterministic column correction from DOM snapshot (tbl_registry) ─
-    # Rule 16 fixes selectors using _KNOWN_PAGE_SELECTORS (a static map).
-    # Rule 17 fixes columns using the live tbl_registry captured from the actual
-    # DOM during the agent run — this has the EXACT headers per table per URL.
-    #
-    # For single-table pages: replace columns on every extract call for that URL.
-    # For multi-table pages: match each call by its selector, then replace columns.
-    # Unmatched calls (selector not in registry) are left untouched.
-    if tbl_registry:
-        _r17_extract_pat = re.compile(
-            r'(resilient_extract_table\(\s*page\s*,\s*)(["\'][^"\']+["\'])(\s*,\s*)(\[[^\]]*\])'
-        )
-        _r17_url = ""
-        r17_lines = []
-        for line in code.splitlines(keepends=True):
-            gm = re.search(r'page\.goto\(\s*["\']([^"\']+)["\']', line)
-            if gm:
-                _r17_url = gm.group(1)
-
-            if "resilient_extract_table" in line and _r17_url:
-                page_tables = tbl_registry.get(_r17_url) or []
-                if page_tables:
-                    def _r17_fix(m, _ptbls=page_tables):
-                        sel_str  = m.group(2).strip().strip("\"'")
-                        orig_cols = m.group(4)
-
-                        # Multi-table: find the entry whose selector matches this call's selector
-                        matched = next(
-                            (t for t in _ptbls if t.get("selector") == sel_str),
-                            None
-                        )
-                        # Single-table fallback: if there's exactly one table, use it
-                        if matched is None and len(_ptbls) == 1:
-                            matched = _ptbls[0]
-
-                        if matched is None:
-                            # Multiple tables, none matched — leave this call untouched
-                            return m.group(0)
-
-                        # Use exact_headers (ground-truth DOM) > required (scored subset)
-                        exact = matched.get("exact_headers") or matched.get("headers") or []
-                        required = matched.get("required") or exact
-                        # Prefer required (the scored/relevant subset), fall back to all headers
-                        cols = required if required else exact
-                        if not cols:
-                            return m.group(0)  # nothing to inject
-
-                        new_cols = json.dumps(cols)
-                        if new_cols != orig_cols:
-                            logger.info(
-                                "[POST Rule17] %s selector=%r: cols %s → %s",
-                                _r17_url, sel_str, orig_cols, new_cols
-                            )
-                        return f"{m.group(1)}{m.group(2)}{m.group(3)}{new_cols}"
-
-                    line = _r17_extract_pat.sub(_r17_fix, line)
-
-            r17_lines.append(line)
-        code = "".join(r17_lines)
-
-    # ── 16: Replace wrong/bare table selectors using known-page selector map ──
-    # Extended (was: only replaced bare "table").
-    #
-    # For EVERY page where we know the correct selector (_KNOWN_PAGE_SELECTORS),
-    # we now replace ANY table selector that doesn't match — including hallucinated
-    # ones like "#metrics-panel table", "#browseViewCoreTable", etc.
-    # We also inject the correct columns for that page.
-    #
-    # Same line-by-line URL-tracking approach as Rule 3 so each page gets its
-    # own selector and columns independently.
-    _bare_table_pat = re.compile(
-        r'(resilient_extract_table\(\s*page\s*,\s*)["\']table["\']'
-    )
-    _any_extract_pat = re.compile(
-        r'(resilient_extract_table\(\s*page\s*,\s*)(["\'][^"\']+["\'])'
-    )
-    _bare_wait_pat = re.compile(
-        r'(page\.wait_for_selector\(\s*)["\']table["\']'
-    )
-    # NEW: matches wait_for_selector with ANY selector string
-    _any_wait_pat = re.compile(
-        r'(page\.wait_for_selector\(\s*)(["\'][^"\']+["\'])'
-    )
-    _any_cols_pat = re.compile(
-        r'(resilient_extract_table\(\s*page\s*,\s*[^,]+,\s*)(\[[^\]]*\])'
-    )
-
-    new_lines = []
-    _kps_url = ""
-    for line in code.splitlines(keepends=True):
-        goto_m = re.search(r'page\.goto\(\s*["\']([^"\']+)["\']', line)
-        if goto_m:
-            _kps_url = goto_m.group(1)
-
-        # Look up known selector + columns for current URL
-        kp_entry = _known_page_info(_kps_url)
-        _known_sel  = kp_entry["selector"]  if kp_entry else None
-        _known_cols = kp_entry.get("columns") if kp_entry else None
-
-        if _known_sel:
-            if _known_sel != "table":
-                # Replace ANY extract selector that doesn't match the known one.
-                # This catches bare "table" AND hallucinated IDs like "#metrics-panel table".
-                def _fix_any_extract(m, _ks=_known_sel):
-                    cur = m.group(2).strip().strip('"\'')
-                    if cur != _ks:
-                        logger.info(
-                            f"[POST Rule16] extract {cur!r} → {_ks!r} (URL: {_kps_url})"
-                        )
-                        return f'{m.group(1)}{json.dumps(_ks)}'
-                    return m.group(0)
-                line = _any_extract_pat.sub(_fix_any_extract, line)
-
-                # Replace ANY wait_for_selector that doesn't match the known selector.
-                # This catches "#x1 table", "#browseViewCoreTable", bare "table", etc.
-                def _fix_any_wait(m, _ks=_known_sel):
-                    cur = m.group(2).strip().strip('"\'')
-                    if cur != _ks:
-                        logger.info(
-                            f"[POST Rule16] wait {cur!r} → {_ks!r} (URL: {_kps_url})"
-                        )
-                        return f'{m.group(1)}{json.dumps(_ks)}'
-                    return m.group(0)
-                line = _any_wait_pat.sub(_fix_any_wait, line)
-
-            else:
-                # For DA page (known_sel == "table"), only replace truly wrong non-table selectors.
-                # We don't replace bare "table" since that is the correct selector.
-                def _fix_non_table_extract(m, _ks="table"):
-                    cur = m.group(2).strip().strip('"\'')
-                    # Replace if it's a container selector (has # or .) but not bare "table"
-                    if cur != "table" and (cur.startswith('#') or cur.startswith('.')):
-                        logger.info(
-                            f"[POST Rule16] extract {cur!r} → 'table' (DA page, URL: {_kps_url})"
-                        )
-                        return f'{m.group(1)}"table"'
-                    return m.group(0)
-                line = _any_extract_pat.sub(_fix_non_table_extract, line)
-
-                def _fix_non_table_wait(m):
-                    cur = m.group(2).strip().strip('"\'')
-                    if cur != "table" and (cur.startswith('#') or cur.startswith('.')):
-                        logger.info(
-                            f"[POST Rule16] wait {cur!r} → 'table' (DA page, URL: {_kps_url})"
-                        )
-                        return f'{m.group(1)}"table"'
-                    return m.group(0)
-                line = _any_wait_pat.sub(_fix_non_table_wait, line)
-
-            # Inject correct columns for this page if we know them.
-            # Skip if tbl_registry already has live DOM data for this URL
-            # (Rule 17 will have already set the right columns before Rule 16 runs).
-            _r16_tbl_covered = bool(tbl_registry and tbl_registry.get(_kps_url))
-            if _known_cols and not _r16_tbl_covered:
-                def _fix_cols(m, _kc=_known_cols):
-                    return f'{m.group(1)}{json.dumps(_kc)}'
-                line = _any_cols_pat.sub(_fix_cols, line)
-
-        new_lines.append(line)
-    code = "".join(new_lines)
-
-    # ── Quality gate ─────────────────────────────────────────────────────────
-    issues = []
-    if re.search(r'resilient_extract_table\(\s*page\s*,\s*["\']table["\']', code):
-        # Only flag if there are URLs in the script where we had a known non-"table" selector
-        # but still couldn't fix it (i.e. the known-page map had a match).
-        _unfixed_urls = []
-        _scan_url = ""
-        for line in code.splitlines():
-            gm = re.search(r'page\.goto\(\s*["\']([^"\']+)["\']', line)
-            if gm:
-                _scan_url = gm.group(1)
-            if re.search(r'resilient_extract_table\(\s*page\s*,\s*["\']table["\']', line):
-                kp = _known_page_info(_scan_url)
-                if kp and kp.get("selector") not in (None, "table"):
-                    _unfixed_urls.append(_scan_url)
-        if _unfixed_urls:
-            issues.append(f"resilient_extract_table still uses bare 'table' for known page(s): {_unfixed_urls}")
-        else:
-            logger.info("[POST] bare 'table' selector kept — no known replacement for this page")
-    if re.search(r'page\.wait_for_selector\(\s*["\']table["\']', code):
-        # Only flag if this is on a page where we know the real selector isn't bare "table"
-        _wait_scan_url = ""
-        _wait_is_issue = False
-        for _wl in code.splitlines():
-            gm = re.search(r'page\.goto\(\s*["\']([^"\']+)["\']', _wl)
-            if gm:
-                _wait_scan_url = gm.group(1)
-            if re.search(r'page\.wait_for_selector\(\s*["\']table["\']', _wl):
-                kp = _known_page_info(_wait_scan_url)
-                if kp and kp.get("selector") not in (None, "table"):
-                    _wait_is_issue = True
-                    break
-        if _wait_is_issue:
-            issues.append("wait_for_selector still uses bare 'table' selector on known page")
-    if re.search(r'table_selector\s*=\s*["\']table["\']', code):
-        issues.append("table_selector still assigned literal 'table'")
-    if re.search(r'page\.locator\(\s*["\']tr["\']', code):
-        issues.append("global page.locator('tr') without table scoping")
-    if "maybe_login(page)" not in code:
-        issues.append("maybe_login(page) call missing after page.goto")
-    for fn in ("resilient_extract_table", "wait_for_selector"):
-        m = re.search(rf'{fn}\(\s*(?:page\s*,\s*)?(["\'][^"\']+["\'])', code)
-        if m and _is_login_selector(m.group(1).strip("'\"")):
-            issues.append(f"{fn} still uses a login-field selector: {m.group(1)!r}")
-    if "from src.utils.script_helpers import" not in code:
-        issues.append("script_helpers import missing")
-    # Check for any surviving hardcoded row IDs or invented selectors
-    if re.search(r'["\']#x\d+["\']', code):
-        issues.append("hardcoded OTCS row function-menu ID (#x<N>) still present — use a.functionMenuHotspot instead")
-    if re.search(r'["\']#view_\d+["\']', code):
-        issues.append("invented #view_<N> selector still present — use a known selector from the SELECTOR REFERENCE TABLE")
-
-    if issues:
-        warning = "# ⚠️  POST-PROCESSING WARNINGS:\n" + "\n".join(f"# - {i}" for i in issues) + "\n\n"
-        logger.warning("[QUALITY GATE]\n  " + "\n  ".join(issues))
-        if selector is None and any("selector" in i for i in issues):
-            raise RuntimeError(f"[QUALITY GATE] Cannot auto-fix — no DOM selector resolved. Issues: {issues}")
-        code = warning + code
-
-    # Trim imports to only what's actually used in the final script
-    code = _minimal_imports(code)
-
-    return code
-
-
-# ── Helper: only import what the generated script actually calls ──────────────
-_ALL_SCRIPT_HELPERS = [
-    "get_secret", "find_in_frames", "resilient_fill", "resilient_click",
-    "click_and_upload_file", "maybe_login", "resilient_extract_table",
-    "generate_report", "check_certificate",
-]
-
-def _minimal_imports(code: str) -> str:
-    """
-    Replace the monolithic script_helpers import block with only the helpers
-    that are actually called in the generated code.
-    Also trims TIMEOUT_FILL_MS from the config import when unused.
-    Applied to both fast-path and LLM-generated scripts.
-    """
-    used = [h for h in _ALL_SCRIPT_HELPERS if (h + "(") in code]
-
-    _import_pat = re.compile(
-        r"from src\.utils\.script_helpers import \([^)]+\)",
-        re.DOTALL,
-    )
-    if used:
-        if len(used) == 1:
-            new_import = "from src.utils.script_helpers import " + used[0]
-        else:
-            sep = ",\n    "
-            new_import = (
-                "from src.utils.script_helpers import (\n    "
-                + sep.join(used)
-                + ",\n)"
-            )
-        code = _import_pat.sub(new_import, code)
-    else:
-        code = _import_pat.sub("", code)
-
-    # Trim TIMEOUT_FILL_MS from config import if not actually used in the script body
-    _config_line = "from src.utils.config import TIMEOUT_TABLE_WAIT_MS, TIMEOUT_FILL_MS"
-    if _config_line in code:
-        # Check if TIMEOUT_FILL_MS is used anywhere other than its own import line
-        _code_without_import = code.replace(_config_line, "")
-        if "TIMEOUT_FILL_MS" not in _code_without_import:
-            code = code.replace(_config_line, "from src.utils.config import TIMEOUT_TABLE_WAIT_MS")
-    return code
-
-
-# ── Fast-path: pure navigation+extraction tasks, no LLM needed ───────────────
-
-_COMPLEX_ACTIONS = {
-    "click_element",
-    "click_element_by_text",
-    "input_text",
-    "upload_file",
-    "select_dropdown_option",
-    "drag_drop",
-}
-
-
-def _try_template_fast_path(
-    cleaned_history: str,
-    all_urls_ordered: list,
-    tbl_registry: dict,
-    objective: str,
-    run_id: str,
-) -> "str | None":
-    """
-    Fast-path script generator — bypasses LLM entirely when the task is purely
-    navigation + table extraction (no clicks, fills, or conditional logic).
-
-    Returns a ready-to-run Python script string, or None if the history contains
-    any non-trivial actions that require the LLM.
-
-    Fast-path fires when:
-      - Every action in history is ONLY go_to_url / extract_content / scroll / wait / done
-      - Every page with table data has a fully-resolved CSS selector
-    """
-    # ── 1. Detect non-trivial actions in history ─────────────────────────────
-    try:
-        _h = json.loads(cleaned_history)
-        _steps = _h.get("steps") if isinstance(_h, dict) else _h
-        for _s in (_steps or []):
-            for _act in (_s.get("actions") or []):
-                if isinstance(_act, dict):
-                    _atype = next(iter(_act.keys()), "")
-                    if _atype in _COMPLEX_ACTIONS:
-                        logger.info(
-                            "[FAST-PATH] Action %r in history — falling back to LLM", _atype
-                        )
-                        return None
-    except Exception:
-        return None
-
-    # ── 1b. Scan objective text for interaction verbs ─────────────────────────
-    # If the task description mentions clicks, saves, selects, etc., the history
-    # may be incomplete (e.g. crashed before those actions) but the LLM still
-    # needs to generate them. Fall back rather than produce an incomplete script.
-    _INTERACTION_VERBS = (
-        " click", "select ", " radio", " save", " submit", " fill",
-        " upload", " drag", " dropdown", " configure", " open ",
-        " check ", " uncheck", " toggle", " press ", " type ",
-    )
-    _obj_lower = (objective or "").lower()
-    if any(v in _obj_lower for v in _INTERACTION_VERBS):
-        logger.info("[FAST-PATH] Objective has interaction verbs — falling back to LLM")
-        return None
-
-    # ── 2. Filter URLs to only those relevant to the objective ────────────────
-    # The agent may have visited pages (e.g. Admin Servers) that are NOT part of
-    # this task. Include a URL only if:
-    #   a) the objective text contains a word from the URL's query string, OR
-    #   b) the URL has table data in the registry AND those headers appear in
-    #      the objective text, OR
-    #   c) there is only one non-login URL (nothing to filter against)
-    #
-    # This prevents stale agent history pages from appearing as extra steps.
-    _LOGIN_FRAGS = ("login", "otdsws", "signin", "auth/login", "llworkspace", "about:blank")
-    _content_urls = [u for u in all_urls_ordered
-                     if not any(f in u.lower() for f in _LOGIN_FRAGS)]
-
-    # Column names so generic they appear in nearly every table — not useful
-    # for distinguishing which page an objective is about.
-    _GENERIC_COLS = {
-        "status", "name", "id", "type", "description", "date", "actions",
-        "errors", "last update", "primary", "title", "size", "owner",
-        "created", "modified", "version", "state", "enabled", "running",
-    }
-
-    def _url_relevant(url: str) -> bool:
-        """Return True if this URL is relevant to the objective."""
-        if not url:
-            return False
-        # Always include if it's the only non-login URL
-        if len(_content_urls) == 1:
-            return True
-        _obj_lc = (objective or "").lower()
-        # ── Check 1: URL query-string fragment appears in objective ──────────
-        # e.g. "distributedagent" in objective → DA URL is relevant
-        # Also matches full key=value: "objtype=148" in objective → Admin relevant
-        from urllib.parse import urlparse as _up2
-        qs = _up2(url).query.lower()
-        for frag in qs.split("&"):
-            val = frag.split("=")[-1]          # e.g. "distributedagent", "148"
-            # Match on the value OR the full key=value pair (e.g. "objtype=148")
-            if (len(val) > 4 and val in _obj_lc) or (len(frag) > 4 and frag in _obj_lc):
-                return True
-        # ── Check 2: a DISTINCTIVE (non-generic) table header is in objective ─
-        # e.g. "Worker ID" in objective → Worker Agents table URL is relevant
-        # Generic cols like "Status", "Name" are excluded — they match too broadly
-        page_tbls = tbl_registry.get(url) or []
-        for tbl in page_tbls:
-            for hdr in (tbl.get("headers") or tbl.get("required") or []):
-                if (len(hdr) > 4
-                        and hdr.lower() not in _GENERIC_COLS
-                        and hdr.lower() in _obj_lc):
-                    return True
-        return False
-
-    # Only filter when there are multiple content pages — if 0 or 1, pass through
-    if len(_content_urls) > 1:
-        filtered_urls = [u for u in all_urls_ordered if
-                         any(f in u.lower() for f in _LOGIN_FRAGS) or _url_relevant(u)]
-        n_dropped = len(all_urls_ordered) - len(filtered_urls)
-        if n_dropped:
-            logger.info("[FAST-PATH] Filtered %d URL(s) not relevant to objective", n_dropped)
-            for u in all_urls_ordered:
-                if u not in filtered_urls:
-                    logger.info("[FAST-PATH]   dropped: %s", u)
-        all_urls_ordered = filtered_urls
-
-    # ── 3. Resolve per-page table data ────────────────────────────────────────
-    # Priority: registry tables with columns (dynamic) > _KNOWN_PAGE_SELECTORS (static fallback)
-    pages = []  # [{url, tables: [{selector, columns}]}]
-    for url in all_urls_ordered:
-        # Check registry first — it's live data
-        tbls = tbl_registry.get(url) or []
-        
-        # If registry is empty, maybe _KNOWN_PAGE_SELECTORS has something
-        if not tbls:
-            kp = _known_page_info(url)
-            if kp and kp.get("selector"):
-                tbls = [{"selector": kp["selector"], "headers": kp.get("columns") or [], "required": kp.get("columns") or []}]
-
-        resolved = []
-        for t in tbls:
-            sel  = (t.get("selector") or "").strip()
-            cols = list(t.get("required") or t.get("headers") or [])
-            if not sel:
-                # If we have no selector for this table, we can't do fast-path for the whole page
-                logger.info("[FAST-PATH] %s: unresolved selector — falling back to LLM", url)
-                return None
-            if not cols:
-                # Skip tables without columns (likely layout tables) instead of failing
+                    meta  = el.get("identity", {})
+                    attrs = el.get("attribute_fingerprint", {})
+                    prov  = el.get("selector_provenance", {})
+                    tag   = meta.get("tagName", "").lower()
+                    el_id = attrs.get("id", "")
+                    frame = meta.get("frame_path", "main")
+
+                    # --- Tables ---
+                    if tag == "table" and el_id:
+                        text = prov.get("text", "")[:2000]
+                        lines = [l.strip() for l in text.replace("\t", "|").split("\n") if l.strip()]
+                        header_line = lines[0] if lines else ""
+                        sample_rows = lines[1:4]
+                        count_in_snap = id_counts_in_snap.get(el_id, 1)
+
+                        if el_id not in tables:
+                            tables[el_id] = {
+                                "frame": frame,
+                                "selector": f"table#{el_id}",
+                                "headers": header_line,
+                                "sample_rows": sample_rows,
+                                "max_count_in_snap": count_in_snap,
+                                "all_headers": [header_line] if header_line else [],
+                            }
+                        else:
+                            # Update max duplicate count
+                            tables[el_id]["max_count_in_snap"] = max(tables[el_id]["max_count_in_snap"], count_in_snap)
+                            # Collect all distinct header rows to show both tables
+                            if header_line and header_line not in tables[el_id]["all_headers"]:
+                                tables[el_id]["all_headers"].append(header_line)
+
+                    # --- Inputs with IDs ---
+                    if tag == "input" and el_id:
+                        itype = attrs.get("type", "text")
+                        name  = attrs.get("name", "")
+                        label = attrs.get("aria-label", "") or attrs.get("placeholder", "") or name
+                        sel   = f"#{el_id}"
+                        if sel not in inputs:
+                            inputs[sel] = f"input[type={itype}] label=\"{label}\""
+
+                    # --- Buttons/links with data-otname ---
+                    if attrs.get("data-otname") and tag in ("a", "button", "span"):
+                        desc = f'[data-otname="{attrs["data-otname"]}"] text="{prov.get("text","")[:50]}"'
+                        if desc not in buttons:
+                            buttons.append(desc)
+
+            except Exception as e:
+                logger.debug(f"[_build_dom_digest] skip {snap_file.name}: {e}")
                 continue
 
-            # ── Refinement: Filter columns and tables based on objective ───
-            # User doesn't want "everything" if they only asked for one specific table.
-            filtered = []
-            
-            # 1. Prepare word sets from objective
-            import re as _re
-            all_text = (objective or "").lower()
-            obj_words = set(_re.findall(r'\w+', all_text))
-            
-            # 1b. Identify "Goal Words" specifically from extraction sentences
-            # We split by line/period and look for "Extract", "Get", etc.
-            goal_words = set()
-            extraction_verbs = {"extract", "get", "read", "scrape", "table", "report", "columns"}
-            sentences = _re.split(r'[\n.]', all_text)
-            for s in sentences:
-                s_words = set(_re.findall(r'\w+', s))
-                if s_words & extraction_verbs:
-                    # Ignore very common generic words even in goal sentences
-                    goal_words.update(s_words - {"the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "by", "with", "columns", "table", "both"})
+        if not tables and not inputs:
+            return ""
 
-            # Identity markers frequently asked for implicitly as "Name" or "ID"
-            id_markers = {"id", "name", "title", "agent", "worker", "server", "host"}
-            # Generic words that often cause false positives across tables
-            generic_words = {"id", "name", "status", "description", "last", "update", "value", "type", "date", "time", "both"}
-            specific_goal_words = goal_words - generic_words
-            
-            has_specific_match = False
-            for c in cols:
-                c_lc = c.lower()
-                c_words = set(_re.findall(r'\w+', c_lc))
-                
-                # Check 1: Overlap between column words and objective words?
-                matched = bool(c_words & obj_words)
-                
-                # Check 1b: Is it a SPECIFIC match (non-generic)?
-                if bool(c_words & specific_goal_words):
-                    has_specific_match = True
-                
-                # Check 2: If user asked for generic "Name" or "ID", treat identity cols as matches.
-                is_requested_id = (("name" in obj_words or "id" in obj_words) and 
-                                 any(m in c_lc for m in id_markers))
-                
-                if matched or is_requested_id:
-                    filtered.append(c)
-            
-            # Table-Level Strictness:
-            # If we have SPECIFIC goal words (like "Worker"), and this table ONLY matched 
-            # via generic words (like "Status" or "ID"), then it's probably NOT requested.
-            is_noise = specific_goal_words and not has_specific_match
-            
-            if filtered and not is_noise:
-                resolved.append({"selector": sel, "columns": filtered})
-            elif filtered and not specific_goal_words:
-                # Fallback: if user only used generic words in prompt, keep everything that matched.
-                resolved.append({"selector": sel, "columns": filtered})
+        out = ["## DOM INTELLIGENCE (extracted from all page snapshots)"]
+        out.append("USE THESE EXACT SELECTORS — they are confirmed from the live DOM.")
+        out.append("")
 
-        pages.append({"url": url, "tables": resolved})
-
-    if not pages:
-        return None
-
-    # ── 5. Derive login base URL ──────────────────────────────────────────────
-    from urllib.parse import urlparse, urlunparse
-
-    try:
-        _h2 = json.loads(cleaned_history)
-        _s2 = _h2.get("steps") if isinstance(_h2, dict) else _h2
-        _first = next(
-            (s["url"] for s in (_s2 or []) if s.get("url", "").startswith("http")),
-            pages[0]["url"],
-        )
-    except Exception:
-        _first = pages[0]["url"]
-    _pu = urlparse(_first)
-    login_url = urlunparse((_pu.scheme, _pu.netloc, _pu.path, "", "", ""))
-
-    # ── 6. Build body lines ───────────────────────────────────────────────────
-    # Use explicit string concatenation to avoid f-string/quote conflicts when
-    # the generated lines themselves contain string literals.
-    L = []
-    all_row_vars = []  # [(var_name, section_title, columns)]
-
-    # Login block
-    L.append("        # ── Step 1: Login")
-    L.append("        await page.goto(" + repr(login_url) + ", timeout=TIMEOUT_TABLE_WAIT_MS)")
-    L.append("        await maybe_login(page)")
-    L.append('        await capture_step("Login", "Logged in successfully")')
-    L.append("")
-
-    for pi, pg in enumerate(pages):
-        url = pg["url"]
-        tables = pg["tables"]
-        step = pi + 2
-
-        L.append("        # ── Step " + str(step) + ": " + url)
-        L.append("        await page.goto(" + repr(url) + ", timeout=TIMEOUT_TABLE_WAIT_MS)")
-
-        if not tables:
-            L.append('        await page.wait_for_load_state("networkidle")')
-            L.append('        await capture_step("Page ' + str(pi + 1) + '", "Navigated")')
-        else:
-            for ti, tbl in enumerate(tables):
-                sel = tbl["selector"]
-                cols = tbl["columns"]
-                multi = len(tables) > 1
-                var = ("rows_p" + str(pi + 1) + "_t" + str(ti + 1)) if multi else ("rows_p" + str(pi + 1))
-                title = "Page " + str(pi + 1) + (" Table " + str(ti + 1) if multi else "")
-                all_row_vars.append((var, title, cols))
-
-                L.append(
-                    "        await page.wait_for_selector("
-                    + repr(sel)
-                    + ", timeout=TIMEOUT_TABLE_WAIT_MS)"
-                )
-                L.append(
-                    "        "
-                    + var
-                    + " = await resilient_extract_table(page, "
-                    + repr(sel)
-                    + ", "
-                    + repr(cols)
-                    + ")"
-                )
-                L.append('        print(f"[*] ' + title + ': {len(' + var + ')} rows")')
-                L.append('        for _r in ' + var + ': print(f"  {_r}")')
-
-            L.append(
-                '        await capture_step("Step '
-                + str(step)
-                + '", f"'
-                + str(len(tables))
-                + ' table(s) from page '
-                + str(pi + 1)
-                + '")'
-            )
-        L.append("")
-
-    # ── 7. Report block ───────────────────────────────────────────────────────
-    L.append("        # ── Report")
-    L.append(
-        '        _summary = "### Execution Summary\\n'
-        '| Step | Action | Output |\\n'
-        '| :--- | :--- | :--- |\\n"'
-    )
-    L.append("        for _i, _s in enumerate(steps, 1):")
-    L.append(
-        "            _summary += f\"| {_i} | {_s['action']} | {_s['output']} |\\n\""
-    )
-    L.append("")
-
-    for var, title, cols in all_row_vars:
-        ncols = len(cols)
-        # Header row: "| Col1 | Col2 |\n| :--- | :--- |\n"
-        L.append(
-            "        _"
-            + var
-            + '_hdr = "| " + " | ".join('
-            + repr(cols)
-            + ') + " |\\n| " + " | ".join([":---"] * '
-            + str(ncols)
-            + ') + " |\\n"'
-        )
-        # Data rows
-        L.append(
-            "        _"
-            + var
-            + '_body = "".join('
-        )
-        L.append(
-            '            f"| {chr(32).join(str(_r.get(_c, chr(78)+chr(47)+chr(65))) for _c in '
-            + repr(cols)
-            + ")} |\\n\""
-        )
-        # Simpler: use explicit join
-        L[-2] = (
-            "        _"
-            + var
-            + "_body = \"\".join("
-        )
-        L[-1] = (
-            "            \"| \" + \" | \".join(str(_r.get(_c, \"N/A\")) for _c in "
-            + repr(cols)
-            + ") + \" |\\n\""
-        )
-        L.append("            for _r in " + var)
-        L.append("        )")
-        L.append(
-            "        "
-            + var
-            + '_section = "### '
-            + title
-            + '\\n" + _'
-            + var
-            + "_hdr + _"
-            + var
-            + "_body"
-        )
-        L.append("")
-
-    if all_row_vars:
-        sections_expr = ' + "\\n" + '.join(v + "_section" for v, _, _ in all_row_vars)
-    else:
-        sections_expr = '"(no data extracted)"'
-
-    L.append('        _details = "## Step Screenshots\\n"')
-    L.append("        for _i, _s in enumerate(steps, 1):")
-    L.append(
-        "            _details += f\"### Step {_i}: {_s['action']}\\n![Step {_i}]({_s['shot']})\\n\""
-    )
-    L.append("")
-    L.append("        _report_sections = " + sections_expr)
-    L.append(
-        '        _full_report = ('
-        ' "# Automation Report\\n\\n"'
-        " + _summary + \"\\n\\n\""
-        " + _report_sections + \"\\n\\n\""
-        " + _details"
-        " )"
-    )
-    L.append(
-        '        await generate_report("Consolidated Report", True,'
-        " output=_full_report, print_terminal=False)"
-    )
-
-    body = "\n".join(L)
-
-    # ── 8. Assemble final script ──────────────────────────────────────────────
-    # Fast-path scripts only use: maybe_login, resilient_extract_table, generate_report
-    # Wrap objective as # comments (it may span multiple lines)
-    _obj_lines = ["# " + ln for ln in (objective or "").splitlines()] or ["# (no objective)"]
-    script_lines = [
-        "# ⚡ FAST-PATH generated (no LLM) — selectors/columns from agent history",
-        "# Run ID: " + run_id,
-    ] + _obj_lines + [
-        "",
-        "import asyncio",
-        "import sys",
-        "import os",
-        "from playwright.async_api import async_playwright",
-        "",
-        "current_dir = os.getcwd()",
-        'if "web-ui" not in current_dir and os.path.exists(os.path.join(current_dir, "web-ui")):',
-        '    sys.path.append(os.path.join(current_dir, "web-ui"))',
-        "else:",
-        "    sys.path.append(current_dir)",
-        "",
-        "from src.utils.script_helpers import (",
-        "    maybe_login, resilient_extract_table, generate_report,",
-        ")",
-        "from src.utils.config import TIMEOUT_TABLE_WAIT_MS",
-        "",
-        "steps = []",
-        "script_dir = os.path.dirname(os.path.abspath(__file__))",
-        "",
-        "",
-        "async def run():",
-        "    async with async_playwright() as p:",
-        '        browser = await p.chromium.launch(headless=False, args=["--start-maximized"])',
-        "        context = await browser.new_context(no_viewport=True)",
-        "        page = await context.new_page()",
-        "",
-        "        async def capture_step(action, output):",
-        "            idx = len(steps) + 1",
-        '            shot_path = os.path.join(script_dir, f"shot_{idx}.png")',
-        "            await page.screenshot(path=shot_path)",
-        '            steps.append({"action": action, "output": output, "shot": f"shot_{idx}.png"})',
-        "",
-        body,
-        "        await browser.close()",
-        "",
-        "",
-        'if __name__ == "__main__":',
-        "    asyncio.run(run())",
-        "",
-    ]
-    script = "\n".join(script_lines)
-
-    logger.info(
-        "[FAST-PATH] ⚡ Generated script for %d pages / %d tables — LLM skipped",
-        len(pages),
-        len(all_row_vars),
-    )
-    return script
+        if tables:
+            out.append("### Tables (verified IDs)")
+            out.append("| Selector | Count on Page | Columns (each distinct table) | Action Required |")
+            out.append("|---|---|---|---|")
+            for tid, info in tables.items():
+                count = info["max_count_in_snap"]
+                all_hdrs = info["all_headers"] or ["(no header)"]
+                hdr_display = " | ALSO: ".join(h[:80] for h in all_hdrs)[:200]
+                if count > 1:
+                    action = f"⚠️ DUPLICATE ID ({count}x) — MUST use `.first` or `.nth(N)` to select specific table"
+                else:
+                    action = "✅ unique — use directly"
+                out.append(f"| {info['selector']} | {count} | {hdr_display} | {action} |")
+            out.append("")
+            out.append("**CRITICAL RULE:** If 'Count on Page' > 1, you MUST use `.first` to avoid Playwright strict mode violation:")
+            out.append("  ✅ CORRECT: `page.locator('table#statusTable').first`")
+            out.append("  ❌ WRONG:   `page.locator('table#statusTable')` (will crash with strict mode error)")
+            out.append("Determine if horizontal (column-index extraction) or vertical (row-filter sibling) — see TABLE EXTRACTION RULES below.")
 
 
-def _build_cert_script(target_url: str, scenario: str) -> str:
-    """Return a ready-to-run Playwright script that calls check_certificate(page)."""
-    return f'''import asyncio
-import sys
-import os
+        if inputs:
+            out.append("")
+            out.append("### Form Inputs (verified IDs)")
+            for sel, desc in list(inputs.items())[:20]:
+                out.append(f"  {sel}  → {desc}")
 
-current_dir = os.getcwd()
-if "web-ui" not in current_dir and os.path.exists(os.path.join(current_dir, "web-ui")):
-    sys.path.append(os.path.join(current_dir, "web-ui"))
-else:
-    sys.path.append(current_dir)
+        if buttons:
+            out.append("")
+            out.append("### Action Buttons (data-otname)")
+            for b in buttons[:10]:
+                out.append(f"  {b}")
 
-from playwright.async_api import async_playwright
-from src.utils.script_helpers import (
-    get_secret, maybe_login, generate_report, check_certificate,
-)
-from src.utils.config import TIMEOUT_TABLE_WAIT_MS
+        return "\n".join(out)
+    except Exception as e:
+        logger.warning(f"[_build_dom_digest] Failed: {e}")
+        return ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# System prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = r"""\
+You are an expert Playwright automation engineer.
+
+Write a complete, self-contained Python script based on the agent execution history.
+Use raw Playwright APIs. Define any helper functions you need yourself.
+The only allowed external imports are:
+  playwright, docx, standard library modules (os, sys, io, logging, re, asyncio, etc.).
+Mandatory: Use `import os, sys, logging, asyncio, io, re, base64` at the top of every script.
+
+CREDENTIALS
+-----------
+A vault_creds() function is already defined in the VAULT SNIPPET at the top of every
+script. Call it to get credentials:
+  creds = vault_creds("PREFIX")        # returns {"username": "...", "password": "..."}
+  username = creds["username"]
+  password = creds["password"]
+Never hardcode credentials. Never use os.getenv() for credentials.
+DYNAMIC PARAMETERIZATION (NO HARDCODING)
+---------------------------------------
+To ensure the script is dynamic and not tied to hardcoded strings:
+1. Define a `SCRIPT_CONFIG` dictionary at the top of `run()`.
+2. Move ALL site-specific strings (URLs, target headers, column names, menu text) into this config.
+3. Access them throughout the script via `SCRIPT_CONFIG["key"]`.
+4. This allows the user to easily repurpose the script for other websites.
+
+Example:
+```python
 async def run():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=["--start-maximized", "--remote-debugging-port=9223"],
-        )
-        context = await browser.new_context(no_viewport=True)
-        page    = await context.new_page()
+    SCRIPT_CONFIG = {
+        "base_url": "http://...",
+        "dashboard_title": "Distributed Agent Status",
+        "search_label": "User name",
+    }
+    await page.goto(SCRIPT_CONFIG["base_url"])
+    # AVOID ^ and $ anchors in locators—they are too brittle for dynamic sites
+    await page.locator("h2").filter(has_text=re.compile(SCRIPT_CONFIG["dashboard_title"], re.I)).first.wait_for()
+```
 
-        await page.goto({repr(target_url)}, timeout=60000)
-        await maybe_login(page)
-        
-        await page.bring_to_front()
-        await asyncio.sleep(1.0)
+ROBUST LOCATORS (MANDATORY)
+--------------------------
+1. **BAN** `^` (start) or `$` (end) anchors in regex for labels/text.
+   - These anchors are fragile and fail if there is any invisible whitespace, non-breaking spaces, or nested `<span>` elements (which are common in OTCS).
+   - **CORRECT**: `re.compile(re.escape(text), re.I)` or `re.compile(f"substring", re.I)`
+   - **WRONG**: `re.compile(f"^{text}$")`
+2. Always use `.first` to get the actual data cell and skip "outer" layout cells.
 
-        # check_certificate uses CDP + direct TLS handshake.
-        # On Windows (headed) it also captures the native OS popup via
-        # Windows UI Automation — no hardcoded coordinates.
-        result = await check_certificate(page)
+LOGIN (DYNAMIC & RESILIENT)
+---------------------------
+After page.goto() to the login URL:
+1. Wait for ANY password field: await page.wait_for_selector('input[type="password"]', timeout=15000)
+2. Fill username. Use the `context` provided in the SELECTOR REFERENCE to find IDs/names.
+   - Strategy: `page.locator("input[name*='user' i], input[id*='user' i], input[name*='login' i]").first`
+   - Common patterns: `otds_username`, `#username`, `input[name='login']`.
+3. Fill password similarly: `page.locator("input[type='password']").first`
+4. Click the standard submit button — NEVER click SSO/federation/test buttons.
+   - Strategy: `page.locator("button[type='submit'], input[type='submit'], #loginbutton, #login_button, .submit-btn").filter(visible=True).first`
+   - Also try: `page.get_by_role("button", name=re.compile(r"Sign in|Login", re.I))`
+5. await page.wait_for_load_state("networkidle")
 
-        cert = result["cert_info"]
-        output = (
-            f"Host: {{result['hostname']}}\\n"
-            f"Valid: {{result['is_valid']}} | Secure: {{result['is_secure']}}\\n"
-            f"Issued to: {{cert.get('subject_cn')}} ({{cert.get('subject_org')}})\\n"
-            f"Issued by: {{cert.get('issuer_cn')}}\\n"
-            f"Valid from {{cert.get('valid_from')}} to {{cert.get('valid_to')}} "
-            f"({{cert.get('days_remaining')}}d remaining)\\n"
-            f"Protocol: {{cert.get('protocol')}} | Cipher: {{cert.get('cipher')}}\\n"
-            f"Expired: {{cert.get('is_expired')}}"
-        )
+AFTER LOGIN — DO NOT use wait_for_url() to verify login.
+Complex apps redirect WITHIN the same URL path (e.g. /app/ → /app/#/home).
+A lambda like `wait_for_url(lambda url: "app-path" not in url)` will ALWAYS time out,
+throw an exception, and skip every step after it.
+Just use: await page.wait_for_load_state("networkidle")
+If you need to confirm login succeeded, check that the password field is gone:
+  await page.wait_for_selector('input[type="password"]', state="hidden", timeout=15000)
 
-        await generate_report(
-            {repr(scenario)},
-            result["is_valid"],
-            screenshot=result["screenshot"] if not result.get("native_capture") else None,
-            output=output,
-            panels={{
-                "panel1": result.get("screenshot_site_info"),
-                "panel2": result.get("screenshot_security"),
-                "panel3": result.get("screenshot_cert"),
-            }} if result.get("native_capture") else None,
-        )
-        await browser.close()
+EXCEPTION HANDLING & GUARANTEED REPORTING (CRITICAL)
+-----------------------------------------------
+1. Wrap the entire automation logic in a `try/except` block.
+2. If an exception occurs, log it and print the traceback, but DO NOT stop the script before reporting.
+3. The report generation (Word document) MUST be in a `finally:` block or after the main `try/except`
+   to ensure that whatever steps were captured BEFORE the failure are still included in the report.
+4. Correct structure:
+   ```python
+   async def run():
+       steps = []
+       p = None; browser = None # Define outside try for finally block
+       try:
+           p = await async_playwright().start()
+           browser = await p.chromium.launch(...)
+           # ... automation steps with capture_step() ...
+       except Exception as e:
+           logging.error(f"Execution failed: {e}")
+           import traceback; traceback.print_exc()
+       finally:
+           # CLOSING BROWSER AND GENERATING REPORT MUST BE IN FINALLY
+           if browser: await browser.close()
+           if p: await p.stop()
+           await asyncio.sleep(0.5)
+           
+           # --- GENERATE REPORT HERE ---
+           doc = Document()
+           # ... (use 'steps' list) ...
+           doc.save(report_path)
+   ```
+A script that crashes without producing a report is a FAILURE. Always produce a report.
 
+SELECTORS
+---------
+Use ONLY selectors from the SELECTOR REFERENCE in the prompt.
+Never invent selectors.
 
+CLICKING NAVIGATION ITEMS (menus, links, buttons with text)
+------------------------------------------------------------
+Responsive pages render nav items TWICE — once for desktop (visible) and once for
+mobile (hidden). page.get_by_text("x").first picks the HIDDEN one and times out.
+
+ALWAYS use a visible-only locator for navigation clicks:
+  await page.locator("a:visible, button:visible, [role='menuitem']:visible, li:visible > a:visible")\
+            .filter(has_text=re.compile(r"Dashboard", re.I)).first.click()
+
+Or with a short explicit wait pattern:
+  dashboard = page.get_by_text("Dashboard", exact=True).filter(visible=True).first
+  # if .filter(visible=True) is not available in your Playwright version, use:
+  dashboard = page.locator("a:visible:has-text('Dashboard'), li:visible a:has-text('Dashboard'), .nav-link:visible:has-text('Dashboard')").first
+  await dashboard.wait_for(state="visible", timeout=10000)
+  await dashboard.click()
+
+NEVER use .first alone on get_by_text() for nav items — it is not visibility-filtered.
+
+WAITS & NAVIGATION
+------------------
+After every page.goto():   await page.wait_for_load_state("networkidle")
+SPA hash-routes (#/path):  await page.wait_for_url("**/path**", timeout=15000)
+                           await page.wait_for_selector("REAL_SELECTOR", timeout=15000)
+                           await page.wait_for_timeout(2000)
+
+RELATIVE URLS:
+If you extract a URL from an attribute (e.g., `href = await el.get_attribute("href")`), it 
+may be relative. NEVER pass raw relative URLs to `page.goto()`.
+  1. Prefer clicking the element: `await el.click()`
+  2. Or normalize it: `from urllib.parse import urljoin; await page.goto(urljoin(page.url, href))`
+
+OTCS SPECIFIC LOGIC (ROBUSTNESS):
+--------------------------------
+1. **Saving Folders/Items**: After typing a name in an inline form, ALWAYS use `await page.keyboard.press("Enter")` to save.
+2. **Finding New Items (SORTING)**: After creation, ALWAYS click the "Modified" column header to sort.
+   - **CRITICAL**: OTCS may sort Ascending first. You MUST verify or click twice to ensure **Descending** (newest first).
+3. **Navigation (STABILITY)**: Entering folders via `.click()` can be unstable in OTCS Smart View (SPA).
+   - **CORRECT**: Extract the `href` attribute and use `await page.goto(folder_url)`. This is much more stable and avoids `TargetClosedError`.
+   - **Example**:
+     ```python
+     link = page.locator("a").filter(has_text=re.compile(re.escape(name), re.I)).first
+     href = await link.get_attribute("href")
+     if href: await page.goto(href)
+     else: await link.click() # Fallback
+     ```
+4. **Bulk Upload (STABILITY)**: Clicking "Document" may NOT trigger a standard Playwright `file_chooser` event in some OTCS versions.
+   - **CORRECT**: Use the "Injected Input" strategy. Click "Document", then wait for the hidden input to appear in the DOM.
+   - **Example**:
+     ```python
+     await page.locator("a:has-text('Document')").click()
+     file_input = await page.wait_for_selector('div.csui-file-open input[type="file"], input[type="file"][style*="display: none"]', state="attached")
+     await file_input.set_input_files(file_paths)
+     ```
+
+DATA EXTRACTION
+---------------
+ALWAYS use r\"\"\"...\"\"\" (raw Python string) for ANY JavaScript passed to page.evaluate()
+that contains regex like /\\d/ or /\\s/. Plain strings cause SyntaxWarning errors.
+Correct:  value = await page.evaluate(r\"\"\"() => { ... /^[\\d.]+\\s*GB$/i ... }\"\"\")
+Wrong:    value = await page.evaluate(\"\"\"() => { ... /^[\\d.]+\\s*GB$/i ... }\"\"\")
+
+To find the CENTER value of a pie/donut chart:
+  - Query all SVG text/tspan elements
+  - Filter for those matching a size pattern like /^[\d.]+\s*(GB|TB|MB|%)$/i
+  - Sort descending by numeric value — the center total is always the largest number
+  - Return the primary result text, or "Not Found" if no matches exist.
+  - Return "Not Found" as is. NEVER append units like " GB" manually to a "Not Found" result.
+  - Correct: `print(f"Value: {val}")`. Wrong: `print(f"Value: {val} GB")`.
+
+OTCS SPECIFIC LOGIC (ROBUSTNESS):
+--------------------------------
+1. **Saving Folders/Items**: After typing a name in an inline form, ALWAYS use `await page.keyboard.press("Enter")` to save.
+2. **Finding New Items (SORTING)**: After creation, ALWAYS click the "Modified" column header to sort.
+   - **CRITICAL**: OTCS may sort Ascending first. You MUST verify or click twice to ensure **Descending** (newest first).
+3. **Navigation (STABILITY)**: Entering folders via `.click()` can be unstable in OTCS Smart View (SPA).
+   - **CORRECT**: Extract the `href` attribute and use `await page.goto(folder_url)`. This is much more stable and avoids `TargetClosedError`.
+   - **Example**:
+     ```python
+     link = page.locator("a").filter(has_text=re.compile(re.escape(name), re.I)).first
+     href = await link.get_attribute("href")
+     if href: await page.goto(href)
+     else: await link.click() # Fallback
+     ```
+
+BROWSER LAUNCH — ALWAYS use these exact settings, no exceptions:
+--------------
+  browser = await p.chromium.launch(headless=False, args=["--start-maximized"])
+  context = await browser.new_context(no_viewport=True)
+  page = await context.new_page()
+headless=True causes pages to render at a tiny viewport — charts and nav items
+may not appear. no_viewport=True is required for --start-maximized to take effect.
+
+  await page.wait_for_selector(".app-main-content, #global-search", timeout=15000)
+
+RESILIENT ACTIONS (MANDATORY)
+-----------------------------
+OTCS and dynamic apps often hide content in iframes.
+MANDATORY: Copy the provided RESILIENT HELPERS verbatim at the start of `run()`.
+Always use `await resilient_click(page, ...)` and `await resilient_fill(page, ...)`—never chain discovery and action yourself.
+
+BULK UPLOAD & DIRECTORY SUPPORT:
+--------------------------------
+If the task involves a "folder" or "bulk" upload, use `await resilient_upload(page, "Document", local_path)`.
+This function automatically expands a directory into a list of files.
+
+OTCS SPECIFIC LOGIC (ROBUSTNESS):
+--------------------------------
+1. **Saving Folders/Items**: After typing a name in an inline form, ALWAYS use `await page.keyboard.press("Enter")` to save. It is more reliable than clicking a checkmark button.
+2. **Finding New Items**: After creation, ALWAYS click the "Modified" column header to sort. The new item will be in the first row. Use `page.locator("a").filter(has_text=re.compile(f"^{re.escape(name)}$")).first` to click it.
+CRITICAL TABLE EXTRACTION RULES (READ CAREFULLY):
+-------------------------------------------------
+**IMPORTANT: Before extracting table data, ALWAYS ask: "Is this a horizontal or vertical table?"**
+
+1. **HORIZONTAL TABLE** (Most common in OTCS/enterprise apps):
+   - Structure: Table has HEADER ROW + DATA ROWS. Each DATA ROW is one record.
+   - Example DOM text: `Partition\tRAM (%)\tDisk (%)\tState\n...\nPartition 1\t5\t0\tNormal\t...`
+   - **CORRECT STRATEGY**: Find the data row by its name, then get the Nth `<td>` by column index.
+   - Use `resilient_table_extract(page, "TableID", "Row Name", col_index=N)`
+   - `col_index` is determined by counting columns from the header row (0-indexed).
+   - **NEVER** look for a label element "Partition State" — it DOES NOT EXIST in horizontal tables.
+   - **NEVER** use `./following-sibling::td` XPath in horizontal tables.
+
+2. **VERTICAL TABLE** (Key-Value layout):
+   - Structure: Each ROW has a `<td>` label (e.g. "Status:") and a `<td>` value.
+   - Example DOM: `<tr><td>Status</td><td>Running</td></tr>`
+   - **CORRECT STRATEGY**: Find the label cell, then get the sibling `<td>`.
+   - Use: `page.locator("tr").filter(has=page.locator("td").filter(has_text="Status")).locator("td").nth(1)`
+
+3. **CRITICAL: DO NOT USE `find_resilient` to look for a "Partition State" label.**
+   - In OTCS `PartitionMapTable`, the DOM text shows: `Partition | RAM (%) | Disk (%) | State`
+   - `State` is a **column header**, not a row label. The VALUE is e.g. `Normal`.
+   - To get it: `await table.locator("tr").filter(has_text="Partition 1").locator("td").nth(5).text_content()`
+   - (Column 5 = State column, confirmed from DOM snapshot analysis)
+
+CRITICAL: Initialise ALL data variables (lists, dicts, strings) at the VERY START of `run()` to avoid `UnboundLocalError` in the `finally` block.
+Always use `await resilient_click(page, ...)` and `await resilient_fill(page, ...)`—never chain discovery and action yourself.
+
+REPORTING & SCREENSHOTS (MANDATORY — COPY VERBATIM)
+----------------------------------------------------
+The following helpers MUST be copied VERBATIM at the START of `run()`, exactly as-is.
+DO NOT modify, simplify, or rewrite them. They contain the approved Chrome frame implementation.
+
+```python
+## ── PASTE THE CAPTURE_STEP_CODE BLOCK HERE ────────────────────────────────
+{{CAPTURE_STEP_CODE}}
+## ─────────────────────────────────────────────────────────────────────────
+```
+
+After every `page.goto()` or click, call `await capture_step(page, "Step name", "Result text")`.
+Call it immediately after every major action:
+  `await capture_step(page, "Navigate to Dashboard", "Navigated to <url>")`
+  `await capture_step(page, "Open Action Menu for AdminServer-01", "Menu opened")`
+
+FINAL REPORT STRUCTURE:
+1. Create a `Document()`.
+2. **Execution Summary Table**: Two columns (Step, Action, Result).
+3. **Data Tables**: If data was extracted before failure, include it.
+4. **Step Screenshots**: Heading for each step followed by the framed screenshot.
+5. Save the report using an absolute path co-located with the script.
+   - Use: `report_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), SCRIPT_CONFIG["report_filename"])`
+6. MANDATORY: The report generation MUST execute even if the automation fails midway.
+
+DATA CLEANING & SANITIZATION:
+Mandatory: Use a `clean_id` helper at the start of `run()`:
+```python
+    def clean_id(raw):
+        # Normalize whitespace, take first line, truncate to 100 chars
+        return re.sub(r'\s+', ' ', (raw or "").split('\n')[0].strip())[:100]
+```
+
+XPATH & SIBLING LOOKUPS (CRITICAL)
+---------------------------------
+1. **XPath Unions**: Use `|` for unions, NEVER use a comma `,`.
+   - **WRONG**: `locator("xpath=//div, //span")`
+   - **CORRECT**: `locator("xpath=//div | //span")`
+2. **Finding Values next to Labels** (The "Golden Pattern"):
+   - Apps like OTCS often put labels in one `<td>` and values in the next.
+   - **STRATEGY A (Row Filter - Best)**: Find the row that contains the label, then get the second cell.
+     ```python
+     row = page.locator("tr").filter(has=page.locator("td, th, span").filter(has_text=re.compile(label, re.I))).first
+     value = await row.locator("td").nth(1).text_content()
+     ```
+   - **STRATEGY B (XPath Sibling)**: 
+     `locator("xpath=./following-sibling::td[1] | ./parent::*/following-sibling::td[1]")`
+
+CLEAN EXIT (WINDOWS)
+--------------------
+To prevent noisy "I/O operation on closed pipe" warnings on Windows, add this BEFORE `asyncio.run()` or at the top of the file:
+```python
+import sys
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+```
+And suppress the logger in `run()`:
+  `logging.getLogger("asyncio").setLevel(logging.ERROR)`
+Ensure you use `await browser.close()` inside the `try/finally` block.
+Mandatory: Add `await asyncio.sleep(0.5)` after `await browser.close()` to avoid "RuntimeError: Event loop is closed" on Windows.
+CRITICAL: If the script fails on a `wait_for` step for a header, it means the tag or text is incorrect. Broaden search to include `div, td`.
+
+STRICT LOGIC ADHERENCE
+----------------------
+1. Follow the AGENT HISTORY exactly once.
+2. Follow the logic specified in the ## TASK objective for reconfiguration or triggers.
+   - If the user says "config only if Running", do NOT use "if not Running".
+   - Follow the user's direction over common-sense defaults.
+3. Do NOT generate loops, retries, or "if/else" logic unless explicitly present in history or required by the objective.
+4. STOP only after the ABSOLUTE FINAL action in the provided AGENT HISTORY.
+5. NEVER append explanation text or alternative versions.
+
+TABLE EXTRACTION (DYNAMIC & ROBUST)
+----------------------------------
+Nested tables and non-standard header names (e.g. "Worker ID" vs "Agent Name") require a high-resiliency approach.
+1. **Find the Header Row (ROBUST DUAL-VERIFICATION)**:
+   - DO NOT look for headers by page title. You MUST find a `tr` that contains cells for BOTH an identifier and a status within the SAME row.
+   - **Inclusive Synonyms**: Use a broad regex for identifiers in `SCRIPT_CONFIG`. Example: `(Worker ID|Agent Name|ID|Agent|Worker|Name|User)`. For status: `(Status|State|Result)`.
+   - **Unique Index Enforcement**: Ensure the identifier and status columns are in different cells (`idx_1 != idx_2`). This prevents matching page titles where both keywords appear in one cell.
+   - **Diagnostic Fallback (MANDATORY)**: If the header row discovery loop finishes without a match, the script MUST iterate through all `tr` elements one more time and print the `clean_id` text of every cell. This is critical for debugging why a header wasn't found.
+   - **Direct-Child Cell Matching**: ALWAYS use `> th, > td` to avoid nested layout table pollution.
+   - Example Pattern (Robust):
+     ```python
+     all_trs = await page.locator("tr").all()
+     header_found = False
+     for row in all_trs:
+         cells = await row.locator("> th, > td").all()
+         if len(cells) < 2: continue
+         texts = [clean_id(await c.text_content()) for c in cells]
+         # ... regex check across texts ...
+         if match:
+             header_found = True; break
+     if not header_found:
+         for r in all_trs: print(f"DEBUG Table Row: {[clean_id(await c.text_content()) for c in await r.locator('> th, > td').all()]}")
+         raise RuntimeError("Could not find table headers")
+     ```
+2. **Identify the Data Table**:
+   - Once the header row is found, the data table is ALWAYS `header_row.locator("xpath=./ancestor::table[1]")`.
+3. **BAN Title-Based Locators**: NEVER locate a table by searching for its title text (e.g. `h1-h6`, `span`, `div`). ALWAYS use the **Header-First** pattern above.
+4. **Header Row Exclusion**: DO NOT use regex substring search (`re.search`) to skip the header row, as it might accidentally match data rows (like "Agent" matching "DAAgent"). Instead, use EXACT STRING EQUALITY to compare the extracted `agent_name` to the known header text.
+   - Example: First save the header text (`header_text = clean_id(await cells[id_col].text_content())`), then in the data loop: `if agent_name.lower() == header_text.lower(): continue`
+5. **Scoped Action Menu (PRECISION)**:
+   - To click an action menu for a specific row, first identify the specific link or cell containing the unique text (e.g. the server name).
+   - **Ancestor Row Scoping (MANDATORY)**: Use `locator("xpath=./ancestor::tr[1]")` to find the *innermost* row that contains that specific cell. This prevents matching broad layout containers.
+   - **Caret Identification**: Inside that innermost row, locate the caret/menu button using a class or ID from the SELECTOR REFERENCE.
+   - Example:
+     ```python
+     item_link = page.get_by_text(name).filter(visible=True).first
+     target_row = item_link.locator("xpath=./ancestor::tr[1]")
+     menu_btn = target_row.locator(".caret_or_menu_selector_from_history").filter(visible=True).first
+     ```
+   - **Vigorous Menu Interaction (VMI)**: For function menus/dropdowns, standard `.click()` is often insufficient. MANDATORY to use:
+     `await menu_el.hover()`
+     `await menu_el.dispatch_event('mousedown')`
+     `await menu_el.dispatch_event('mouseup')`
+     `await menu_el.click()`
+     `await page.wait_for_timeout(1000) # MANDATORY: Wait for menu to animate`
+6. **Shallow Columns (CRITICAL)**:
+   - When extracting cells from a row, ALWAYS use `locator("> th, > td")`.
+7. **Async Iteration (CRITICAL)**:
+   - When using `.all()`, await it once: `rows = await locator.all()`.
+   - Then iterate normally: `for row in rows:`.
+8. **Resilient Data Row Extraction**:
+   - Filter out spacing rows: `if len(cells) > max_index and "".join([await c.text_content() for c in cells]).strip():`.
+9. **Timestamped Reports (MANDATORY)**:
+   - To avoid file-lock errors, generate a unique filename with a timestamp AT RUNTIME.
+   - In `run()`, use: `filename = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx")`.
+10. **ZERO HARDCODING**:
+   - Never use specific strings from prompt examples in your code. Derive ALL names, statuses, and labels from the provided context.
+11. **Icon-Based Status Extraction**:
+    - If a status is represented by an icon (e.g., a green checkmark), the text will NOT be in `text_content()`. It will be in the `title` or `alt` attribute of an `img` tag.
+    - When extracting statuses, implement a fallback: if text extraction yields empty/Not Found, search for an `img` tag within the element or its parent row, and use `await img.get_attribute("title")` or `alt`. Example:
+      ```python
+      img_locator = target_cell.locator("img").first
+      if await img_locator.count() > 0:
+          status_value = await img_locator.get_attribute("title") or await img_locator.get_attribute("alt")
+      ```
+
+12. **Precision Row-Specific Selection (ROBUST)**:
+    - When interacting with an element inside a table (like a menu button for a specific row), do NOT rely on a global index or broad selector.
+    - **Use `row_context`**: Identify a unique string from the `row_context` (e.g., the server or agent name) and use it to locate the row.
+    - **Identify the Target**: Once the row is located via `.filter(has_text=...)`, find the target element (button, link, caret) within that row.
+    - Example:
+      ```python
+      # The selector reference shows row_context: ['MyServer', 'Running', ...] for a click
+      target_name = "MyServer" 
+      target_row = page.locator("tr").filter(has_text=re.compile(rf"\b{target_name}\b", re.I)).first
+      menu_btn = target_row.locator(".menu-selector-from-history").first
+      await menu_btn.click()
+      ```
+
+13. **SYNTAX: DO NOT AWAIT LOCATORS (CRITICAL)**:
+    - In Playwright for Python, `locator()`, `.first`, `.last`, `.nth()`, and `.filter()` are for defining WHERE to look and are **NOT** awaitable.
+    - **WRONG**: `await page.locator("...").first`
+    - **CORRECT**: `page.locator("...").first` (standard assignment)
+    - **CORRECT**: `await page.locator("...").first.click()` (awaiting the action)
+    - **CORRECT**: `await page.locator("...").first.wait_for()` (awaiting the wait)
+    - **CORRECT**: `await page.locator("...").count()` (awaiting the count)
+    - **CORRECT**: `await page.locator("...").all()` (awaiting the list retrieval)
+    - **CORRECT**: `await page.locator("...").text_content()` (awaiting the extraction)
+    - If you are assigning a locator to a variable for later use, DO NOT use `await`.
+529: 
+530: SELECTORS (ROBUSTNESS)
+----------------------
+CRITICAL: TOTAL BAN on `page.wait_for_selector()`. It is prone to hallucinations. Use `locator().wait_for()` instead (especially for login).
+CRITICAL: TOTAL BAN on all `:has-text()` pseudo-selectors. They cause syntax errors. Use `.filter(has_text=...)` instead.
+CRITICAL: NEVER assign the result of `locator.wait_for()` to a variable. It returns `None`.
+
+To wait for an element with specific text:
+- Target: `page.locator("table").filter(has=page.locator("th, td").filter(has_text=re.compile(r"ColName", re.I)))).filter(visible=True).first`
+- Use `.first` or `.last` to avoid outer "Shell" tables.
+- CRITICAL: Use `re.compile(r"...", re.I)` for ALL `has_text` filters (column names, table titles, nav items) to avoid whitespace and case issues.
+BROWSER LAUNCH & WINDOWS STABILITY (CRITICAL):
+----------------------------------------------
+To avoid "RuntimeError: Event loop is closed" on Windows, use this exact manual startup/cleanup pattern (do NOT use `async with`):
+```python
+    p = None
+    browser = None
+    # INITIALIZE ALL DATA VARIABLES TO EMPTY LISTS/DICTS/STRINGS HERE
+    distributed_agents_data = [] 
+    partition_map_summary = {} 
+    # ... etc
+    
+    try:
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(...)
+        ...
+    finally:
+        # CLEANUP MUST BE IN A PROTECTED TRY-EXCEPT
+        try:
+            if browser: await browser.close()
+            if p: await p.stop()
+        except: pass # Ignore playwright connection closed errors
+```
+
+Headers and Titles:
+- Use broad locators for robustness: `page.locator("h1, h2, h3, h4, h5, h6, b, span, div, td").filter(has_text=text).first`
+
+Rows and Inputs:
+- Correct: `page.locator("tr").filter(has_text=row_id).locator("input").first`
+- Wrong:   `page.locator("tr:has-text('...') input")`
+
+CLICKING NAVIGATION & MENUS (DYNAMIC)
+-------------------------------------
+Always filter for visibility to avoid clicking hidden/mobile clones:
+  await page.get_by_text(nav_text, exact=True).filter(visible=True).first.click()
+
+Action Menus & Buttons:
+- Prioritize selectors provided in the `## SELECTOR REFERENCE` section for specific actions like `click_element` or `open_action_menu`.
+- Common Action Menu Patterns (Classic & Smart View):
+  - `[title*='Functions']`, `[title*='Actions']`, `.functionMenuHotspot`, `[data-otname='objFuncMenu']`
+  - `button[aria-label*='actions']`, `.icon-dropdown`, `.csui-table-row-action-menu`
+  - `a[role='button'][data-csui-extension='dropdown']`
+- ALWAYS use visibility filtering: `.filter(visible=True).first.click()`
+
+OUTPUT
+------
+Return ONLY valid Python code. No markdown fences. No explanation.
+Exactly one `async def run():` block.
+The script MUST end with this exact entry point:
+```python
 if __name__ == "__main__":
     asyncio.run(run())
-'''
+```
+"""
 
 
-def generate_script(history_path: str, output_path: str = None, model_name: str = None, provider: str = None, objective: str = None, mandatory_history_path: str = None):
-    """
-    Generate script from history file.
+# ─────────────────────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_script(
+    history_path: str,
+    output_path: str = None,
+    model_name: str = None,
+    provider: str = None,
+    objective: str = None,
+    mandatory_history_path: str = None,
+    vault_prefix: str = None,
+) -> tuple:
+    """Generate a pure Playwright script. Returns (output_path, code)."""
+    model_name = model_name or SCRIPT_GEN_MODEL
+    provider   = provider   or SCRIPT_GEN_PROVIDER
+
+    with open(history_path, "r", encoding="utf-8") as f:
+        history_data = json.load(f)
+    run_id = Path(history_path).stem
+    logger.info(f"[generate_script] Loaded: {run_id}")
+
+    if mandatory_history_path and os.path.exists(mandatory_history_path):
+        try:
+            with open(mandatory_history_path, "r", encoding="utf-8") as f:
+                mandatory_data = json.load(f)
+            history_data["history"] = (
+                mandatory_data.get("history", []) + history_data.get("history", [])
+            )
+        except Exception as e:
+            logger.warning(f"[generate_script] Could not merge mandatory history: {e}")
+
+    if not vault_prefix:
+        search_text = objective or history_data.get("task", "") or ""
+        matches = re.findall(r"@vault\.([a-zA-Z0-9_]+)", search_text)
+        if matches:
+            vault_prefix = matches[0].upper()
+            logger.info(f"[generate_script] Auto-detected vault prefix: '{vault_prefix}'")
+
+    effective_prefix = (vault_prefix or VAULT_CREDENTIAL_PREFIX).upper()
+    logger.info(f"[generate_script] Vault prefix: '{effective_prefix}'")
+
+    selector_map = _build_selector_map(history_data)
+    compact_hist = _compact_history(history_data)
+    task_text    = objective or history_data.get("task", "Complete the automation task")
+
+    # Add DOM Context for relevant steps (e.g. table extraction steps)
+    dom_context_blocks = []
+    steps = history_data.get("history") or history_data.get("steps") or []
+    for idx, step in enumerate(steps):
+        model_out = step.get("model_output") or {}
+        actions = model_out.get("action") or []
+        
+        # Extract target index if this is a targeted element action
+        target_idx = None
+        for act in actions:
+            if not isinstance(act, dict): continue
+            for key in ("retrieve_value_by_element", "click_element", "hover_capture"):
+                if key in act:
+                    target_idx = act[key].get("index") or act[key].get("element_index")
+                    break
+            if target_idx: break
+
+        # Always provide context for the last 3 steps, or any step with a target index
+        if idx >= len(steps) - 3 or target_idx:
+            context = _get_dom_context(history_path, idx + 1, target_idx)
+            if context:
+                dom_context_blocks.append(f"### STEP {idx + 1} PAGE STRUCTURE\n{context}")
+
+    dom_ctx_str = "\n\n".join(dom_context_blocks) if dom_context_blocks else ""
+
+    dom_digest_str = _build_dom_digest(history_path)
+
+    user_prompt = f"""## TASK
+{task_text}
+
+## VAULT PREFIX
+Call `vault_creds("{effective_prefix}")` to get credentials.
+The vault_creds() function is already defined — copy the VAULT SNIPPET below verbatim
+at the top of the script before your imports, then call it in run().
+
+## VAULT SNIPPET (copy this verbatim at the very top of the script)
+```
+{_VAULT_SNIPPET}
+```
+
+```python
+{_CAPTURE_STEP_CODE}
+```
+
+## MANDATORY CODE BLOCK — RESILIENT HELPERS (copy verbatim inside run(), before automation steps)
+The code below provides robust navigation and bulk upload. You MUST use these helpers for ALL interactions.
+```python
+{_RESILIENT_HELPERS_CODE}
+```
+
+{selector_map}
+
+{dom_digest_str}
+
+## PAGE STRUCTURE REFERENCE (Full structural context for relevant steps)
+{dom_ctx_str or "No additional DOM snapshots found."}
+
+## AGENT HISTORY (successful path — failed/retry actions removed)
+{compact_hist}
+
+Write the complete Python script now. Start with the VAULT SNIPPET verbatim."""
+
+    current_system_prompt = _SYSTEM_PROMPT.replace("{{CAPTURE_STEP_CODE}}", _CAPTURE_STEP_CODE)
+
+    prompt_tokens = (len(current_system_prompt) + len(user_prompt)) // 4
+    # Increase headroom to 16k to ensure long scripts aren't truncated
+    num_ctx = max(16384, min(prompt_tokens + 16384, SCRIPT_GEN_NUM_CTX))
+    logger.info(f"[generate_script] {provider}/{model_name} | ~{prompt_tokens} tok | ctx={num_ctx}")
+
+    llm = get_llm_model(
+        provider=provider,
+        model_name=model_name,
+        temperature=SCRIPT_GEN_TEMPERATURE,
+        num_ctx=num_ctx,
+    )
+
+    response = llm.invoke([
+        SystemMessage(content=current_system_prompt),
+        HumanMessage(content=user_prompt),
+    ])
+    code = response.content
+
+    # Strip markdown fences (including partial ones if truncated)
+    code = code.strip()
+    if code.startswith("```python"):
+        code = code[9:].strip()
+    elif code.startswith("```"):
+        code = code[3:].strip()
     
-    Args:
-        history_path: Path to the process history JSON file
-        output_path: Where to save the generated script
-        model_name: LLM model to use (default: LLM_MODEL_NAME from config/env)
-        provider: LLM provider (default: LLM_PROVIDER from config/env)
-        objective: The task objective
-        mandatory_history_path: Optional path to mandatory/login history to prepend
-    """
-    from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
-    if model_name is None:
-        model_name = SCRIPT_GEN_MODEL
-    if provider is None:
-        provider = SCRIPT_GEN_PROVIDER
-    try:
-        with open(history_path, 'r', encoding='utf-8') as f:
-            history_data = json.load(f)
-            
-        run_id = Path(history_path).stem
-        logger.info(f"Loaded history for {run_id}")
-        
-        # If mandatory history is provided, merge it with process history
-        # This ensures non-mandatory process scripts can run standalone with login
-        if mandatory_history_path and os.path.exists(mandatory_history_path):
-            try:
-                with open(mandatory_history_path, 'r', encoding='utf-8') as f:
-                    mandatory_data = json.load(f)
-                
-                mandatory_steps = mandatory_data.get('history', [])
-                process_steps = history_data.get('history', [])
-                
-                # Prepend mandatory steps to process steps
-                history_data['history'] = mandatory_steps + process_steps
-                
-                # Include mandatory objective in the combined objective
-                mandatory_objective = mandatory_data.get('task', '')
-                if mandatory_objective:
-                    objective = f"PREREQUISITES (Login/Session Setup):\n{mandatory_objective}\n\nMAIN TASK:\n{objective or history_data.get('task', '')}"
-                
-                logger.info(f"Merged {len(mandatory_steps)} mandatory steps with {len(process_steps)} process steps")
-            except Exception as merge_err:
-                logger.warning(f"Failed to merge mandatory history: {merge_err}. Proceeding with process-only history.")
-        
-        # Prepare content
-        cleaned_history = clean_history_json(history_data, objective=objective)
-        logger.info(f"Cleaned History Context (First 500 chars): {cleaned_history[:500]}...")
+    if code.endswith("```"):
+        code = code[:-3].strip()
 
-        # ── Cert task short-circuit: skip LLM, emit check_certificate script ──
-        import re as _re
-        _CERT_RE = r'\b(ssl|tls|certificate|https cert|cert detail|cert valid|lock icon|connection secure)\b'
-        _obj_text = (objective or history_data.get('task', '')).lower()
-        if _re.search(_CERT_RE, _obj_text, _re.IGNORECASE):
-            # Extract target URL from history
-            _url = None
-            try:
-                _h = json.loads(cleaned_history)
-                _steps = _h.get('steps') if isinstance(_h, dict) else _h
-                for _s in (_steps or []):
-                    _u = _s.get('url', '')
-                    if _u and _u.startswith('http') and 'about:blank' not in _u:
-                        _url = _u
-                        break
-            except Exception:
-                pass
-            _url = _url or "# REPLACE_WITH_TARGET_URL"
-            cert_script = _build_cert_script(_url, objective or "SSL Certificate Check")
-            
-            if not output_path:
-                output_path = str(Path(history_path).parent / f"{run_id}_LLM.py")
-                
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(cert_script)
-            logger.info(f"[cert-shortcircuit] Cert script written to: {output_path}")
-            
-            return output_path, cert_script
+    # Ensure vault snippet is present — prepend if LLM forgot it
+    if "vault_creds" not in code:
+        logger.warning("[generate_script] vault_creds missing — prepending snippet")
+        code = _VAULT_SNIPPET + "\n" + code
+
+    if 'if __name__ == "__main__":' not in code:
+        logger.warning("[generate_script] Entry point missing — appending fallback")
+        code += '\n\nif __name__ == "__main__":\n    asyncio.run(run())\n'
+
+    if not output_path:
+        output_path = str(Path(history_path).parent / f"{run_id}_LLM.py")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    logger.info(f"[generate_script] Saved: {output_path}")
+    return output_path, code
 
 
-        try:
-            debug_path = history_path.replace('.json', '_cleaned.json')
-            with open(debug_path, 'w', encoding='utf-8') as f:
-                f.write(cleaned_history)
-            logger.info(f"Debug cleaned history saved to: {debug_path}")
-        except: pass
-
-        # Prepare user prompt
-        # (LLM is initialized later, after dynamic num_ctx is computed from actual prompt size)
-
-        # Build element data context from captured elements
-        element_context = _build_element_data_context()
-
-        # Build action→selector map from history (explicit lookup, prevents hallucination)
-        selector_map = _build_action_selector_map(cleaned_history)
-        if selector_map:
-            logger.info(f"[selector-map] Built action→selector reference ({selector_map.count(chr(10))} lines)")
-
-        # Create Prompt
-        user_prompt = f"Task Objective: {objective or 'Complete the automation task'}\n\n"
-
-        # ── Multi-page / Multi-table navigation plan ──────────────────────────
-        # Uses _build_page_table_registry() to inject EVERY table on EVERY page
-        # with its exact CSS selector and required columns.
-        #
-        # For each page visited in the history the LLM receives:
-        #   Page N: <url>
-        #     Table 1: selector="<css>" | headers=[...] | row_count=N
-        #       → wait_for_selector("<css>", timeout=TIMEOUT_TABLE_WAIT_MS)
-        #       → resilient_extract_table(page, "<css>", [<exact cols>])
-        #     Table 2: ...
-        #
-        # This eliminates ALL column and selector guessing by the LLM.
-        try:
-            _tbl_registry = _build_page_table_registry(cleaned_history, run_id=run_id)
-            _login_kws = ("login", "otdsws", "signin", "auth/login", "about:blank")
-
-            # Also collect non-table pages (they still need a goto block)
-            _h2 = json.loads(cleaned_history)
-            _steps2 = _h2.get('steps') if isinstance(_h2, dict) else _h2
-            _all_urls_ordered = []
-            _seen_u2 = set()
-            for _s2 in (_steps2 or []):
-                # FIX: dedup by FULL URL, not base URL.
-                # OTCS pages all share the same base (cs.exe) but differ only in query
-                # string (func=distributedagent vs func=ll&objtype=148 etc.).
-                # Using split('?')[0] collapsed them all into one entry → only the
-                # first page ever appeared in the navigation plan.
-                _full_u2 = _s2.get('url') or ''
-                if not _full_u2 or _full_u2 in _seen_u2:
-                    continue
-                if any(kw in _full_u2.lower() for kw in _login_kws):
-                    continue
-                _seen_u2.add(_full_u2)
-                _all_urls_ordered.append(_full_u2)
-
-            if _all_urls_ordered:
-                plan_lines = [
-                    "## NAVIGATION PLAN",
-                    "# ⚠️  CRITICAL RULES:",
-                    "# 1. Generate ONE page.goto() block per page listed below.",
-                    "# 2. Call resilient_extract_table() ONCE per table listed — "
-                    "use the EXACT selector and EXACT columns shown.",
-                    "# 3. NEVER mix selectors across pages.",
-                    "# 4. For pages with NO TABLE listed: use wait_for_load_state('networkidle').",
-                    "",
-                ]
-
-                for _pi, _purl in enumerate(_all_urls_ordered):
-                    # Match URL to registry key (full URL first)
-                    _ptbls = _tbl_registry.get(_purl) or []
-                    # Fallback: match registry key whose query string is contained in purl
-                    # (handles minor URL variations like extra params)
-                    if not _ptbls:
-                        for _rk, _rv in _tbl_registry.items():
-                            if _rk in _purl or _purl in _rk:
-                                _ptbls = _rv
-                                break
-
-                    # Fallback 2: _KNOWN_PAGE_SELECTORS — for pages with no history data
-                    # (agent visited the page but didn't call extract_content, or old run)
-                    if not _ptbls:
-                        kp = _known_page_info(_purl)
-                        if kp and kp.get("selector"):
-                            _ptbls = [{
-                                "selector":  kp["selector"],
-                                "headers":   kp.get("columns") or [],
-                                "required":  kp.get("columns") or [],
-                                "row_count": 0,
-                            }]
-                            logger.info(
-                                f"[NAV-PLAN] {_purl}: "
-                                f"injected known-page selector {kp['selector']!r}"
-                            )
-
-                    plan_lines.append(f"  Page {_pi+1}: {_purl}")
-
-                    if _ptbls:
-                        for _ti, _tbl in enumerate(_ptbls):
-                            _tsel = _tbl.get("selector", "")
-                            _tcols = _tbl.get("required") or _tbl.get("headers") or []
-                            _rows  = _tbl.get("row_count", 0)
-                            _hdrs  = _tbl.get("headers") or []
-
-                            if _tsel:
-                                plan_lines.append(
-                                    f"    Table {_ti+1}: selector={_tsel!r}"
-                                    + (f" | headers={_hdrs}" if _hdrs else "")
-                                    + (f" | row_count={_rows}" if _rows else "")
-                                )
-                                plan_lines.append(
-                                    f"      → await page.wait_for_selector({_tsel!r}, "
-                                    f"timeout=TIMEOUT_TABLE_WAIT_MS)"
-                                )
-                                plan_lines.append(
-                                    f"      → rows_{_ti+1} = await resilient_extract_table"
-                                    f"(page, {_tsel!r}, {_tcols!r})"
-                                )
-                            else:
-                                # No selector — use networkidle + auto-discover
-                                plan_lines.append(
-                                    f"    Table {_ti+1}: selector=unknown"
-                                    + (f" | columns={_tcols}" if _tcols else "")
-                                )
-                                plan_lines.append(
-                                    f"      → await page.wait_for_load_state('networkidle')"
-                                )
-                                plan_lines.append(
-                                    f"      → rows_{_ti+1} = await resilient_extract_table"
-                                    f"(page, 'table', {_tcols!r})"
-                                )
-                    else:
-                        plan_lines.append(
-                            f"    (No table data captured — use wait_for_load_state"
-                            f"('networkidle') and interact as needed)"
-                        )
-                    plan_lines.append("")  # blank line between pages
-
-                user_prompt += "\n".join(plan_lines) + "\n\n"
-                logger.info(
-                    f"[PROMPT] Injected {len(_all_urls_ordered)}-page / "
-                    f"{sum(len(v) for v in _tbl_registry.values())}-table navigation plan"
-                )
-
-                # ── ⚡ FAST-PATH: skip LLM if all selectors/columns are known ──
-                # Attempt this BEFORE initializing the LLM to save the most time.
-                _fast_code = _try_template_fast_path(
-                    cleaned_history=cleaned_history,
-                    all_urls_ordered=_all_urls_ordered,
-                    tbl_registry=_tbl_registry,
-                    objective=objective or "",
-                    run_id=run_id,
-                )
-                if _fast_code is not None:
-                    if not output_path:
-                        output_path = str(Path(history_path).parent / f"{run_id}_LLM.py")
-                    with open(output_path, 'w', encoding='utf-8') as f:
-                        f.write(_fast_code)
-                    logger.info(f"[FAST-PATH] ⚡ Script written (no LLM used): {output_path}")
-                    return output_path, _fast_code
-
-        except Exception as _pe:
-            logger.warning(f"[PROMPT] Could not build page/table plan: {_pe}")
-
-        if selector_map:
-            user_prompt += (
-                f"{selector_map}\n\n"
-                "⚠️  CRITICAL: For EVERY resilient_fill, resilient_click, wait_for_selector, "
-                "and page.locator call you MUST use the exact selector from the "
-                "SELECTOR REFERENCE TABLE above. Do NOT invent selectors.\n\n"
-            )
-        user_prompt += f"Generate a Playwright script for the following execution history (Run ID: {run_id}):\n\n{cleaned_history}"
-        if element_context:
-            user_prompt += element_context
-            logger.info(f"[PROMPT] Injected {element_context.count(chr(10))} lines of captured element data into LLM prompt")
-
-        # ── Dynamic num_ctx: actual prompt size + 2K headroom ──────────────
-        # Avoids loading a 32K context window for a 5K prompt.
-        # 1 token ≈ 4 chars; add 2048 tokens for the generated output.
-        _prompt_chars  = len(SYSTEM_PROMPT) + len(user_prompt)
-        _prompt_tokens = (_prompt_chars // 4) + 2048
-        _dynamic_ctx   = max(4096, min(_prompt_tokens, SCRIPT_GEN_NUM_CTX))
-        if _dynamic_ctx < SCRIPT_GEN_NUM_CTX:
-            logger.info(
-                f"[LLM] Dynamic num_ctx: {_dynamic_ctx} "
-                f"(prompt ~{_prompt_chars//4} tok, cap was {SCRIPT_GEN_NUM_CTX})"
-            )
-
-        # Initialize LLM now that we know the actual context size needed
-        logger.info(f"Initializing LLM: {provider}/{model_name} (num_predict={SCRIPT_GEN_NUM_PREDICT}, num_ctx={_dynamic_ctx})")
-        llm = get_llm_model(
-            provider=provider,
-            model_name=model_name,
-            temperature=SCRIPT_GEN_TEMPERATURE,
-            num_predict=SCRIPT_GEN_NUM_PREDICT,
-            num_ctx=_dynamic_ctx,
-        )
-
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=user_prompt)
-        ]
-        
-        # Generate with OOM retry fallback (spec §3.G)
-        logger.info("Sending request to LLM (this may take a minute)...")
-        # Build fallback chain: primary model first, then config-defined fallbacks
-        _oom_fallback_models = [model_name] + OOM_FALLBACK_MODELS
-        # ctx sizes: primary uses dynamic_ctx, fallbacks use OOM_FALLBACK_CTX values
-        _oom_fallback_ctx    = [_dynamic_ctx] + list(OOM_FALLBACK_CTX)
-        response = None
-        last_err = None
-        for _attempt, (_fb_model, _fb_ctx) in enumerate(zip(_oom_fallback_models, _oom_fallback_ctx)):
-            try:
-                if _attempt > 0:
-                    logger.warning(f"[OOM] Retrying with fallback model={_fb_model}, num_ctx={_fb_ctx} (attempt {_attempt+1})")
-                    llm = get_llm_model(
-                        provider=provider,
-                        model_name=_fb_model,
-                        temperature=SCRIPT_GEN_TEMPERATURE,
-                        num_predict=OOM_RETRY_NUM_PREDICT,
-                        num_ctx=_fb_ctx,
-                    )
-                response = llm.invoke(messages)
-                break
-            except Exception as invoke_err:
-                last_err = invoke_err
-                err_lower = str(invoke_err).lower()
-                if any(kw in err_lower for kw in ("cuda out of memory", "oom", "out of memory", "failed to allocate")):
-                    logger.warning(f"[OOM] CUDA OOM detected on attempt {_attempt+1}: {invoke_err}")
-                    continue
-                raise  # Non-OOM errors are re-raised immediately
-        if response is None:
-            raise RuntimeError(f"[OOM] All fallback models exhausted. Last error: {last_err}")
-        code = response.content
-        
-        # Robust Extraction (Handle extra text, markdown blocks, etc.)
-        import re
-        code = response.content
-        
-        # Try to find the largest python code block
-        code_blocks = re.findall(r'```python\n(.*?)\n```', code, re.DOTALL)
-        if not code_blocks:
-            code_blocks = re.findall(r'```\n(.*?)\n```', code, re.DOTALL)
-            
-        if code_blocks:
-            # Use the longest block (highest probability of being the actual script)
-            code = max(code_blocks, key=len).strip()
-        else:
-            # Fallback: strip markers manually but keep the whole content if no blocks found
-            code = code.replace("```python", "").replace("```", "").strip()
-
-        # Enforce required DOM scoping, columns, and login hook
-        # May raise RuntimeError if quality gate cannot auto-fix
-        try:
-            code = _postprocess_generated_code(code, cleaned_history, tbl_registry=_tbl_registry)
-        except RuntimeError as qg_err:
-            logger.error(f"[QUALITY GATE] Refusing to save script: {qg_err}")
-            raise
-        
-        # Final safety check: if it STILL doesn't look like code, log it
-        if "async def run" not in code:
-            logger.warning("Generated content might not be a valid script! Checking for generic text...")
-            # If there's an 'async filter' or similar, we might have a nested structure
-            
-        # Verify imports (Basic check)
-        if "from playwright.async_api" not in code:
-            logger.warning("Generated code might be missing imports!")
-
-        # Determine output path
-        if not output_path:
-            output_path = str(Path(history_path).parent / f"{run_id}_LLM.py")
-            
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(code)
-            
-        logger.info(f"✅ Script saved to: {output_path}")
-        return output_path, code
-
-    except Exception as e:
-        logger.error(f"Failed to generate script: {e}")
-        raise
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
-    parser = argparse.ArgumentParser(description="Generate Playwright script via LLM")
-    parser.add_argument("history_file", help="Path to agent history JSON file")
-    parser.add_argument("--output", help="Output path for .py file")
-    parser.add_argument("--provider", default=SCRIPT_GEN_PROVIDER, help=f"LLM Provider (default: {SCRIPT_GEN_PROVIDER}, set via SCRIPT_GEN_PROVIDER env)")
-    parser.add_argument("--model",    default=SCRIPT_GEN_MODEL,    help=f"Model name (default: {SCRIPT_GEN_MODEL}, set via SCRIPT_GEN_MODEL env)")
-
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s - %(levelname)s - %(message)s")
+    parser = argparse.ArgumentParser(description="Generate pure Playwright script")
+    parser.add_argument("history_file")
+    parser.add_argument("--output",       default=None)
+    parser.add_argument("--provider",     default=SCRIPT_GEN_PROVIDER)
+    parser.add_argument("--model",        default=SCRIPT_GEN_MODEL)
+    parser.add_argument("--vault-prefix", default=None)
+    parser.add_argument("--objective",    default=None)
     args = parser.parse_args()
-    generate_script(args.history_file, args.output, args.model, args.provider)
+
+    path, _ = generate_script(
+        history_path=args.history_file,
+        output_path=args.output,
+        model_name=args.model,
+        provider=args.provider,
+        objective=args.objective,
+        vault_prefix=args.vault_prefix,
+    )
+    print(f"Script written to: {path}")

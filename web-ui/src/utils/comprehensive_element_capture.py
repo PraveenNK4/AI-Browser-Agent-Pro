@@ -114,6 +114,30 @@ class ComprehensiveElementCapture:
                     current = current.parentElement;
                     depth++;
                 }
+
+                // NEW: Get Direct Siblings
+                const siblings = {
+                    prev: el.previousElementSibling ? { 
+                        tag: el.previousElementSibling.tagName.toLowerCase(),
+                        text: (el.previousElementSibling.innerText || el.previousElementSibling.textContent || '').trim().substring(0, 50),
+                        id: el.previousElementSibling.id || null
+                    } : null,
+                    next: el.nextElementSibling ? {
+                        tag: el.nextElementSibling.tagName.toLowerCase(),
+                        text: (el.nextElementSibling.innerText || el.nextElementSibling.textContent || '').trim().substring(0, 50),
+                        id: el.nextElementSibling.id || null
+                    } : null
+                };
+
+                // NEW: Get Row Context (if inside a table)
+                let row = el.closest('tr');
+                let rowContext = null;
+                if (row) {
+                    rowContext = {
+                        allCellText: Array.from(row.cells).map(cell => (cell.innerText || cell.textContent || '').trim()).filter(t => t.length > 0),
+                        cellIndex: el.closest('td') ? el.closest('td').cellIndex : -1
+                    };
+                }
                 
                 // Generate multiple selector candidates
                 const selectorCandidates = [];
@@ -298,6 +322,10 @@ class ComprehensiveElementCapture:
                     // Ancestor context
                     ancestorIds: ancestorIds,
                     parentChain: parentChain,
+                    
+                    // NEW: Neighbor Context
+                    siblings: siblings,
+                    rowContext: rowContext,
                     
                     // Visual state
                     state: {

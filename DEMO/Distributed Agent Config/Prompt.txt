@@ -1,0 +1,24 @@
+1. Navigate and Login: Go to http://otcsvm.otxlab.net:8080/OTCS/cs.exe and log in using the provided credentials (OTCS_USERNAME, OTCS_PASSWORD). Fill the fields directly and do not click any SSO or federation buttons. Wait for the home page to fully load.
+
+2. Access Dashboard: Navigate to the Distributed Agent Dashboard at: http://otcsvm.otxlab.net:8080/OTCS/cs.exe?func=distributedagent.AgentStatus.
+
+3. Extract Data: Read the "Distributed Agent Status" table and extract "Distributed Agent ID" (Column 1) and "Status" (Column 4) for every row.
+
+4. Verify Status: Check if the Status for every Distributed Agent is "Running".
+
+5. Conditional Configuration:
+   - Step 4a (If any agent is NOT "Running"): 
+     - Click the "Configure the Distributed Agent System" link.
+     - Select the radio button for each agent that is not "Running".
+     - Click "Save" and navigate back to the Distributed Agent Dashboard.
+   - Step 4b (If all agents are "Running"): Skip configuration and proceed directly to Step 5.
+
+6. Navigate to Admin Servers: Go to: http://otcsvm.otxlab.net:8080/OTCS/cs.exe?func=ll&objtype=148&objaction=browse.
+
+7. Open Function Menu: Locate the row for "AdminServer-01". Click the dropdown/caret icon to the right of the name link (do not click the name link itself).
+
+8. Generate Report: Create a report containing:
+   - Screenshots of each step.
+   - The full extracted Distributed Agent Status table.
+   - Verification results (confirming all were running or listing those that were not).
+   - The specific action taken (configured or skipped).

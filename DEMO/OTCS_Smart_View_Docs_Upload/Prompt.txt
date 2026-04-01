@@ -1,0 +1,11 @@
+"Navigate to http://otcsvm.otxlab.net:8080/OTCS/cs.exe/app/nodes/2004, login with @vault.otcs, and perform the following actions:
+1. Click the '+' (Add Item) button (targeting the modern UI 'button[aria-label="Add item"]').
+2. Select 'Folder' to open the inline creation form.
+3. Type 'Upload_Test_{timestamp}' into the 'Enter name' field and ENSURE it is saved by pressing 'Enter' or clicking the tick/checkmark button. 
+   - Note: Wait until the input field disappears and the folder is visually created before proceeding.
+4. Click the 'Modified' column header to sort by newest first (ensuring the new folder is at the top).
+5. Enter the new folder (top row).
+6. Inside the new folder, click the '+' (Add Item) button and select 'Document'.
+7. Bulk upload the entire folder 'C:\Users\pnandank\Downloads\OTCS_Upload_Test'.
+   - Note: Simply provide the directory path to the `upload_file` action, and it will automatically expand and upload all files within that folder at once.
+8. Generate a full Chrome-framed report verifying the success of both the folder creation and the file listing."

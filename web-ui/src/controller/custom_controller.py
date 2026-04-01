@@ -163,7 +163,15 @@ class CustomController(Controller):
             browser: BrowserContext,
         ):
             try:
-                dom_el = await browser.get_dom_element_by_index(index)
+                try:
+                    dom_el = await browser.get_dom_element_by_index(index)
+                except KeyError:
+                    return ActionResult(
+                        error=f"❌ KEY ERROR: Index {index} is not found in the current state.\n"
+                              f"REASON: The page may have scrolled, reloaded, or the element is no longer visible.\n"
+                              f"ACTION: Call get_clickable_elements or scroll to refresh the index map, or use find_table_data_rows if extracting from a table."
+                    )
+                
                 if not dom_el:
                     return ActionResult(error=f"No element found at index {index}")
 
@@ -415,95 +423,104 @@ class CustomController(Controller):
                 logger.info(msg)
                 return ActionResult(extracted_content=msg, include_in_memory=True)
             except Exception as e:
-                return ActionResult(error=f'Failed to input text: {str(e)}')
-
-        @self.registry.action('Upload file to file input element. REQUIRED for <input type="file"> elements. This is the ONLY way to upload files - input_text will NOT work for file uploads.')
-        async def upload_file(index: int, path: str, browser: BrowserContext):
+                return Action        @self.registry.action('Upload file(s) to file input element. Supports single path, list of paths, or a directory path (automatically uploads all files in directory). REQUIRED for <input type="file"> elements.')
+        async def upload_file(index: int, path: Union[str, list[str]], browser: BrowserContext):
             """
-            Upload a file to a file input element.
+            Upload one or more files to a file input element.
             
             Args:
                 index: The element index of the file input
-                path: Full file path from available_file_paths
+                path: File path, list of paths, or directory path to upload from.
             """
             logger.info(f"🔍 upload_file called: index={index}, path={path}")
-            logger.info(f"📂 Available file paths: {self.available_file_paths}")
             
-            # Normalize path separators
-            path_normalized = os.path.normpath(path)
+            # --- 1. Expand paths (handle strings, lists, and directories) ---
+            target_paths = []
+            raw_paths = [path] if isinstance(path, str) else path
             
-            # Check if file is available
-            file_available = False
-            matched_path = None
-            
-            for available_path in self.available_file_paths:
-                available_normalized = os.path.normpath(available_path)
-                # Check exact match or if the filename matches
-                if available_normalized == path_normalized or os.path.basename(available_normalized) == os.path.basename(path_normalized):
-                    file_available = True
-                    matched_path = available_normalized
-                    break
-            
-            if not file_available:
-                # RELAXATION: If running locally and file exists, allow it.
-                if os.path.exists(path_normalized):
-                     logger.warning(f"⚠️ Allowing local file upload not in context list: {path_normalized}")
-                     matched_path = path_normalized
+            for p in raw_paths:
+                p_norm = os.path.normpath(p)
+                if os.path.isdir(p_norm):
+                    # Directory expansion: collect all non-hidden files
+                    logger.info(f"📁 Expanding directory: {p_norm}")
+                    for root, _, files in os.walk(p_norm):
+                        for f in files:
+                            if not f.startswith('.'):
+                                target_paths.append(os.path.join(root, f))
                 else:
-                     return ActionResult(
-                        error=f'❌ File not available: {path}\n'
-                              f'📂 Available files:\n' + '\n'.join([f'  - {p}' for p in self.available_file_paths]) +
-                              f'\n(Or provide a valid absolute path to a file that exists on this machine)'
-                    )
+                    target_paths.append(p_norm)
             
-            # Use the matched path
-            actual_path = matched_path
-            logger.info(f"✅ Using file path: {actual_path}")
-            
-            if not os.path.exists(actual_path):
-                return ActionResult(error=f'❌ File does not exist: {actual_path}')
+            if not target_paths:
+                return ActionResult(error=f"❌ No valid file paths provided or found in directory: {path}")
 
+            # --- 2. Validate and match paths against available_file_paths ---
+            actual_paths = []
+            for tp in target_paths:
+                tp_norm = os.path.normpath(tp)
+                matched = None
+                
+                # Check available_file_paths first
+                for av in self.available_file_paths:
+                    av_norm = os.path.normpath(av)
+                    if av_norm == tp_norm or os.path.basename(av_norm) == os.path.basename(tp_norm):
+                        matched = av_norm
+                        break
+                
+                if matched:
+                    actual_paths.append(matched)
+                elif os.path.exists(tp_norm):
+                    # Relaxation: allow local files if they exist
+                    logger.warning(f"⚠️ Allowing local file not in context list: {tp_norm}")
+                    actual_paths.append(tp_norm)
+                else:
+                    logger.warning(f"❌ File not found: {tp_norm}")
+
+            if not actual_paths:
+                return ActionResult(
+                    error=f'❌ None of the requested files were found.\n'
+                          f'📂 Available files:\n' + '\n'.join([f'  - {p}' for p in self.available_file_paths])
+                )
+
+            logger.info(f"✅ Final upload list ({len(actual_paths)} files): {actual_paths}")
+
+            # --- 3. Execute Upload ---
             try:
                 dom_el = await browser.get_dom_element_by_index(index)
                 if not dom_el:
                     return ActionResult(error=f'❌ No element at index {index}')
                 
-                # Get file upload element
-                # Attempt 1: Check if it's a file input or has one associated
-                file_upload_dom_el = dom_el.get_file_upload_element()
+                # Use a single string if only one file (some apps prefer this), else list
+                payload = actual_paths[0] if len(actual_paths) == 1 else actual_paths
                 
+                # Attempt 1: Direct input setting
+                file_upload_dom_el = dom_el.get_file_upload_element()
                 if file_upload_dom_el:
                     file_upload_el = await browser.get_locate_element(file_upload_dom_el)
                     if file_upload_el:
-                        await file_upload_el.set_input_files(actual_path)
-                        logger.info(f'✅ Successfully uploaded file (direct input): {os.path.basename(actual_path)} to index {index}')
-                        return ActionResult(
-                            extracted_content=f'✅ Uploaded file: {os.path.basename(actual_path)} to index {index}',
-                            include_in_memory=True
-                        )
+                        await file_upload_el.set_input_files(payload)
+                        msg = f'✅ Successfully uploaded {len(actual_paths)} file(s) (direct input) to index {index}'
+                        logger.info(msg)
+                        return ActionResult(extracted_content=msg, include_in_memory=True)
 
-                # Attempt 2: Fallback - Click and handle file chooser (common for "Upload" buttons)
-                logger.info(f"ℹ️ Element {index} is not a direct file input. Attempting click + file chooser handling...")
-                
+                # Attempt 2: Handle file chooser (click trigger)
+                logger.info(f"ℹ️ Element {index} is not a direct file input. Attempting click + file chooser...")
                 element = await browser.get_locate_element(dom_el)
                 if not element:
-                     return ActionResult(error=f'❌ Cannot locate element at index {index} for click interaction.')
+                     return ActionResult(error=f'❌ Cannot locate element at index {index} for interaction.')
 
                 try:
-                    page = await browser.get_current_page() # DEFINE PAGE HERE
+                    page = await browser.get_current_page()
                     async with page.expect_file_chooser(timeout=30000) as fc_info:
                         await element.click()
                     
                     file_chooser = await fc_info.value
-                    await file_chooser.set_files(actual_path)
+                    await file_chooser.set_files(payload)
                     
-                    logger.info(f'✅ Successfully uploaded file (via chooser): {os.path.basename(actual_path)}')
-                    return ActionResult(
-                        extracted_content=f'✅ Uploaded file via chooser: {os.path.basename(actual_path)} (clicked index {index})',
-                        include_in_memory=True
-                    )
+                    msg = f'✅ Successfully uploaded {len(actual_paths)} file(s) via chooser (clicked index {index})'
+                    logger.info(msg)
+                    return ActionResult(extracted_content=msg, include_in_memory=True)
                 except asyncio.TimeoutError:
-                     return ActionResult(error=f'❌ Failed: Clicked element {index}, but no file chooser dialog opened within 30s. Is this the right upload button?')
+                     return ActionResult(error=f'❌ Failed: Clicked element {index}, but no file chooser dialog opened within 30s.')
 
             except Exception as e:
                 logger.error(f'❌ Upload failed: {str(e)}', exc_info=True)
@@ -1197,6 +1214,132 @@ class CustomController(Controller):
             except Exception as e:
                 return ActionResult(error=str(e))
 
+        @self.registry.action(
+            "Find indices and CONTENT of table data rows, EXCLUDING headers and structural noise. "
+            "Use this when you are on a page with a table (interactive or non-interactive). "
+            "Optionally provide 'header_text' (e.g., 'Status') to skip the header row, and 'target_text' to find specific rows. "
+            "Returns a JSON string containing the rows with their indices (if any) and cell data."
+        )
+        async def find_table_data_rows(
+            browser: BrowserContext,
+            header_text: Optional[str] = None,
+            target_text: Optional[str] = None,
+        ):
+            """
+            Analyze the current page's tables (including frames) and return a list of valid data rows.
+            Works for non-interactive tables too. Skips headers and noise.
+            """
+            try:
+                import json
+                page = await browser.get_current_page()
+                
+                all_rows = []
+                all_headers = []
+                
+                # RECURSIVE FRAME SCANNING
+                for frame in page.frames:
+                    try:
+                        # JavaScript to find and filter table rows within this frame
+                        frame_data = await frame.evaluate(
+                            """
+                            ({header_text, target_text}) => {
+                                const results = [];
+                                const discoveredHeaders = [];
+                                const rows = Array.from(document.querySelectorAll('tr'));
+                                
+                                rows.forEach(row => {
+                                    const ths = Array.from(row.querySelectorAll('th'));
+                                    if (ths.length > 0) {
+                                        discoveredHeaders.push(ths.map(h => (h.innerText || '').trim()).join(' | '));
+                                    }
+                                });
+
+                                rows.forEach((row, rowIndex) => {
+                                    const cells = Array.from(row.querySelectorAll('td, th'));
+                                    const rowText = (row.innerText || '').trim();
+                                    
+                                    if (!rowText) return;
+                                    
+                                    let index = row.getAttribute('data-browser-use-index');
+                                    if (!index) {
+                                        const indexedChild = row.querySelector('[data-browser-use-index]');
+                                        if (indexedChild) index = indexedChild.getAttribute('data-browser-use-index');
+                                    }
+                                    
+                                    const hasTh = row.querySelector('th') !== null;
+                                    const cellValues = cells.map(c => (c.innerText || '').trim().replace(/\\n/g, ' '));
+                                    
+                                    if (header_text) {
+                                        const ht = header_text.toLowerCase().trim();
+                                        const isHeaderMatch = cellValues.some(val => {
+                                            const v = val.toLowerCase().trim();
+                                            return v === ht || v.includes(ht) || ht.includes(v);
+                                        });
+                                        if (isHeaderMatch) return;
+                                    }
+                                    
+                                    if (hasTh) return;
+                                    
+                                    const parentTable = row.closest('table');
+                                    const tableRows = parentTable ? Array.from(parentTable.querySelectorAll('tr')) : [];
+                                    const hasWideRow = tableRows.some(r => r.querySelectorAll('td, th').length >= 4);
+                                    if (cells.length < 2 && hasWideRow) return;
+                                    
+                                    if (target_text) {
+                                        if (!rowText.toLowerCase().includes(target_text.toLowerCase())) return;
+                                    }
+                                    
+                                    results.push({
+                                        index: index ? parseInt(index) : null,
+                                        row_number: rowIndex,
+                                        cells: cellValues.filter(v => v.length > 0),
+                                        text: cellValues.filter(v => v.length > 0).join(' | '),
+                                        cell_count: cells.length
+                                    });
+                                });
+                                
+                                return { rows: results, headers: discoveredHeaders };
+                            }
+                            """,
+                            {"header_text": header_text, "target_text": target_text}
+                        )
+                        
+                        # Add frame-specific results
+                        if frame_data.get("rows"):
+                            all_rows.extend(frame_data["rows"])
+                        if frame_data.get("headers"):
+                            all_headers.extend(frame_data["headers"])
+                            
+                    except Exception as frame_err:
+                        logger.debug(f"Skipping frame {frame.url}: {frame_err}")
+                        continue
+                
+                if not all_rows:
+                    msg = "No valid data rows found."
+                    if all_headers:
+                        msg += f" Discovered headers: {all_headers[:3]}. Check if you should avoid 'header_text' matching these."
+                    return ActionResult(extracted_content=msg)
+                
+                # Format summary
+                summary = f"Found {len(all_rows)} data rows across {len(page.frames)} frames.\n"
+                if all_headers:
+                    summary += f"Primary Table Headers: {all_headers[0]}\n"
+                
+                for item in all_rows[:15]: # Limit output to prevent context bloat
+                    idx_prefix = f"[{item['index']}] " if item['index'] else "[No Idx] "
+                    summary += f"- {idx_prefix}{item['text'][:120]}\n"
+                
+                result_json = json.dumps({
+                    "rows": all_rows,
+                    "count": len(all_rows),
+                    "headers": all_headers,
+                    "summary": summary
+                }, indent=2)
+                
+                return ActionResult(extracted_content=result_json, include_in_memory=True)
+            except Exception as e:
+                return ActionResult(error=f"find_table_data_rows failed: {str(e)}")
+
     @time_execution_sync('--act')
     async def act(
         self,
@@ -1229,14 +1372,21 @@ class CustomController(Controller):
                     page = await browser_context.get_current_page()
                     url = page.url
                     title = await page.title()
-                    content_len = len(await page.content())
-                    state_hash = f"{url}:{title}:{content_len}"
+                    frames_count = len(page.frames)
+                    # Include frame URLs in state to detect frame-level changes
+                    frame_urls = ",".join([f.url for f in page.frames[:5]])
+                    state_hash = f"{url}:{title}:{frames_count}:{frame_urls}"
+                    
                     self.state_history.append(state_hash)
                     if len(self.state_history) > 20:
                         self.state_history.pop(0)
+                        
+                    # Loop detection: only trigger if the EXACT same state happens 4 times
+                    # and it's NOT a scroll action (scrolling often keeps state the same in frames)
                     if self.state_history.count(state_hash) > 3:
-                        logger.warning(f"Loop detected: {state_hash}")
-                        return ActionResult(error="Loop detected: Same page state repeated. Try different approach.")
+                        if action_name != "scroll_page":
+                            logger.warning(f"Loop detected: {state_hash}")
+                            return ActionResult(error="Loop detected: Same page state repeated. Please try a different navigation or extraction approach.")
                 except Exception:
                     pass
 

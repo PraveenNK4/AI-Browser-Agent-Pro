@@ -1,0 +1,6 @@
+1. Navigate to: "http://otcsvm.otxlab.net:8080/OTCS/cs.exe?func=distributedagent.AgentStatus"
+2. Login using @vault.otcs credentials.
+3. Extract a table showing every "Distributed Agent" and its current "Status".
+4. Navigate to the Enterprise Partition Map: "http://otcsvm.otxlab.net:8080/OTCS/cs.exe?func=ll&objId=2539&objAction=browse&viewType=1"
+5. Extract the "Partition State", "Enterprise Update Distributor" status, and "Enterprise Search Federator" status for that specific row.
+6. Finally, navigate to the Admin Servers list (http://otcsvm.otxlab.net:8080/OTCS/cs.exe?func=ll&objtype=148&objaction=browse) and open the action menu (Functions menu) for the row named "AdminServer-01".

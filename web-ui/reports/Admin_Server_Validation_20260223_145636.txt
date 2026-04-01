@@ -1,4 +1,0 @@
-Server: Admin Servers, Status: , Errors: 
-Server: Default, Status: , Errors: 
-Server: Name, Status: , Errors: 
-Server: AdminServer-01, Status: , Errors: 

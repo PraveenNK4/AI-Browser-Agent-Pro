@@ -245,6 +245,7 @@ def get_llm_model(provider: str, **kwargs):
         return ChatGoogleGenerativeAI(
             model=kwargs.get("model_name", "gemini-2.0-flash-exp"),
             temperature=kwargs.get("temperature", 0.0),
+            max_output_tokens=kwargs.get("num_ctx", 16384),  # Increased to 16k to matching generator headroom
             api_key=api_key,
         )
     elif provider == "ollama":

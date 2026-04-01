@@ -706,6 +706,27 @@ Step 1: retrieve_value_by_element(index=N) → extracts plain text
 Step 2: validate_value(actual=text, expected=value, operator="equals")
 
 NEVER pass HTML to validate_value. Always retrieve first.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 TABLE DATA EXTRACTION - MANDATORY RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When extracting data from tables (e.g., agent statuses, server lists):
+1. PREFERRED TOOL: Use find_table_data_rows(header_text="...") first. It returns the CONTENT of every row.
+2. NON-INTERACTIVE TABLES: This tool works even if the table has no indices. Use its "rows" output to read data.
+3. IDENTIFY HEADERS: If not using the tool, manually find the row containing column names (e.g., "Status").
+4. EXCLUDE HEADERS: If retrieve_value_by_element(index=N) matches a header name, SKIP IT.
+5. SKIP LAYOUT NOISE: Ignore rows that are empty, only contain spacing, or have fewer cells.
+6. STALE INDICES: If you get a KEY ERROR, call get_clickable_elements or scroll.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏁 TASK COMPLETION - MANDATORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Once ALL points in the user's prompt are satisfied, you MUST call done(success=true).
+2. Do NOT idle, scroll unnecessarily, or "think" about extra steps once the objective is met.
+3. If you have extracted the required data or performed the required clicks, END THE SESSION.
+4. Efficiency is priority. End the task immediately upon fulfillment.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
     # Simplified system prompt (no more giant walls of text)
@@ -791,6 +812,15 @@ NEVER repeat a failed action more than once. Move on or finish.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏁 TASK COMPLETION - MANDATORY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Once ALL points in the user's prompt are satisfied, you MUST call done(success=true).
+2. Do NOT idle, scroll unnecessarily, or "think" about extra steps once the objective is met.
+3. If you have extracted the required data or performed the required clicks, END THE SESSION.
+4. Efficiency is priority. End the task immediately upon fulfillment.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🚫 extract_content IS BANNED — DO NOT USE IT EVER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 extract_content is FORBIDDEN in ALL tasks. It dumps the entire page as
@@ -803,6 +833,18 @@ INSTEAD — use the correct targeted action:
 If you are tempted to call extract_content, STOP.
 Read what is already visible. Use retrieve_value_by_element for specific values.
 Call done() when you have the information.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 TABLE DATA EXTRACTION - MANDATORY RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When extracting data from tables (e.g., agent statuses, server lists):
+1. PREFERRED TOOL: Use find_table_data_rows(header_text="...") first. It returns the CONTENT of every row.
+2. NON-INTERACTIVE TABLES: This tool works even if the table has no indices. Use its "rows" output to read data.
+3. IDENTIFY HEADERS: If not using the tool, manually find the row containing column names (e.g., "Status").
+4. EXCLUDE HEADERS: If retrieve_value_by_element(index=N) matches a header name, SKIP IT.
+5. SKIP LAYOUT NOISE: Ignore rows that are empty, only contain spacing, or have fewer cells.
+6. STALE INDICES: If you get a KEY ERROR, call get_clickable_elements or scroll.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔒 SSL / CERTIFICATE TASKS — MANDATORY APPROACH
@@ -879,6 +921,12 @@ YOU MUST NOT:
         from src.utils.vault import vault
         vault_matches = re.findall(r'@vault\.([a-zA-Z0-9_]+)', task)
         sensitive_data = {}
+
+        # Capture the vault prefix for script generation (first @vault.XXX in task wins).
+        # This is passed to generate_llm_script so generated scripts call
+        # maybe_login(page, vault_prefix="XXX") with the correct vault key,
+        # instead of always falling back to VAULT_CREDENTIAL_PREFIX from config.
+        _task_vault_prefix = vault_matches[0].upper() if vault_matches else None
         
         for vault_key in vault_matches:
             creds = vault.get_credentials(vault_key)
@@ -1158,11 +1206,13 @@ YOU MUST NOT:
                 history_path = pathlib.Path(history_file)
                 from src.utils.config import SCRIPT_GEN_MODEL, SCRIPT_GEN_PROVIDER
                 logger.info(f"Script gen model: {SCRIPT_GEN_PROVIDER}/{SCRIPT_GEN_MODEL} (agent model: {llm_provider_name}/{llm_model_name})")
+                logger.info(f"Script vault prefix: {_task_vault_prefix or '(using config default)'}")
                 script_path, script_content = generate_llm_script(
                     str(history_path),
                     model_name=SCRIPT_GEN_MODEL,
                     provider=SCRIPT_GEN_PROVIDER,
-                    objective=task
+                    objective=task,
+                    vault_prefix=_task_vault_prefix,
                 )
                 logger.info(f"Playwright script saved to {script_path}")
                 logger.info(f"Script is ready to run: python {os.path.basename(script_path)}")

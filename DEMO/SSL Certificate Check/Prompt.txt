@@ -1,0 +1,2 @@
+1. Navigate to: "https://confluence.opentext.com"
+2. Check its SSL certificate.

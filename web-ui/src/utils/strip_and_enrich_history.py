@@ -620,7 +620,9 @@ def enhance_dom_context_with_comprehensive_data(dom_context: Optional[Dict[str, 
         "parent_chain": element_data.get("parentChain", []),
         "element_hash": element_data.get("elementHash", ""),
         "bounding_box": element_data.get("boundingBox", {}),
-        "computed_style": element_data.get("computedStyle", {})
+        "computed_style": element_data.get("computedStyle", {}),
+        "siblings": element_data.get("siblings", {}),
+        "row_context": element_data.get("rowContext", {})
     }
     
     return dom_context

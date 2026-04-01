@@ -20,10 +20,12 @@ SCRIPT_GEN_PROVIDER = os.getenv("SCRIPT_GEN_PROVIDER", os.getenv("LLM_PROVIDER",
 # ---------------------------------------------------------------------------
 # Temperature used when generating Playwright scripts (lower = more deterministic)
 SCRIPT_GEN_TEMPERATURE = float(os.getenv("SCRIPT_GEN_TEMPERATURE", "0.1"))
-# Context window size (tokens) passed to the generation model
-SCRIPT_GEN_NUM_CTX = int(os.getenv("SCRIPT_GEN_NUM_CTX", "8192"))
-# num_predict token limit for generation (-1 = unlimited)
-SCRIPT_GEN_NUM_PREDICT = int(os.getenv("SCRIPT_GEN_NUM_PREDICT", "2000"))
+# Context window size (tokens) passed to the generation model.
+# 32768 accommodates the system prompt (~1500 tok) + large agent histories + headroom.
+SCRIPT_GEN_NUM_CTX = int(os.getenv("SCRIPT_GEN_NUM_CTX", "32768"))
+# num_predict token limit for generation (-1 = unlimited).
+# 2000 was far too small — a full script with reporting needs 3000–6000 tokens.
+SCRIPT_GEN_NUM_PREDICT = int(os.getenv("SCRIPT_GEN_NUM_PREDICT", "-1"))
 
 # ---------------------------------------------------------------------------
 # Script Generator – OOM fallback chain
@@ -43,8 +45,8 @@ OOM_RETRY_NUM_PREDICT = int(os.getenv("OOM_RETRY_NUM_PREDICT", "2048"))
 # Vault / credential settings
 # ---------------------------------------------------------------------------
 # Vault key prefix used by the target application's credentials.
-# E.g. "OTCS" means vault.get_credentials("OTCS") -> {username, password}.
-VAULT_CREDENTIAL_PREFIX = os.getenv("VAULT_CREDENTIAL_PREFIX", "OTCS")
+# E.g. "PREFIX" means vault.get_credentials("PREFIX") -> {username, password}.
+VAULT_CREDENTIAL_PREFIX = os.getenv("VAULT_CREDENTIAL_PREFIX", "APP")
 
 # ---------------------------------------------------------------------------
 # Login selectors (used by maybe_login helper injected into generated scripts)
@@ -56,15 +58,15 @@ def _sel_list(env_var: str, default: str) -> list[str]:
 
 LOGIN_USER_SELECTORS: list[str] = _sel_list(
     "LOGIN_USER_SELECTORS",
-    "#otds_username,input[name='otds_username'],input[name='username'],input#username,input[name='user'],input[type='text']",
+    "input[name='username'],input#username,input[name='user'],input[type='text'],#login_username",
 )
 LOGIN_PASS_SELECTORS: list[str] = _sel_list(
     "LOGIN_PASS_SELECTORS",
-    "#otds_password,input[name='otds_password'],input[name='password'],input#password,input[type='password']",
+    "input[name='password'],input#password,input[type='password'],#login_password",
 )
 LOGIN_SUBMIT_SELECTORS: list[str] = _sel_list(
     "LOGIN_SUBMIT_SELECTORS",
-    "#loginbutton,#otds_login_button,button:has-text('Sign in'),button:has-text('Sign In'),input[type='submit'],button[type='submit']",
+    "button[type='submit'],#login_button,button:has-text('Sign in'),button:has-text('Sign In'),input[type='submit']",
 )
 
 # ---------------------------------------------------------------------------
